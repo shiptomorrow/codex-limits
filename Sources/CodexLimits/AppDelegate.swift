@@ -190,7 +190,7 @@ enum StatusItemPreferences {
 
     static var spacing: CGFloat {
         let defaults = UserDefaults.standard
-        guard defaults.object(forKey: spacingKey) != nil else { return 2 }
+        guard defaults.object(forKey: spacingKey) != nil else { return 4 }
         return CGFloat(min(max(defaults.double(forKey: spacingKey), 0), 12))
     }
 

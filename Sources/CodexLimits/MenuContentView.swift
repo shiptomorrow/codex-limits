@@ -7,7 +7,8 @@ struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     var openSettingsAction: (() -> Void)?
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
-    @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = false
+    @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
+    @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
 
@@ -28,10 +29,13 @@ struct MenuContentView: View {
     private func dashboard(snapshot: UsageSnapshot, forecast: Forecast) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(snapshot.mainLimit.window.remainingPercent, format: .number.precision(.fractionLength(0)))
+                Text(
+                    displayedPercent(snapshot.mainLimit.window.remainingPercent),
+                    format: .number.precision(.fractionLength(0))
+                )
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                Text("% remaining")
+                Text(showsUsedPercentage ? "% used" : "% remaining")
                     .foregroundStyle(.secondary)
                 Spacer()
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
@@ -84,10 +88,14 @@ struct MenuContentView: View {
                     Button {
                         chartMode = chartMode == .usage ? .weeklyPace : .usage
                     } label: {
-                        Label(
-                            chartMode == .usage ? "Hours / week" : "Usage",
-                            systemImage: chartMode == .usage ? "clock.arrow.trianglehead.counterclockwise.rotate.90" : "percent"
-                        )
+                        HStack(spacing: 3) {
+                            Image(
+                                systemName: chartMode == .usage
+                                    ? "clock.arrow.trianglehead.counterclockwise.rotate.90"
+                                    : "percent"
+                            )
+                            Text(chartMode == .usage ? "Hours / week" : "Usage")
+                        }
                     }
                     .controlSize(.small)
                     .help(chartMode == .usage ? "Show estimated hours per week pace" : "Show usage forecast")
@@ -101,7 +109,8 @@ struct MenuContentView: View {
                         tokenHistory: snapshot.tokenHistory,
                         fetchedAt: snapshot.fetchedAt,
                         forecast: forecast,
-                        safetyBuffer: safetyBuffer
+                        safetyBuffer: safetyBuffer,
+                        showsUsedPercentage: showsUsedPercentage
                     )
                 } else if let weeklyWindow = weeklyWindow(in: snapshot) {
                     WeeklyPaceChart(
@@ -174,7 +183,7 @@ struct MenuContentView: View {
                             Text(limit.name)
                                 .lineLimit(1)
                             Spacer()
-                            Text("\(Int(limit.window.remainingPercent.rounded()))%")
+                            Text("\(Int(displayedPercent(limit.window.remainingPercent).rounded()))%")
                                 .monospacedDigit()
                             Text(countdownText(until: limit.window.resetsAt, now: context.date))
                                 .foregroundStyle(.secondary)
@@ -294,6 +303,10 @@ struct MenuContentView: View {
                 ? "At this pace, your limit may run out \(durationText(early)) early."
                 : "Your current pace is too close to the limit."
         case .onTrack:
+            if showsUsedPercentage {
+                let expectedUsed = displayedPercent(forecast.expectedRemainingAtReset)
+                return "You’re on track to use \(Int(expectedUsed.rounded()))% by reset."
+            }
             return "You’re on track to have \(Int(forecast.expectedRemainingAtReset.rounded()))% left at reset."
         case .roomToUseMore:
             let room = max(forecast.expectedRemainingAtReset - safetyBuffer, 0)
@@ -331,6 +344,13 @@ struct MenuContentView: View {
             .number
                 .precision(.fractionLength(1))
                 .locale(Locale(identifier: "en_US"))
+        )
+    }
+
+    private func displayedPercent(_ remainingPercent: Double) -> Double {
+        UsagePercentageDisplay.value(
+            remainingPercent: remainingPercent,
+            showsUsed: showsUsedPercentage
         )
     }
 
@@ -631,6 +651,7 @@ private struct BurnDownChart: View {
     let fetchedAt: Date
     let forecast: Forecast
     let safetyBuffer: Double
+    let showsUsedPercentage: Bool
 
     private var observed: [BurnPoint] {
         let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
@@ -706,7 +727,7 @@ private struct BurnDownChart: View {
                 ]) { point in
                     LineMark(
                         x: .value("Time", point.date),
-                        y: .value("Target", point.remaining),
+                        y: .value("Target", displayedPercent(point.remaining)),
                         series: .value("Series", "Target")
                     )
                     .foregroundStyle(Color.green.opacity(0.75))
@@ -716,7 +737,7 @@ private struct BurnDownChart: View {
                 ForEach(observed) { point in
                     LineMark(
                         x: .value("Time", point.date),
-                        y: .value("Actual", point.remaining),
+                        y: .value("Actual", displayedPercent(point.remaining)),
                         series: .value("Series", "Actual")
                     )
                     .foregroundStyle(Color.blue)
@@ -727,7 +748,7 @@ private struct BurnDownChart: View {
                 ForEach(currentProjection) { point in
                     LineMark(
                         x: .value("Time", point.date),
-                        y: .value("Current", point.remaining),
+                        y: .value("Current", displayedPercent(point.remaining)),
                         series: .value("Series", "Current")
                     )
                     .foregroundStyle(currentColor)
@@ -737,7 +758,7 @@ private struct BurnDownChart: View {
                 ForEach(historicalProjection) { point in
                     LineMark(
                         x: .value("Time", point.date),
-                        y: .value("Historical", point.remaining),
+                        y: .value("Historical", displayedPercent(point.remaining)),
                         series: .value("Series", "Historical")
                     )
                     .foregroundStyle(Color.secondary)
@@ -750,7 +771,7 @@ private struct BurnDownChart: View {
 
                 PointMark(
                     x: .value("Now", fetchedAt),
-                    y: .value("Remaining now", window.remainingPercent)
+                    y: .value("Usage now", displayedPercent(window.remainingPercent))
                 )
                 .foregroundStyle(currentColor)
                 .symbolSize(18)
@@ -768,7 +789,7 @@ private struct BurnDownChart: View {
 
                 PointMark(
                     x: .value("Reset", window.resetsAt),
-                    y: .value("Target", safetyBuffer)
+                    y: .value("Target", displayedPercent(safetyBuffer))
                 )
                 .foregroundStyle(Color.green)
                 .symbolSize(38)
@@ -776,7 +797,7 @@ private struct BurnDownChart: View {
                 if let endpoint = currentProjection.last {
                     PointMark(
                         x: .value("Current endpoint", endpoint.date),
-                        y: .value("Current endpoint", endpoint.remaining)
+                        y: .value("Current endpoint", displayedPercent(endpoint.remaining))
                     )
                     .foregroundStyle(currentColor)
                     .symbolSize(12)
@@ -822,10 +843,22 @@ private struct BurnDownChart: View {
             .frame(height: 190)
             .padding(.horizontal, 8)
             .accessibilityLabel("Usage forecast")
-            .accessibilityValue(
-                "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent and the historical pace leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent."
-            )
+            .accessibilityValue(accessibilityValue)
         }
+    }
+
+    private var accessibilityValue: String {
+        if showsUsedPercentage {
+            return "Now has \(Int(displayedPercent(window.remainingPercent).rounded())) percent used. At reset, the current pace reaches \(Int(displayedPercent(forecast.expectedRemainingAtReset).rounded())) percent used and the historical pace reaches \(Int(displayedPercent(forecast.historicalRemainingAtReset).rounded())) percent used."
+        }
+        return "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent and the historical pace leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent."
+    }
+
+    private func displayedPercent(_ remainingPercent: Double) -> Double {
+        UsagePercentageDisplay.value(
+            remainingPercent: remainingPercent,
+            showsUsed: showsUsedPercentage
+        )
     }
 
     private func projection(rate: Double, remainingAtReset: Double) -> [BurnPoint] {
@@ -883,10 +916,11 @@ struct SettingsView: View {
     @ObservedObject var monitor: UsageMonitor
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = 60
-    @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = true
+    @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.paceLookbackMinutesKey) private var paceLookbackMinutes = 60
-    @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = false
-    @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 2.0
+    @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
+    @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
+    @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
     @State private var loginItemError: String?
@@ -911,6 +945,8 @@ struct SettingsView: View {
                 }
 
                 Toggle("Show icon", isOn: $showsMenuBarIcon)
+                Toggle("Show used percentage", isOn: $showsUsedPercentage)
+                    .help("Show percentage used instead of percentage remaining")
             }
 
             Section("Misc") {

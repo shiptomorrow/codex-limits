@@ -70,7 +70,11 @@ final class UsageMonitor: ObservableObject {
 
     var menuBarText: String {
         guard let remaining = snapshot?.mainLimit.window.remainingPercent else { return "—" }
-        return "\(Int(remaining.rounded()))%"
+        let displayed = UsagePercentageDisplay.value(
+            remainingPercent: remaining,
+            showsUsed: UsagePercentageDisplay.showsUsed
+        )
+        return "\(Int(displayed.rounded()))%"
     }
 
     var currentWindowSamples: [UsageSample] {
@@ -384,7 +388,9 @@ final class UsageMonitor: ObservableObject {
         lastWeeklyPaceCalculationAt = snapshot.fetchedAt
 
         let defaults = UserDefaults.standard
-        let showPreviousWindow = defaults.bool(forKey: Self.showPreviousWeeklyWindowKey)
+        let showPreviousWindow = defaults.object(forKey: Self.showPreviousWeeklyWindowKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.showPreviousWeeklyWindowKey)
         let currentSamples = weeklySamples.filter {
             abs($0.resetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
         }
@@ -425,7 +431,7 @@ final class UsageMonitor: ObservableObject {
             : defaults.integer(forKey: Self.refreshIntervalSecondsKey)
         let tolerance = min(max(TimeInterval(refreshSeconds) * 1.5, 90), 15 * 60)
         let factorInPauses = defaults.object(forKey: Self.factorInPausesKey) == nil
-            ? true
+            ? false
             : defaults.bool(forKey: Self.factorInPausesKey)
         let lookbackMinutes = defaults.object(forKey: Self.paceLookbackMinutesKey) == nil
             ? 60

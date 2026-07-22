@@ -1,5 +1,18 @@
 import Foundation
 
+enum UsagePercentageDisplay {
+    static let showsUsedKey = "showUsedPercentage"
+
+    static var showsUsed: Bool {
+        UserDefaults.standard.bool(forKey: showsUsedKey)
+    }
+
+    static func value(remainingPercent: Double, showsUsed: Bool) -> Double {
+        let remaining = min(max(remainingPercent, 0), 100)
+        return showsUsed ? 100 - remaining : remaining
+    }
+}
+
 struct UsageWindow: Codable, Equatable, Sendable {
     let remainingPercent: Double
     let resetsAt: Date

@@ -23,6 +23,7 @@ struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
 
 enum WeeklyPaceCalculator {
     static let idleGap: TimeInterval = 15 * 60
+    private static let resetTimeTolerance: TimeInterval = 5 * 60
     private static let recentSessionMinimum: TimeInterval = 15 * 60
     private static let maximumActiveLookback: TimeInterval = 3 * 60 * 60
 
@@ -112,9 +113,18 @@ enum WeeklyPaceCalculator {
         let samples = rawSamples
             .filter { $0.observedAt <= now }
             .sorted { $0.observedAt < $1.observedAt }
-        let windows = Dictionary(grouping: samples, by: \.resetsAt)
+        let windows = samples.reduce(into: [[UsageSample]]()) { windows, sample in
+            if let index = windows.firstIndex(where: { window in
+                guard let reset = window.first?.resetsAt else { return false }
+                return abs(reset.timeIntervalSince(sample.resetsAt)) <= resetTimeTolerance
+            }) {
+                windows[index].append(sample)
+            } else {
+                windows.append([sample])
+            }
+        }
 
-        return windows.values.flatMap { windowSamples in
+        return windows.flatMap { windowSamples in
             estimateSingleWindowSeries(
                 samples: windowSamples,
                 activity: activity,

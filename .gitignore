@@ -8,6 +8,7 @@ xcuserdata/
 *.xcuserstate
 .idea/
 .vscode/
+AGENTS.md
 
 # Local configuration and credentials
 .env

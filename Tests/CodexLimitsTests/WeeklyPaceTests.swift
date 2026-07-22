@@ -118,6 +118,30 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(points[1].hoursPerWeek, 50, accuracy: 0.01)
     }
 
+    func testEstimateSeriesToleratesSmallResetTimeDrift() {
+        let start = Date(timeIntervalSince1970: 650_000)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let driftedReset = reset.addingTimeInterval(1)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: driftedReset),
+            UsageSample(observedAt: start.addingTimeInterval(900), remainingPercent: 99, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(1_800), remainingPercent: 98, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(3_600), remainingPercent: 96, resetsAt: driftedReset),
+            UsageSample(observedAt: start.addingTimeInterval(4_500), remainingPercent: 95, resetsAt: reset)
+        ]
+        let activity = [ActivityInterval(start: start, end: start.addingTimeInterval(4_500))]
+
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: activity,
+            now: start.addingTimeInterval(4_500),
+            sampleTolerance: 90,
+            factorInPauses: false
+        )
+
+        XCTAssertEqual(points.map(\.date), Array(samples.dropFirst()).map(\.observedAt))
+    }
+
     func testExcludesIdleGapLongerThanFifteenMinutes() throws {
         let now = Date(timeIntervalSince1970: 100_000)
         let reset = now.addingTimeInterval(86_400)

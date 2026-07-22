@@ -4,7 +4,7 @@ A lightweight macOS menu-bar app for tracking the remaining Codex usage allowanc
 
 The menu bar shows the current remaining percentage. The popover adds the reset time, a suggested pace, a burn-down chart, and one of three plain-language assessments: `Slow down`, `On track`, or `Room to use more`.
 
-![Codex Limits menu bar popover](docs/assets/screenshot.png)
+<img src="docs/assets/screenshot.png" alt="Codex Limits menu bar popover" width="480">
 
 > [!NOTE]
 > Codex Limits is an independent, unofficial project. It is not affiliated with or endorsed by OpenAI.

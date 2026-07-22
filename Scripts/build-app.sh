@@ -13,6 +13,7 @@ rm -rf "$app_dir"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp .build/release/CodexLimits "$app_dir/Contents/MacOS/CodexLimits"
 cp Resources/Info.plist "$app_dir/Contents/Info.plist"
+cp Resources/AppIcon.icns "$app_dir/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$app_dir"
 
 print -r -- "$app_dir"

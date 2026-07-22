@@ -21,6 +21,19 @@ struct UsageWindow: Codable, Equatable, Sendable {
     var startsAt: Date {
         resetsAt.addingTimeInterval(-Double(durationMinutes) * 60)
     }
+
+    func isPlausibleSuccessor(
+        to previous: UsageWindow,
+        resetTolerance: TimeInterval = UsageReadingValidation.resetTolerance
+    ) -> Bool {
+        let isSameWindow = durationMinutes == previous.durationMinutes
+            && UsageReadingValidation.isSameWindow(
+                resetsAt: resetsAt,
+                previousReset: previous.resetsAt,
+                tolerance: resetTolerance
+            )
+        return !isSameWindow || remainingPercent <= previous.remainingPercent
+    }
 }
 
 struct UsageSample: Codable, Equatable, Hashable, Sendable {
@@ -57,6 +70,31 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+enum UsageReadingValidation {
+    static let resetTolerance: TimeInterval = 5 * 60
+
+    static func removingImplausibleIncreases(from samples: [UsageSample]) -> [UsageSample] {
+        var accepted: [UsageSample] = []
+        for sample in samples.sorted(by: { $0.observedAt < $1.observedAt }) {
+            if let previous = accepted.last,
+               isSameWindow(resetsAt: sample.resetsAt, previousReset: previous.resetsAt),
+               sample.remainingPercent > previous.remainingPercent {
+                continue
+            }
+            accepted.append(sample)
+        }
+        return accepted
+    }
+
+    static func isSameWindow(
+        resetsAt: Date,
+        previousReset: Date,
+        tolerance: TimeInterval = resetTolerance
+    ) -> Bool {
+        abs(resetsAt.timeIntervalSince(previousReset)) <= tolerance
+    }
+}
+
 struct TokenDay: Codable, Equatable, Sendable {
     let date: Date
     let tokens: Int64
@@ -77,6 +115,22 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
     let emergencyResetCount: Int
     let nextEmergencyResetExpiration: Date?
     let fetchedAt: Date
+    let planType: String?
+
+    var subscriptionName: String? {
+        switch planType {
+        case "free": "Codex Free"
+        case "go": "Codex Go"
+        case "plus": "Codex Plus"
+        case "prolite": "Codex Pro 5×"
+        case "pro": "Codex Pro 20×"
+        case "team": "Codex Team"
+        case "self_serve_business_usage_based", "business": "Codex Business"
+        case "enterprise_cbp_usage_based", "enterprise": "Codex Enterprise"
+        case "edu": "Codex Edu"
+        default: nil
+        }
+    }
 }
 
 enum PaceStatus: String, Codable, Equatable, Sendable {

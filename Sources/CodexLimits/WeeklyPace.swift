@@ -164,7 +164,7 @@ enum WeeklyPaceCalculator {
             }
         }
 
-        return candidateIndices.compactMap { index in
+        let rawPoints: [WeeklyPacePoint] = candidateIndices.compactMap { index in
             let date = samples[index].observedAt
             guard let estimate = estimate(
                 samples: Array(samples[...index]),
@@ -178,6 +178,30 @@ enum WeeklyPaceCalculator {
                 date: date,
                 hoursPerWeek: estimate.hoursPerWeek,
                 windowResetsAt: samples[index].resetsAt
+            )
+        }
+        return stabilizedSeries(rawPoints)
+    }
+
+    static func stabilizedSeries(_ points: [WeeklyPacePoint]) -> [WeeklyPacePoint] {
+        guard points.count >= 3 else { return points }
+        return points.indices.map { index in
+            guard index >= 2 else { return points[index] }
+            let raw = points[index]
+            let localValues = points[(index - 2) ... index]
+                .map(\.hoursPerWeek)
+                .sorted()
+            let median = localValues[1]
+            // A large one-sample change is usually caused by whole-percentage usage
+            // readings or an activity block crossing the rolling lookback boundary.
+            // Delay it until a second point confirms the new level.
+            guard raw.hoursPerWeek > median * 1.5 || raw.hoursPerWeek < median / 1.5 else {
+                return raw
+            }
+            return WeeklyPacePoint(
+                date: raw.date,
+                hoursPerWeek: median,
+                windowResetsAt: raw.windowResetsAt
             )
         }
     }

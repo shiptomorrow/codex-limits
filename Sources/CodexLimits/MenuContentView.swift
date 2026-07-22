@@ -7,6 +7,7 @@ struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     var openSettingsAction: (() -> Void)?
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
+    @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @Environment(\.openSettings) private var openSettings
@@ -29,14 +30,16 @@ struct MenuContentView: View {
     private func dashboard(snapshot: UsageSnapshot, forecast: Forecast) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(
-                    displayedPercent(snapshot.mainLimit.window.remainingPercent),
-                    format: .number.precision(.fractionLength(0))
-                )
+                HStack(alignment: .firstTextBaseline, spacing: 2.5) {
+                    Text(
+                        displayedPercent(snapshot.mainLimit.window.remainingPercent),
+                        format: .number.precision(.fractionLength(0))
+                    )
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                Text(showsUsedPercentage ? "% used" : "% remaining")
-                    .foregroundStyle(.secondary)
+                    Text(showsUsedPercentage ? "% used" : "% remaining")
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
                     Text(weeklyPaceValueText)
@@ -81,6 +84,11 @@ struct MenuContentView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            .overlay(alignment: .bottomLeading) {
+                Text(projectedUsageText(forecast: forecast))
+                    .foregroundStyle(.secondary)
+                    .offset(y: 19)
+            }
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -117,6 +125,7 @@ struct MenuContentView: View {
                         window: weeklyWindow,
                         points: monitor.weeklyPacePoints,
                         fetchedAt: snapshot.fetchedAt,
+                        factorInPauses: factorInPauses,
                         showsPreviousWindow: showPreviousWeeklyWindow
                     )
                 }
@@ -208,6 +217,25 @@ struct MenuContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 Spacer()
+                if let subscriptionName = snapshot.subscriptionName {
+                    Text(subscriptionName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 0.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.primary.opacity(0.06))
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .stroke(.secondary.opacity(0.4), lineWidth: 1)
+                        }
+                        .fixedSize()
+                        .help("Codex subscription")
+                        .padding(.trailing, 1.5)
+                }
                 Button {
                     if let openSettingsAction {
                         openSettingsAction()
@@ -314,6 +342,16 @@ struct MenuContentView: View {
         }
     }
 
+    private func projectedUsageText(forecast: Forecast) -> String {
+        guard let weeklyPaceHours = monitor.weeklyPaceHours, weeklyPaceHours > 0 else {
+            return ""
+        }
+        let hoursUsedPerDay = weeklyPaceHours * forecast.currentPercentPerDay / 100
+        let multiple = hoursUsedPerDay * 7 / weeklyPaceHours
+        guard multiple.isFinite else { return "" }
+        return "Projected weekly usage is \(oneDecimal(multiple))x your limit."
+    }
+
     private func paceText(forecast: Forecast) -> String {
         guard let weeklyPaceHours = monitor.weeklyPaceHours else {
             return "— hr / day"
@@ -385,6 +423,7 @@ private struct WeeklyPaceChart: View {
     let window: UsageWindow
     let points: [WeeklyPacePoint]
     let fetchedAt: Date
+    let factorInPauses: Bool
     let showsPreviousWindow: Bool
 
     private var displayedPoints: [WeeklyPacePoint] {
@@ -453,11 +492,12 @@ private struct WeeklyPaceChart: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 4) {
-                ChartLegendItem(label: "Estimated pace", color: .purple)
-                Spacer()
-                Text("hours / week")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                ChartLegendItem(
+                    label: factorInPauses
+                        ? "Estimated usage hours / week"
+                        : "Estimated runtime / week",
+                    color: .purple
+                )
             }
 
             if displayedPoints.isEmpty {
@@ -491,6 +531,7 @@ private struct WeeklyPaceChart: View {
                                 Text("Reset")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
+                                    .offset(y: 10)
                             }
                     }
 

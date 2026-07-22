@@ -6,6 +6,8 @@
     <string>Codex Limits</string>
     <key>CFBundleExecutable</key>
     <string>CodexLimits</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.github.thrr87.CodexLimits</string>
     <key>CFBundleName</key>

@@ -62,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        monitor.shutdown()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }

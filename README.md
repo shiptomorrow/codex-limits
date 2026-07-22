@@ -2,7 +2,7 @@
 
 A lightweight macOS menu-bar app for tracking the remaining Codex usage allowance and pacing it until reset.
 
-The menu bar shows the current remaining percentage. The popover adds the reset time, a suggested pace, a burn-down chart, and one of three plain-language assessments: `Slow down`, `On track`, or `Room to use more`.
+The menu bar shows the current remaining percentage. The popover adds the reset time, a suggested pace, usage and estimated pace charts, and one of three plain-language assessments: `Slow down`, `On track`, or `Room to use more`.
 
 <img src="docs/assets/screenshot.png" alt="Codex Limits menu bar popover" width="480">
 
@@ -14,6 +14,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Reads the main Codex limit and any independent model-specific limits.
 - Records local samples to show actual usage during the current window.
 - Compares actual usage with a straight target path ending at a configurable safety buffer.
+- Shows an estimated pace chart so you can see how your sustainable weekly usage changes over time.
 - Projects the current pace and compares it with recent historical usage.
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage history in versioned daily JSON files.

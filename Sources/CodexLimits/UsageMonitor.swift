@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import OSLog
 
 @MainActor
 final class UsageMonitor: ObservableObject {
@@ -25,6 +26,11 @@ final class UsageMonitor: ObservableObject {
     private static let historySyncBookmarkKey = "historySyncBookmark"
     private let history: UsageHistory
     private let weeklyHistory: UsageHistory
+    private let client = CodexClient()
+    private let logger = Logger(
+        subsystem: "com.github.thrr87.CodexLimits",
+        category: "UsageMonitor"
+    )
     private var previousStatus: PaceStatus?
     private var cancellables: Set<AnyCancellable> = []
     private var refreshTimerCancellable: AnyCancellable?
@@ -141,7 +147,7 @@ final class UsageMonitor: ObservableObject {
             historyUsesFiles = historyState.errorMessage == nil
         }
 
-        let fetchTask = Task { try await CodexClient.fetch() }
+        let fetchTask = Task { try await client.fetch() }
         let historyState = await exchangeHistory()
         apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
         let exchangeErrorMessage = historyState.errorMessage
@@ -151,6 +157,14 @@ final class UsageMonitor: ObservableObject {
         do {
             let newSnapshot = try await fetchTask.value
             let window = newSnapshot.mainLimit.window
+            if let previousWindow = snapshot?.mainLimit.window,
+               !window.isPlausibleSuccessor(to: previousWindow) {
+                logger.info(
+                    "Ignoring implausible remaining percentage increase from \(previousWindow.remainingPercent, privacy: .public) to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
+                )
+                errorMessage = nil
+                return
+            }
             let sample = UsageSample(
                 observedAt: newSnapshot.fetchedAt,
                 remainingPercent: window.remainingPercent,
@@ -172,6 +186,11 @@ final class UsageMonitor: ObservableObject {
         } catch {
             errorMessage = "Couldn’t read Codex usage. Try refreshing again."
         }
+    }
+
+    func shutdown() {
+        refreshTimerCancellable?.cancel()
+        client.shutdown()
     }
 
     private func scheduleRefreshTimer() {
@@ -280,7 +299,9 @@ final class UsageMonitor: ObservableObject {
 
         let state = await history.load(legacySamples: samples)
         apply(state)
-        weeklySamples = await weeklyHistory.load(legacySamples: samples).samples
+        weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
+            from: await weeklyHistory.load(legacySamples: samples).samples
+        )
         historyUsesFiles = state.errorMessage == nil
         if historyUsesFiles {
             persist()
@@ -335,7 +356,7 @@ final class UsageMonitor: ObservableObject {
         _ state: UsageHistory.State,
         configuredFolderName: String? = nil
     ) {
-        samples = state.samples
+        samples = UsageReadingValidation.removingImplausibleIncreases(from: state.samples)
         syncFolderName = state.folderName ?? configuredFolderName
         syncErrorMessage = state.errorMessage
     }
@@ -369,9 +390,13 @@ final class UsageMonitor: ObservableObject {
         )
 
         if weeklySamples.isEmpty {
-            weeklySamples = await weeklyHistory.load(legacySamples: samples + [sample]).samples
+            weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
+                from: await weeklyHistory.load(legacySamples: samples + [sample]).samples
+            )
         } else {
-            weeklySamples = await weeklyHistory.record(sample).samples
+            weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
+                from: await weeklyHistory.record(sample).samples
+            )
         }
     }
 
@@ -446,17 +471,9 @@ final class UsageMonitor: ObservableObject {
                 factorInPauses: factorInPauses,
                 lookback: lookback
             )
-            let currentSamples = relevantSamples.filter {
-                abs($0.resetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
-            }
-            let current = WeeklyPaceCalculator.estimate(
-                samples: currentSamples,
-                activity: activity,
-                now: snapshot.fetchedAt,
-                sampleTolerance: tolerance,
-                factorInPauses: factorInPauses,
-                lookback: lookback
-            )?.hoursPerWeek
+            let current = points.last(where: {
+                abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
+            })?.hoursPerWeek
             return (points, current)
         }.value
         weeklyPacePoints = calculation.0

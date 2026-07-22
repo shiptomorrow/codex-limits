@@ -208,6 +208,38 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(estimate.hoursPerWeek, 9.848, accuracy: 0.01)
     }
 
+    func testStabilizedSeriesSuppressesIsolatedOutlier() {
+        let start = Date(timeIntervalSince1970: 250_000)
+        let reset = start.addingTimeInterval(86_400)
+        let points = [6.3, 6.2, 9.8, 5.9].enumerated().map { index, hours in
+            WeeklyPacePoint(
+                date: start.addingTimeInterval(Double(index) * 900),
+                hoursPerWeek: hours,
+                windowResetsAt: reset
+            )
+        }
+
+        let stabilized = WeeklyPaceCalculator.stabilizedSeries(points)
+
+        XCTAssertEqual(stabilized.map(\.hoursPerWeek), [6.3, 6.2, 6.3, 5.9])
+    }
+
+    func testStabilizedSeriesShowsSustainedPaceChangeAfterOnePoint() {
+        let start = Date(timeIntervalSince1970: 275_000)
+        let reset = start.addingTimeInterval(86_400)
+        let points = [6.3, 6.2, 9.8, 10.1, 9.9].enumerated().map { index, hours in
+            WeeklyPacePoint(
+                date: start.addingTimeInterval(Double(index) * 900),
+                hoursPerWeek: hours,
+                windowResetsAt: reset
+            )
+        }
+
+        let stabilized = WeeklyPaceCalculator.stabilizedSeries(points)
+
+        XCTAssertEqual(stabilized.map(\.hoursPerWeek), [6.3, 6.2, 6.3, 10.1, 9.9])
+    }
+
     func testCanExcludeEveryIdleSecond() throws {
         let now = Date(timeIntervalSince1970: 300_000)
         let reset = now.addingTimeInterval(86_400)

@@ -5,10 +5,16 @@ import Foundation
 @MainActor
 final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
+    static let refreshIntervalSecondsKey = "refreshIntervalSeconds"
+    static let factorInPausesKey = "factorInPauses"
+    static let paceLookbackMinutesKey = "paceLookbackMinutes"
+    static let showPreviousWeeklyWindowKey = "showPreviousWeeklyWindow"
 
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var forecast: Forecast?
     @Published private(set) var samples: [UsageSample] = []
+    @Published private(set) var weeklyPaceHours: Double?
+    @Published private(set) var weeklyPacePoints: [WeeklyPacePoint] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var syncFolderName: String?
@@ -18,13 +24,17 @@ final class UsageMonitor: ObservableObject {
     private static let historyInstallationIDKey = "historyInstallationID"
     private static let historySyncBookmarkKey = "historySyncBookmark"
     private let history: UsageHistory
+    private let weeklyHistory: UsageHistory
     private var previousStatus: PaceStatus?
     private var cancellables: Set<AnyCancellable> = []
+    private var refreshTimerCancellable: AnyCancellable?
     private var started = false
     private var historyPrepared = false
     private var historyUsesFiles = false
     private var configuredSyncDirectory: URL?
     private var historyConnectionActive = false
+    private var weeklySamples: [UsageSample] = []
+    private var lastWeeklyPaceCalculationAt: Date?
 
     init() {
         let defaults = UserDefaults.standard
@@ -45,6 +55,10 @@ final class UsageMonitor: ObservableObject {
         }
         history = UsageHistory(
             localDirectory: Self.historyDirectory(),
+            installationID: installationID
+        )
+        weeklyHistory = UsageHistory(
+            localDirectory: Self.weeklyHistoryDirectory(),
             installationID: installationID
         )
         recalculate()
@@ -70,12 +84,7 @@ final class UsageMonitor: ObservableObject {
 
         await prepareHistory()
 
-        Timer.publish(every: 600, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                Task { @MainActor in await self?.refresh() }
-            }
-            .store(in: &cancellables)
+        scheduleRefreshTimer()
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
@@ -85,6 +94,35 @@ final class UsageMonitor: ObservableObject {
             .store(in: &cancellables)
 
         await refresh()
+    }
+
+    func updateRefreshInterval(seconds: Int) {
+        let clampedSeconds = min(max(seconds, 15), 3_600)
+        UserDefaults.standard.set(clampedSeconds, forKey: Self.refreshIntervalSecondsKey)
+        guard started else { return }
+        scheduleRefreshTimer()
+    }
+
+    func updateFactorInPauses(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.factorInPausesKey)
+        lastWeeklyPaceCalculationAt = nil
+        guard let snapshot else { return }
+        Task { await updateWeeklyPace(from: snapshot) }
+    }
+
+    func updatePaceLookback(minutes: Int) {
+        let clampedMinutes = min(max(minutes, 15), 180)
+        UserDefaults.standard.set(clampedMinutes, forKey: Self.paceLookbackMinutesKey)
+        lastWeeklyPaceCalculationAt = nil
+        guard let snapshot else { return }
+        Task { await updateWeeklyPace(from: snapshot) }
+    }
+
+    func updateShowPreviousWeeklyWindow(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.showPreviousWeeklyWindowKey)
+        lastWeeklyPaceCalculationAt = nil
+        guard let snapshot else { return }
+        Task { await updateWeeklyPace(from: snapshot) }
     }
 
     func refresh() async {
@@ -119,14 +157,40 @@ final class UsageMonitor: ObservableObject {
             if recordedState.errorMessage == nil {
                 syncErrorMessage = exchangeErrorMessage
             }
+            await recordWeeklySample(from: newSnapshot)
             snapshot = newSnapshot
             errorMessage = nil
             recalculate()
             persist()
+            await updateWeeklyPace(from: newSnapshot)
         } catch let error as CodexClientError {
             errorMessage = error.localizedDescription
         } catch {
             errorMessage = "Couldn’t read Codex usage. Try refreshing again."
+        }
+    }
+
+    private func scheduleRefreshTimer() {
+        refreshTimerCancellable?.cancel()
+
+        let defaults = UserDefaults.standard
+        let seconds: Int
+        if defaults.object(forKey: Self.refreshIntervalSecondsKey) != nil {
+            seconds = min(max(defaults.integer(forKey: Self.refreshIntervalSecondsKey), 15), 3_600)
+        } else if defaults.object(forKey: "refreshIntervalMinutes") != nil {
+            seconds = min(max(defaults.integer(forKey: "refreshIntervalMinutes") * 60, 15), 3_600)
+            defaults.set(seconds, forKey: Self.refreshIntervalSecondsKey)
+        } else {
+            seconds = 60
+        }
+        refreshTimerCancellable = Timer.publish(
+            every: TimeInterval(seconds),
+            on: .main,
+            in: .common
+        )
+        .autoconnect()
+        .sink { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
         }
     }
 
@@ -167,6 +231,18 @@ final class UsageMonitor: ObservableObject {
         apply(await history.disconnect())
     }
 
+    func resetHistory() async {
+        apply(await history.reset())
+        _ = await weeklyHistory.reset()
+        weeklySamples = []
+        weeklyPaceHours = nil
+        weeklyPacePoints = []
+        lastWeeklyPaceCalculationAt = nil
+        previousStatus = nil
+        recalculate()
+        persist()
+    }
+
     private func recalculate(safetyBuffer: Double? = nil) {
         guard let snapshot else { return }
         let storedBuffer = UserDefaults.standard.object(forKey: Self.safetyBufferKey) as? Double
@@ -200,6 +276,7 @@ final class UsageMonitor: ObservableObject {
 
         let state = await history.load(legacySamples: samples)
         apply(state)
+        weeklySamples = await weeklyHistory.load(legacySamples: samples).samples
         historyUsesFiles = state.errorMessage == nil
         if historyUsesFiles {
             persist()
@@ -267,6 +344,123 @@ final class UsageMonitor: ObservableObject {
         return base
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
             .appendingPathComponent("History", isDirectory: true)
+    }
+
+    private static func weeklyHistoryDirectory() -> URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        return base
+            .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
+            .appendingPathComponent("WeeklyHistory", isDirectory: true)
+    }
+
+    private func recordWeeklySample(from snapshot: UsageSnapshot) async {
+        guard let window = Self.weeklyWindow(in: snapshot) else { return }
+        let sample = UsageSample(
+            observedAt: snapshot.fetchedAt,
+            remainingPercent: window.remainingPercent,
+            resetsAt: window.resetsAt
+        )
+
+        if weeklySamples.isEmpty {
+            weeklySamples = await weeklyHistory.load(legacySamples: samples + [sample]).samples
+        } else {
+            weeklySamples = await weeklyHistory.record(sample).samples
+        }
+    }
+
+    private func updateWeeklyPace(from snapshot: UsageSnapshot) async {
+        guard let window = Self.weeklyWindow(in: snapshot) else {
+            weeklyPaceHours = nil
+            weeklyPacePoints = []
+            return
+        }
+        if let lastWeeklyPaceCalculationAt,
+           snapshot.fetchedAt.timeIntervalSince(lastWeeklyPaceCalculationAt) < 60 {
+            return
+        }
+        lastWeeklyPaceCalculationAt = snapshot.fetchedAt
+
+        let defaults = UserDefaults.standard
+        let showPreviousWindow = defaults.bool(forKey: Self.showPreviousWeeklyWindowKey)
+        let currentSamples = weeklySamples.filter {
+            abs($0.resetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
+        }
+        let firstCurrentDate = currentSamples.map(\.observedAt).min() ?? window.startsAt
+        let previousCandidates = weeklySamples.filter {
+            $0.observedAt < firstCurrentDate
+                && abs($0.resetsAt.timeIntervalSince(window.resetsAt)) > 5 * 60
+        }
+        let previousReset = showPreviousWindow
+            ? previousCandidates
+                .filter { candidate in
+                    Set(previousCandidates.lazy.filter {
+                        abs($0.resetsAt.timeIntervalSince(candidate.resetsAt)) <= 5 * 60
+                    }.map(\.remainingPercent)).count > 1
+                }
+                .max(by: { $0.observedAt < $1.observedAt })?
+                .resetsAt
+            : nil
+        let relevantSamples = weeklySamples.filter { sample in
+            let isCurrent = abs(sample.resetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
+            let isPrevious = previousReset.map { reset in
+                abs(sample.resetsAt.timeIntervalSince(reset)) <= 5 * 60
+            } ?? false
+            return isCurrent || isPrevious
+        }
+        guard let firstSample = relevantSamples.min(by: { $0.observedAt < $1.observedAt }) else {
+            weeklyPaceHours = nil
+            weeklyPacePoints = []
+            return
+        }
+
+        let activity = await CodexActivityReader.loadIntervals(
+            since: firstSample.observedAt,
+            now: snapshot.fetchedAt
+        )
+        let refreshSeconds = defaults.object(forKey: Self.refreshIntervalSecondsKey) == nil
+            ? 60
+            : defaults.integer(forKey: Self.refreshIntervalSecondsKey)
+        let tolerance = min(max(TimeInterval(refreshSeconds) * 1.5, 90), 15 * 60)
+        let factorInPauses = defaults.object(forKey: Self.factorInPausesKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.factorInPausesKey)
+        let lookbackMinutes = defaults.object(forKey: Self.paceLookbackMinutesKey) == nil
+            ? 60
+            : min(max(defaults.integer(forKey: Self.paceLookbackMinutesKey), 15), 180)
+        let lookback = TimeInterval(lookbackMinutes * 60)
+        let calculation = await Task.detached(priority: .utility) {
+            let points = WeeklyPaceCalculator.estimateSeries(
+                samples: relevantSamples,
+                activity: activity,
+                now: snapshot.fetchedAt,
+                sampleTolerance: tolerance,
+                factorInPauses: factorInPauses,
+                lookback: lookback
+            )
+            let currentSamples = relevantSamples.filter {
+                abs($0.resetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
+            }
+            let current = WeeklyPaceCalculator.estimate(
+                samples: currentSamples,
+                activity: activity,
+                now: snapshot.fetchedAt,
+                sampleTolerance: tolerance,
+                factorInPauses: factorInPauses,
+                lookback: lookback
+            )?.hoursPerWeek
+            return (points, current)
+        }.value
+        weeklyPacePoints = calculation.0
+        weeklyPaceHours = calculation.1
+    }
+
+    private static func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {
+        ([snapshot.mainLimit] + snapshot.otherLimits)
+            .first { $0.limitId == "codex" && $0.window.durationMinutes == 10_080 }?
+            .window
     }
 }
 

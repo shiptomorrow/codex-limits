@@ -13,6 +13,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Records local samples to show actual usage during the current window.
 - Compares actual usage with a straight target path ending at a configurable safety buffer.
 - Projects the current pace and compares it with recent historical usage.
+- Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage history in versioned daily JSON files.
 - Can optionally replicate usage history through a private folder selected by the user.
 - Refreshes on launch, wake, popover open, every ten minutes, or when requested manually.
@@ -26,7 +27,9 @@ Codex Limits is local-first:
 
 - It does not copy or store Codex credentials.
 - It starts the user-managed Codex CLI and reads usage through its local app-server interface.
+- For the weekly-hours estimate, it reads only task timestamps, task boundaries, and token-count metadata from local Codex session files. It does not use prompt or response text.
 - It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
+- Weekly-limit samples used by the activity estimate remain local and are not copied to a sync folder.
 - If history sync is enabled, it replicates only those samples to the selected folder. Preferences, credentials, and raw Codex responses remain local.
 - Synced history is readable JSON and contains observation times, remaining percentages, and reset times. Choose a private folder that is not shared with other people.
 - It has no telemetry, analytics, notifications, or direct network client.
@@ -38,7 +41,7 @@ Do not attach raw CLI output or screenshots containing account usage to public i
 
 - macOS 14 or later
 - Xcode 16.4 or later
-- a signed-in, Homebrew-managed Codex CLI at either `/opt/homebrew/bin/codex` or `/usr/local/bin/codex`
+- a signed-in Codex CLI at `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, or `~/.local/bin/codex`
 
 Codex Limits deliberately does not use a Codex binary bundled inside another application. Install and update the standalone CLI yourself.
 

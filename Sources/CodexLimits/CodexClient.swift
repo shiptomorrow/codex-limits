@@ -9,7 +9,7 @@ enum CodexClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cliNotFound:
-            "Codex CLI was not found. Install it with Homebrew, sign in, and try again."
+            "Codex CLI was not found. Install it, sign in, and try again."
         case .invalidResponse:
             "Codex returned data this app could not read. Update Codex CLI and try again."
         case .mainLimitMissing:
@@ -23,7 +23,9 @@ enum CodexClientError: LocalizedError {
 enum CodexClient {
     private static let executablePaths = [
         "/opt/homebrew/bin/codex",
-        "/usr/local/bin/codex"
+        "/usr/local/bin/codex",
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/codex").path
     ]
 
     static func fetch() async throws -> UsageSnapshot {
@@ -133,6 +135,10 @@ enum CodexClient {
             otherLimits: others,
             tokenHistory: tokenHistory,
             emergencyResetCount: rateResult.rateLimitResetCredits?.availableCount ?? 0,
+            nextEmergencyResetExpiration: rateResult.rateLimitResetCredits?.credits?
+                .compactMap(\.expiresAt)
+                .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                .min(),
             fetchedAt: fetchedAt
         )
     }
@@ -212,6 +218,11 @@ private struct RateLimitsResult: Decodable {
 
 private struct ResetCredits: Decodable {
     let availableCount: Int
+    let credits: [ResetCredit]?
+}
+
+private struct ResetCredit: Decodable {
+    let expiresAt: Int64?
 }
 
 private struct RateLimitSnapshot: Decodable {

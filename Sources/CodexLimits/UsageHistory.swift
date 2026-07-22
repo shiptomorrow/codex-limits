@@ -117,6 +117,24 @@ actor UsageHistory {
         return state()
     }
 
+    func reset() -> State {
+        knownSamples = []
+        do {
+            try prepareRoot(localDirectory, createIfMissing: true, coordinated: false)
+            try removeAllHistory(from: localDirectory, coordinated: false)
+            if let syncDirectory {
+                try prepareRoot(syncDirectory, createIfMissing: false, coordinated: true)
+                try removeAllHistory(from: syncDirectory, coordinated: true)
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = syncDirectory == nil
+                ? "Usage history couldn’t be reset."
+                : message(for: error)
+        }
+        return state()
+    }
+
     private func state(fallback: [UsageSample] = []) -> State {
         let local = readAll(from: localDirectory)
         if local.hadError && errorMessage == nil {
@@ -255,6 +273,15 @@ actor UsageHistory {
             }
         }
         return hadReadError
+    }
+
+    private func removeAllHistory(from root: URL, coordinated: Bool) throws {
+        let directory = installationsDirectory(in: root)
+        for writer in try directoryContents(of: directory) {
+            for file in try jsonFiles(in: writer) {
+                try removeItem(at: file, coordinated: coordinated)
+            }
+        }
     }
 
     private func readAll(from root: URL) -> (samples: [UsageSample], hadError: Bool) {

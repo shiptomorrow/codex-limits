@@ -62,6 +62,7 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
     let otherLimits: [LimitReading]
     let tokenHistory: [TokenDay]
     let emergencyResetCount: Int
+    let nextEmergencyResetExpiration: Date?
     let fetchedAt: Date
 }
 

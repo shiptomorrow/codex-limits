@@ -10,7 +10,11 @@ final class CodexClientTests: XCTestCase {
             "codex":{"limitId":"codex","primary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
             "codex_example":{"limitId":"codex_example","limitName":"Example model","primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":2100000}}
           },
-          "rateLimitResetCredits":{"availableCount":3}
+          "rateLimitResetCredits":{"availableCount":3,"credits":[
+            {"id":"later","grantedAt":1800000,"expiresAt":2200000,"resetType":"codexRateLimits","status":"available"},
+            {"id":"next","grantedAt":1800000,"expiresAt":2100000,"resetType":"codexRateLimits","status":"available"},
+            {"id":"none","grantedAt":1800000,"expiresAt":null,"resetType":"codexRateLimits","status":"available"}
+          ]}
         }}
         """#.utf8)
         let usage = Data(#"""
@@ -35,6 +39,7 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(result.otherLimits.map(\.name), ["Example model"])
         XCTAssertEqual(result.tokenHistory.map(\.tokens), [1_000, 250])
         XCTAssertEqual(result.emergencyResetCount, 3)
+        XCTAssertEqual(result.nextEmergencyResetExpiration, Date(timeIntervalSince1970: 2_100_000))
         XCTAssertEqual(result.fetchedAt, fetchedAt)
     }
 }

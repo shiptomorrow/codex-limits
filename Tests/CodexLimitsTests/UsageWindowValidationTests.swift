@@ -2,68 +2,16 @@ import XCTest
 @testable import CodexLimits
 
 final class UsageWindowValidationTests: XCTestCase {
-    func testRejectsRemainingPercentageIncreaseWithinSameWindow() {
+    func testKeepsIncreasePendingWithoutConfirmation() {
         let reset = Date(timeIntervalSince1970: 2_000_000)
-        let previous = UsageWindow(
-            remainingPercent: 52,
-            resetsAt: reset,
-            durationMinutes: 10_080
-        )
-        let stale = UsageWindow(
-            remainingPercent: 87,
-            resetsAt: reset,
-            durationMinutes: 10_080
-        )
+        let samples = [
+            UsageSample(observedAt: Date(timeIntervalSince1970: 1), remainingPercent: 25, resetsAt: reset),
+            UsageSample(observedAt: Date(timeIntervalSince1970: 2), remainingPercent: 31, resetsAt: reset)
+        ]
 
-        XCTAssertFalse(stale.isPlausibleSuccessor(to: previous))
-    }
+        let filtered = UsageReadingValidation.removingImplausibleIncreases(from: samples)
 
-    func testAcceptsFurtherUsageWithinSameWindow() {
-        let reset = Date(timeIntervalSince1970: 2_000_000)
-        let previous = UsageWindow(
-            remainingPercent: 52,
-            resetsAt: reset,
-            durationMinutes: 10_080
-        )
-        let current = UsageWindow(
-            remainingPercent: 50,
-            resetsAt: reset,
-            durationMinutes: 10_080
-        )
-
-        XCTAssertTrue(current.isPlausibleSuccessor(to: previous))
-    }
-
-    func testAcceptsIncreaseAfterResetWindowAdvances() {
-        let previousReset = Date(timeIntervalSince1970: 2_000_000)
-        let previous = UsageWindow(
-            remainingPercent: 2,
-            resetsAt: previousReset,
-            durationMinutes: 10_080
-        )
-        let reset = UsageWindow(
-            remainingPercent: 100,
-            resetsAt: previousReset.addingTimeInterval(7 * 24 * 60 * 60),
-            durationMinutes: 10_080
-        )
-
-        XCTAssertTrue(reset.isPlausibleSuccessor(to: previous))
-    }
-
-    func testTreatsSmallResetTimestampDriftAsSameWindow() {
-        let reset = Date(timeIntervalSince1970: 2_000_000)
-        let previous = UsageWindow(
-            remainingPercent: 52,
-            resetsAt: reset,
-            durationMinutes: 10_080
-        )
-        let stale = UsageWindow(
-            remainingPercent: 87,
-            resetsAt: reset.addingTimeInterval(2),
-            durationMinutes: 10_080
-        )
-
-        XCTAssertFalse(stale.isPlausibleSuccessor(to: previous))
+        XCTAssertEqual(filtered.map(\.remainingPercent), [25])
     }
 
     func testRemovesRepeatedStaleIncreasesFromSavedHistory() {
@@ -78,5 +26,47 @@ final class UsageWindowValidationTests: XCTestCase {
         let filtered = UsageReadingValidation.removingImplausibleIncreases(from: samples)
 
         XCTAssertEqual(filtered.map(\.remainingPercent), [52, 50])
+    }
+
+    func testAcceptsIncreaseConfirmedBySmallDecrease() {
+        let reset = Date(timeIntervalSince1970: 2_000_000)
+        let samples = [
+            UsageSample(observedAt: Date(timeIntervalSince1970: 1), remainingPercent: 25, resetsAt: reset),
+            UsageSample(observedAt: Date(timeIntervalSince1970: 301), remainingPercent: 31, resetsAt: reset),
+            UsageSample(observedAt: Date(timeIntervalSince1970: 302), remainingPercent: 30, resetsAt: reset)
+        ]
+
+        let filtered = UsageReadingValidation.removingImplausibleIncreases(from: samples)
+
+        XCTAssertEqual(filtered.map(\.remainingPercent), [25, 31, 30])
+    }
+
+    func testKeepsIncreasePendingWhenFollowingDecreaseIsTooLarge() {
+        let reset = Date(timeIntervalSince1970: 2_000_000)
+        let samples = [
+            UsageSample(observedAt: Date(timeIntervalSince1970: 1), remainingPercent: 25, resetsAt: reset),
+            UsageSample(observedAt: Date(timeIntervalSince1970: 2), remainingPercent: 40, resetsAt: reset),
+            UsageSample(observedAt: Date(timeIntervalSince1970: 3), remainingPercent: 30, resetsAt: reset)
+        ]
+
+        let filtered = UsageReadingValidation.removingImplausibleIncreases(from: samples)
+
+        XCTAssertEqual(filtered.map(\.remainingPercent), [25])
+    }
+
+    func testAcceptsIncreaseImmediatelyAfterWindowReset() {
+        let previousReset = Date(timeIntervalSince1970: 2_000_000)
+        let samples = [
+            UsageSample(observedAt: Date(timeIntervalSince1970: 1), remainingPercent: 2, resetsAt: previousReset),
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 2),
+                remainingPercent: 100,
+                resetsAt: previousReset.addingTimeInterval(7 * 24 * 60 * 60)
+            )
+        ]
+
+        let filtered = UsageReadingValidation.removingImplausibleIncreases(from: samples)
+
+        XCTAssertEqual(filtered.map(\.remainingPercent), [2, 100])
     }
 }

@@ -816,7 +816,7 @@ private struct BurnDownChart: View {
                 )
                 .foregroundStyle(currentColor)
                 .symbolSize(18)
-                .annotation(position: .top, spacing: 5) {
+                .annotation(position: .trailing, spacing: 5) {
                     Text("Now")
                         .font(.caption2)
                         .padding(.horizontal, 5)

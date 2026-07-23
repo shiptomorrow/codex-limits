@@ -22,18 +22,6 @@ struct UsageWindow: Codable, Equatable, Sendable {
         resetsAt.addingTimeInterval(-Double(durationMinutes) * 60)
     }
 
-    func isPlausibleSuccessor(
-        to previous: UsageWindow,
-        resetTolerance: TimeInterval = UsageReadingValidation.resetTolerance
-    ) -> Bool {
-        let isSameWindow = durationMinutes == previous.durationMinutes
-            && UsageReadingValidation.isSameWindow(
-                resetsAt: resetsAt,
-                previousReset: previous.resetsAt,
-                tolerance: resetTolerance
-            )
-        return !isSameWindow || remainingPercent <= previous.remainingPercent
-    }
 }
 
 struct UsageSample: Codable, Equatable, Hashable, Sendable {
@@ -72,16 +60,52 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
 
 enum UsageReadingValidation {
     static let resetTolerance: TimeInterval = 5 * 60
+    static let confirmationMaximumDecrease = 2.0
 
     static func removingImplausibleIncreases(from samples: [UsageSample]) -> [UsageSample] {
         var accepted: [UsageSample] = []
+        var pendingIncrease: [UsageSample] = []
+
         for sample in samples.sorted(by: { $0.observedAt < $1.observedAt }) {
-            if let previous = accepted.last,
-               isSameWindow(resetsAt: sample.resetsAt, previousReset: previous.resetsAt),
-               sample.remainingPercent > previous.remainingPercent {
+            guard let baseline = accepted.last else {
+                accepted.append(sample)
                 continue
             }
-            accepted.append(sample)
+
+            guard isSameWindow(
+                resetsAt: sample.resetsAt,
+                previousReset: baseline.resetsAt
+            ) else {
+                pendingIncrease.removeAll()
+                accepted.append(sample)
+                continue
+            }
+
+            guard let pending = pendingIncrease.last else {
+                if sample.remainingPercent <= baseline.remainingPercent {
+                    accepted.append(sample)
+                } else {
+                    pendingIncrease = [sample]
+                }
+                continue
+            }
+
+            if sample.remainingPercent <= baseline.remainingPercent {
+                pendingIncrease.removeAll()
+                accepted.append(sample)
+                continue
+            }
+
+            let decrease = pending.remainingPercent - sample.remainingPercent
+            if decrease > 0, decrease <= confirmationMaximumDecrease {
+                accepted.append(contentsOf: pendingIncrease)
+                accepted.append(sample)
+                pendingIncrease.removeAll()
+            } else if decrease > confirmationMaximumDecrease {
+                pendingIncrease = [sample]
+            } else {
+                pendingIncrease.append(sample)
+            }
         }
         return accepted
     }

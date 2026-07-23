@@ -157,14 +157,6 @@ final class UsageMonitor: ObservableObject {
         do {
             let newSnapshot = try await fetchTask.value
             let window = newSnapshot.mainLimit.window
-            if let previousWindow = snapshot?.mainLimit.window,
-               !window.isPlausibleSuccessor(to: previousWindow) {
-                logger.info(
-                    "Ignoring implausible remaining percentage increase from \(previousWindow.remainingPercent, privacy: .public) to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
-                )
-                errorMessage = nil
-                return
-            }
             let sample = UsageSample(
                 observedAt: newSnapshot.fetchedAt,
                 remainingPercent: window.remainingPercent,
@@ -176,6 +168,13 @@ final class UsageMonitor: ObservableObject {
                 syncErrorMessage = exchangeErrorMessage
             }
             await recordWeeklySample(from: newSnapshot)
+            guard samples.contains(sample) else {
+                logger.info(
+                    "Recorded pending remaining percentage increase to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
+                )
+                errorMessage = nil
+                return
+            }
             snapshot = newSnapshot
             errorMessage = nil
             recalculate()

@@ -111,4 +111,46 @@ final class ForecastEngineTests: XCTestCase {
         XCTAssertEqual(result.safetyRemainingAtReset, 3.5, accuracy: 0.01)
         XCTAssertEqual(result.status, .slowDown)
     }
+
+    func testRuntimeRateDrivesCurrentProjectionWithoutHistoricalBlend() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 300 * day)
+        let reset = now.addingTimeInterval(6 * day)
+        let previousReset = now.addingTimeInterval(-day)
+        let window = UsageWindow(
+            remainingPercent: 99,
+            resetsAt: reset,
+            durationMinutes: 7 * 24 * 60
+        )
+        let samples = [
+            UsageSample(
+                observedAt: previousReset.addingTimeInterval(-day),
+                remainingPercent: 100,
+                resetsAt: previousReset
+            ),
+            UsageSample(
+                observedAt: previousReset,
+                remainingPercent: 25,
+                resetsAt: previousReset
+            )
+        ]
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: samples,
+            tokenHistory: [],
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: .slowDown,
+            runtimePercentPerDay: 2,
+            historicalRuntimePercentPerDay: 4
+        )
+
+        XCTAssertEqual(result.currentPercentPerDay, 2, accuracy: 0.01)
+        XCTAssertEqual(result.expectedRemainingAtReset, 87, accuracy: 0.01)
+        XCTAssertEqual(result.safetyRemainingAtReset, 84.6, accuracy: 0.01)
+        XCTAssertEqual(result.historicalPercentPerDay, 4, accuracy: 0.01)
+        XCTAssertEqual(result.historicalRemainingAtReset, 75, accuracy: 0.01)
+        XCTAssertEqual(result.status, .roomToUseMore)
+    }
 }

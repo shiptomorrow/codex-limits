@@ -50,7 +50,7 @@ struct MenuContentView: View {
                 }
                 .overlay(alignment: .topTrailing) {
                     HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Text(usingPaceValueText(forecast: forecast))
+                        Text(usingPaceValueText)
                             .font(.system(size: 20))
                             .foregroundStyle(.primary)
                             .monospacedDigit()
@@ -60,7 +60,11 @@ struct MenuContentView: View {
                     }
                         .offset(y: 44)
                 }
-                .help("Estimated active Codex hours supported by a full weekly allowance at the recent pace")
+                .help(
+                    "Weekly pace estimates the active hours supported by the allowance. "
+                        + "Used per day averages actual thread runtime across the last two completed "
+                        + "7 AM–7 AM days."
+                )
                 Button {
                     Task { await monitor.refresh() }
                 } label: {
@@ -85,7 +89,7 @@ struct MenuContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .overlay(alignment: .bottomLeading) {
-                Text(projectedUsageText(forecast: forecast))
+                Text(projectedUsageText)
                     .foregroundStyle(.secondary)
                     .offset(y: 19)
             }
@@ -270,11 +274,10 @@ struct MenuContentView: View {
         return "\(value)h"
     }
 
-    private func usingPaceValueText(forecast: Forecast) -> String {
-        guard let weeklyPaceHours = monitor.weeklyPaceHours else {
+    private var usingPaceValueText: String {
+        guard let hoursPerDay = monitor.dailyRuntimeHours else {
             return "—h"
         }
-        let hoursPerDay = weeklyPaceHours * forecast.currentPercentPerDay / 100
         return "\(oneDecimal(hoursPerDay))h"
     }
 
@@ -342,14 +345,21 @@ struct MenuContentView: View {
         }
     }
 
-    private func projectedUsageText(forecast: Forecast) -> String {
-        guard let weeklyPaceHours = monitor.weeklyPaceHours, weeklyPaceHours > 0 else {
+    private var projectedUsageText: String {
+        guard let weeklyPaceHours = monitor.weeklyPaceHours,
+              weeklyPaceHours > 0,
+              let dailyRuntimeHours = monitor.dailyRuntimeHours else {
             return ""
         }
-        let hoursUsedPerDay = weeklyPaceHours * forecast.currentPercentPerDay / 100
-        let multiple = hoursUsedPerDay * 7 / weeklyPaceHours
+        let multiple = dailyRuntimeHours * 7 / weeklyPaceHours
         guard multiple.isFinite else { return "" }
-        return "Projected weekly usage is \(oneDecimal(multiple))x your limit."
+        let digits = multiple < 1 ? 2 : 1
+        let value = multiple.formatted(
+            .number
+                .precision(.fractionLength(digits))
+                .locale(Locale(identifier: "en_US"))
+        )
+        return "Projected weekly usage is \(value)x your limit."
     }
 
     private func paceText(forecast: Forecast) -> String {

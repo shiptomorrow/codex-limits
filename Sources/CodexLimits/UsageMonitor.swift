@@ -15,6 +15,8 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var forecast: Forecast?
     @Published private(set) var samples: [UsageSample] = []
     @Published private(set) var weeklyPaceHours: Double?
+    @Published private(set) var dailyRuntimeHours: Double?
+    @Published private(set) var historicalDailyRuntimeHours: Double?
     @Published private(set) var weeklyPacePoints: [WeeklyPacePoint] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
@@ -168,6 +170,7 @@ final class UsageMonitor: ObservableObject {
                 syncErrorMessage = exchangeErrorMessage
             }
             await recordWeeklySample(from: newSnapshot)
+            await updateDailyRuntime(now: newSnapshot.fetchedAt)
             guard samples.contains(sample) else {
                 logger.info(
                     "Recorded pending remaining percentage increase to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
@@ -275,7 +278,9 @@ final class UsageMonitor: ObservableObject {
             tokenHistory: snapshot.tokenHistory,
             safetyBuffer: buffer,
             now: snapshot.fetchedAt,
-            previousStatus: previousStatus
+            previousStatus: previousStatus,
+            runtimePercentPerDay: runtimePercentPerDay,
+            historicalRuntimePercentPerDay: historicalRuntimePercentPerDay
         )
         forecast = result
         previousStatus = result.status
@@ -400,6 +405,10 @@ final class UsageMonitor: ObservableObject {
     }
 
     private func updateWeeklyPace(from snapshot: UsageSnapshot) async {
+        defer {
+            recalculate()
+            persist()
+        }
         guard let window = Self.weeklyWindow(in: snapshot) else {
             weeklyPaceHours = nil
             weeklyPacePoints = []
@@ -477,6 +486,50 @@ final class UsageMonitor: ObservableObject {
         }.value
         weeklyPacePoints = calculation.0
         weeklyPaceHours = calculation.1
+    }
+
+    private var runtimePercentPerDay: Double? {
+        runtimePercentPerDay(for: dailyRuntimeHours)
+    }
+
+    private var historicalRuntimePercentPerDay: Double? {
+        runtimePercentPerDay(for: historicalDailyRuntimeHours)
+    }
+
+    private func runtimePercentPerDay(for hours: Double?) -> Double? {
+        guard let hours,
+              let weeklyPaceHours,
+              weeklyPaceHours.isFinite,
+              weeklyPaceHours > 0 else {
+            return nil
+        }
+        return hours / weeklyPaceHours * 100
+    }
+
+    private func updateDailyRuntime(now: Date) async {
+        guard let windows = DailyRuntimeCalculator.completedDayWindows(
+            now: now,
+            dayCount: DailyRuntimeCalculator.completedDayCount * 2
+        ),
+              let first = windows.first,
+              let last = windows.last else {
+            dailyRuntimeHours = nil
+            historicalDailyRuntimeHours = nil
+            return
+        }
+        let activity = await CodexActivityReader.loadIntervals(
+            since: first.start,
+            now: last.end
+        )
+        dailyRuntimeHours = DailyRuntimeCalculator.averageCompletedDayHours(
+            activity: activity,
+            now: now
+        )
+        historicalDailyRuntimeHours = DailyRuntimeCalculator.averageCompletedDayHours(
+            activity: activity,
+            now: now,
+            dayOffset: DailyRuntimeCalculator.completedDayCount
+        )
     }
 
     private static func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {

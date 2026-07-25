@@ -21,6 +21,83 @@ struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
     var id: Date { date }
 }
 
+enum DailyRuntimeCalculator {
+    static let dayStartHour = 7
+    static let completedDayCount = 2
+
+    static func averageCompletedDayHours(
+        activity: [ActivityInterval],
+        now: Date,
+        calendar: Calendar = .current,
+        dayOffset: Int = 0,
+        dayCount: Int = completedDayCount
+    ) -> Double? {
+        guard let windows = completedDayWindows(
+            now: now,
+            calendar: calendar,
+            dayOffset: dayOffset,
+            dayCount: dayCount
+        ) else {
+            return nil
+        }
+        let totalDuration = windows.reduce(0.0) { total, window in
+            let clipped = activity.compactMap { interval -> ActivityInterval? in
+                let start = max(interval.start, window.start)
+                let end = min(interval.end, window.end)
+                guard end > start else { return nil }
+                return ActivityInterval(start: start, end: end)
+            }
+            let merged = WeeklyPaceCalculator.merged(clipped, joiningGapsUpTo: 0)
+            return total + merged.reduce(0) { $0 + $1.duration }
+        }
+        return totalDuration / Double(dayCount) / 3_600
+    }
+
+    static func completedDayWindows(
+        now: Date,
+        calendar: Calendar = .current,
+        dayOffset: Int = 0,
+        dayCount: Int = completedDayCount
+    ) -> [(start: Date, end: Date)]? {
+        guard dayOffset >= 0, dayCount > 0 else { return nil }
+        guard var currentStart = calendar.date(
+            bySettingHour: dayStartHour,
+            minute: 0,
+            second: 0,
+            of: now
+        ) else {
+            return nil
+        }
+        if now < currentStart {
+            guard let previousStart = calendar.date(
+                byAdding: .day,
+                value: -1,
+                to: currentStart
+            ) else {
+                return nil
+            }
+            currentStart = previousStart
+        }
+
+        var windows: [(start: Date, end: Date)] = []
+        var end = currentStart
+        for _ in 0 ..< dayOffset {
+            guard let previous = calendar.date(byAdding: .day, value: -1, to: end) else {
+                return nil
+            }
+            end = previous
+        }
+        for _ in 0 ..< dayCount {
+            guard let start = calendar.date(byAdding: .day, value: -1, to: end) else {
+                return nil
+            }
+            windows.append((start: start, end: end))
+            end = start
+        }
+        return Array(windows.reversed())
+    }
+}
+
 enum WeeklyPaceCalculator {
     static let idleGap: TimeInterval = 15 * 60
     private static let resetTimeTolerance: TimeInterval = 5 * 60

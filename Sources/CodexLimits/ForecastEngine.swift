@@ -7,7 +7,9 @@ enum ForecastEngine {
         tokenHistory: [TokenDay],
         safetyBuffer: Double,
         now: Date,
-        previousStatus: PaceStatus?
+        previousStatus: PaceStatus?,
+        runtimePercentPerDay: Double? = nil,
+        historicalRuntimePercentPerDay: Double? = nil
     ) -> Forecast {
         let daysLeft = max(window.resetsAt.timeIntervalSince(now) / 86_400, 0)
         let currentSamples = samples
@@ -26,7 +28,7 @@ enum ForecastEngine {
             recentRate = windowRate
         }
 
-        let currentRate = currentSamples.count > 1
+        let observedCurrentRate = currentSamples.count > 1
             ? 0.7 * recentRate + 0.3 * windowRate
             : windowRate
         let historicalRates = Dictionary(grouping: samples.filter { $0.resetsAt != window.resetsAt }) {
@@ -39,19 +41,27 @@ enum ForecastEngine {
             let days = last.observedAt.timeIntervalSince(first.observedAt) / 86_400
             return max((first.remainingPercent - last.remainingPercent) / days, 0)
         }
-        let historicalRate: Double
+        let observedHistoricalRate: Double
         if historicalRates.isEmpty {
-            historicalRate = tokenBootstrapRate(
+            observedHistoricalRate = tokenBootstrapRate(
                 window: window,
                 windowRate: windowRate,
                 tokenHistory: tokenHistory,
                 now: now
-            ) ?? currentRate
+            ) ?? observedCurrentRate
         } else {
-            historicalRate = historicalRates.reduce(0, +) / Double(historicalRates.count)
+            observedHistoricalRate = historicalRates.reduce(0, +) / Double(historicalRates.count)
         }
-        let expectedRate = 0.75 * currentRate + 0.25 * historicalRate
-        let safetyRate = max(currentRate, historicalRate) * 1.2
+        let validRuntimeRate = runtimePercentPerDay.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
+        let historicalRate = historicalRuntimePercentPerDay.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        } ?? observedHistoricalRate
+        let expectedRate = validRuntimeRate
+            ?? (0.75 * observedCurrentRate + 0.25 * historicalRate)
+        let safetyRate = validRuntimeRate.map { $0 * 1.2 }
+            ?? (max(observedCurrentRate, historicalRate) * 1.2)
         let expected = max(window.remainingPercent - expectedRate * daysLeft, 0)
         let safety = max(window.remainingPercent - safetyRate * daysLeft, 0)
         let historical = max(window.remainingPercent - historicalRate * daysLeft, 0)

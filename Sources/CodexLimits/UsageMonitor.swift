@@ -511,17 +511,16 @@ final class UsageMonitor: ObservableObject {
             now: now,
             dayCount: DailyRuntimeCalculator.completedDayCount * 2
         ),
-              let first = windows.first,
-              let last = windows.last else {
+              let first = windows.first else {
             dailyRuntimeHours = nil
             historicalDailyRuntimeHours = nil
             return
         }
         let activity = await CodexActivityReader.loadIntervals(
             since: first.start,
-            now: last.end
+            now: now
         )
-        dailyRuntimeHours = DailyRuntimeCalculator.averageCompletedDayHours(
+        dailyRuntimeHours = DailyRuntimeCalculator.averageRecentDayHours(
             activity: activity,
             now: now
         )

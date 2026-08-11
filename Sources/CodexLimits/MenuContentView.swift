@@ -10,6 +10,7 @@ struct MenuContentView: View {
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
+    @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
 
@@ -28,7 +29,12 @@ struct MenuContentView: View {
     }
 
     private func dashboard(snapshot: UsageSnapshot, forecast: Forecast) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let visibleOtherLimits = OtherLimitPreferences.visibleLimits(
+            from: snapshot.otherLimits,
+            hideCodex53Spark: hideCodex53Spark
+        )
+
+        return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 2.5) {
                     Text(
@@ -62,8 +68,9 @@ struct MenuContentView: View {
                 }
                 .help(
                     "Weekly pace estimates the active hours supported by the allowance. "
-                        + "Used per day averages actual thread runtime across the last two completed "
-                        + "7 AM–7 AM days."
+                        + "Used per day ignores days under five minutes and averages the last two "
+                        + "completed 7 AM–7 AM days until today exceeds the most recent usable day, "
+                        + "then it uses today alone."
                 )
                 Button {
                     Task { await monitor.refresh() }
@@ -185,12 +192,12 @@ struct MenuContentView: View {
                 .font(.callout)
             }
 
-            if !snapshot.otherLimits.isEmpty {
+            if !visibleOtherLimits.isEmpty {
                 Divider()
                 Text("Other limits")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                ForEach(snapshot.otherLimits) { limit in
+                ForEach(visibleOtherLimits) { limit in
                     TimelineView(.periodic(from: .now, by: 60)) { context in
                         HStack {
                             Text(limit.name)
@@ -971,6 +978,7 @@ struct SettingsView: View {
     @AppStorage(UsageMonitor.paceLookbackMinutesKey) private var paceLookbackMinutes = 60
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
+    @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
@@ -1036,6 +1044,8 @@ struct SettingsView: View {
                     setPaceLookback(previousPaceLookback)
                 }
                 .help("Use this much recent activity to estimate the weekly pace")
+
+                Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }
 
             Section("History sync") {

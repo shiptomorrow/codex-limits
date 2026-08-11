@@ -13,6 +13,25 @@ enum UsagePercentageDisplay {
     }
 }
 
+enum OtherLimitPreferences {
+    static let hideCodex53SparkKey = "hideCodex53SparkLimit"
+
+    static func visibleLimits(
+        from limits: [LimitReading],
+        hideCodex53Spark: Bool
+    ) -> [LimitReading] {
+        guard hideCodex53Spark else { return limits }
+        return limits.filter { !isCodex53Spark($0) }
+    }
+
+    private static func isCodex53Spark(_ limit: LimitReading) -> Bool {
+        let identity = "\(limit.limitId) \(limit.name)"
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+        return identity.contains("53") && identity.contains("spark")
+    }
+}
+
 struct UsageWindow: Codable, Equatable, Sendable {
     let remainingPercent: Double
     let resetsAt: Date

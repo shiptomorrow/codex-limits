@@ -64,6 +64,143 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(hours, 1.5, accuracy: 0.001)
     }
 
+    func testDailyRuntimeIgnoresDaysUnderFiveMinutes() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 24,
+            hour: 12
+        )))
+        let activity = [
+            ActivityInterval(
+                start: now.addingTimeInterval(-52 * 3_600),
+                end: now.addingTimeInterval(-52 * 3_600 + 4 * 60)
+            ),
+            ActivityInterval(
+                start: now.addingTimeInterval(-29 * 3_600),
+                end: now.addingTimeInterval(-27 * 3_600)
+            )
+        ]
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.averageCompletedDayHours(
+            activity: activity,
+            now: now,
+            calendar: calendar
+        ))
+
+        XCTAssertEqual(hours, 2, accuracy: 0.001)
+    }
+
+    func testDailyRuntimeReturnsNilWhenEveryDayIsUnderFiveMinutes() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 24,
+            hour: 12
+        )))
+        let activity = [
+            ActivityInterval(
+                start: now.addingTimeInterval(-52 * 3_600),
+                end: now.addingTimeInterval(-52 * 3_600 + 4 * 60)
+            ),
+            ActivityInterval(
+                start: now.addingTimeInterval(-28 * 3_600),
+                end: now.addingTimeInterval(-28 * 3_600 + 2 * 60)
+            )
+        ]
+
+        XCTAssertNil(DailyRuntimeCalculator.averageCompletedDayHours(
+            activity: activity,
+            now: now,
+            calendar: calendar
+        ))
+    }
+
+    func testRecentDailyRuntimeUsesOnlyCurrentDayAfterItExceedsMostRecentUsableDay() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let olderDay = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 22,
+            hour: 7
+        )))
+        let previousDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: olderDay))
+        let currentDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: previousDay))
+        let now = currentDay.addingTimeInterval(5 * 3_600)
+        let activity = [
+            ActivityInterval(start: olderDay, end: olderDay.addingTimeInterval(3 * 3_600)),
+            ActivityInterval(start: previousDay, end: previousDay.addingTimeInterval(1 * 3_600)),
+            ActivityInterval(start: currentDay, end: currentDay.addingTimeInterval(2 * 3_600))
+        ]
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.averageRecentDayHours(
+            activity: activity,
+            now: now,
+            calendar: calendar
+        ))
+
+        XCTAssertEqual(hours, 2, accuracy: 0.001)
+    }
+
+    func testRecentDailyRuntimeKeepsCompletedDaysUntilCurrentExceedsMostRecentDay() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let olderDay = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 22,
+            hour: 7
+        )))
+        let previousDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: olderDay))
+        let currentDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: previousDay))
+        let now = currentDay.addingTimeInterval(5 * 3_600)
+        let activity = [
+            ActivityInterval(start: olderDay, end: olderDay.addingTimeInterval(3 * 3_600)),
+            ActivityInterval(start: previousDay, end: previousDay.addingTimeInterval(1 * 3_600)),
+            ActivityInterval(start: currentDay, end: currentDay.addingTimeInterval(30 * 60))
+        ]
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.averageRecentDayHours(
+            activity: activity,
+            now: now,
+            calendar: calendar
+        ))
+
+        XCTAssertEqual(hours, 2, accuracy: 0.001)
+    }
+
+    func testRecentDailyRuntimeDoesNotSwitchWhenCurrentOnlyExceedsOlderDay() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let olderDay = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 22,
+            hour: 7
+        )))
+        let previousDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: olderDay))
+        let currentDay = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: previousDay))
+        let now = currentDay.addingTimeInterval(5 * 3_600)
+        let activity = [
+            ActivityInterval(start: olderDay, end: olderDay.addingTimeInterval(1 * 3_600)),
+            ActivityInterval(start: previousDay, end: previousDay.addingTimeInterval(4 * 3_600)),
+            ActivityInterval(start: currentDay, end: currentDay.addingTimeInterval(2 * 3_600))
+        ]
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.averageRecentDayHours(
+            activity: activity,
+            now: now,
+            calendar: calendar
+        ))
+
+        XCTAssertEqual(hours, 2.5, accuracy: 0.001)
+    }
+
     func testHistoricalDailyRuntimeUsesPrecedingTwoDays() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))

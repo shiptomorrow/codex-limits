@@ -24,6 +24,36 @@ struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
 enum DailyRuntimeCalculator {
     static let dayStartHour = 7
     static let completedDayCount = 2
+    static let minimumIncludedDayHours = 5.0 / 60
+
+    static func averageRecentDayHours(
+        activity: [ActivityInterval],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> Double? {
+        guard let windows = completedDayWindows(
+            now: now,
+            calendar: calendar,
+            dayCount: completedDayCount
+        ), windows.count == completedDayCount,
+           let currentDayStart = windows.last?.end else {
+            return nil
+        }
+
+        let completedHours = windows.map {
+            hours(activity: activity, from: $0.start, to: $0.end)
+        }.filter(isIncludedDay)
+        let currentHours = hours(activity: activity, from: currentDayStart, to: now)
+        guard !completedHours.isEmpty else {
+            return isIncludedDay(currentHours) ? currentHours : nil
+        }
+        if let lastCompletedHours = completedHours.last,
+           isIncludedDay(currentHours),
+           currentHours > lastCompletedHours {
+            return currentHours
+        }
+        return completedHours.reduce(0, +) / Double(completedHours.count)
+    }
 
     static func averageCompletedDayHours(
         activity: [ActivityInterval],
@@ -40,17 +70,13 @@ enum DailyRuntimeCalculator {
         ) else {
             return nil
         }
-        let totalDuration = windows.reduce(0.0) { total, window in
-            let clipped = activity.compactMap { interval -> ActivityInterval? in
-                let start = max(interval.start, window.start)
-                let end = min(interval.end, window.end)
-                guard end > start else { return nil }
-                return ActivityInterval(start: start, end: end)
-            }
-            let merged = WeeklyPaceCalculator.merged(clipped, joiningGapsUpTo: 0)
-            return total + merged.reduce(0) { $0 + $1.duration }
+        let includedHours = windows.map { window in
+            hours(activity: activity, from: window.start, to: window.end)
+        }.filter(isIncludedDay)
+        guard !includedHours.isEmpty else {
+            return nil
         }
-        return totalDuration / Double(dayCount) / 3_600
+        return includedHours.reduce(0, +) / Double(includedHours.count)
     }
 
     static func completedDayWindows(
@@ -95,6 +121,25 @@ enum DailyRuntimeCalculator {
             end = start
         }
         return Array(windows.reversed())
+    }
+
+    private static func hours(
+        activity: [ActivityInterval],
+        from windowStart: Date,
+        to windowEnd: Date
+    ) -> Double {
+        let clipped = activity.compactMap { interval -> ActivityInterval? in
+            let start = max(interval.start, windowStart)
+            let end = min(interval.end, windowEnd)
+            guard end > start else { return nil }
+            return ActivityInterval(start: start, end: end)
+        }
+        let merged = WeeklyPaceCalculator.merged(clipped, joiningGapsUpTo: 0)
+        return merged.reduce(0) { $0 + $1.duration } / 3_600
+    }
+
+    private static func isIncludedDay(_ hours: Double) -> Bool {
+        hours >= minimumIncludedDayHours
     }
 }
 

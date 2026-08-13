@@ -13,6 +13,10 @@ enum UsagePercentageDisplay {
     }
 }
 
+enum EstimatedRuntimeChartPreferences {
+    static let reversesYAxisKey = "reverseEstimatedRuntimeChart"
+}
+
 enum OtherLimitPreferences {
     static let hideCodex53SparkKey = "hideCodex53SparkLimit"
 

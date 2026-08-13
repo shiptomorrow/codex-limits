@@ -10,6 +10,7 @@ struct MenuContentView: View {
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
+    @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
@@ -144,7 +145,8 @@ struct MenuContentView: View {
                         points: monitor.weeklyPacePoints,
                         fetchedAt: snapshot.fetchedAt,
                         factorInPauses: factorInPauses,
-                        showsPreviousWindow: showPreviousWeeklyWindow
+                        showsPreviousWindow: showPreviousWeeklyWindow,
+                        reversesYAxis: reversesEstimatedRuntimeChart
                     )
                 }
             }
@@ -465,6 +467,7 @@ private struct WeeklyPaceChart: View {
     let fetchedAt: Date
     let factorInPauses: Bool
     let showsPreviousWindow: Bool
+    let reversesYAxis: Bool
 
     private var displayedPoints: [WeeklyPacePoint] {
         points
@@ -633,7 +636,7 @@ private struct WeeklyPaceChart: View {
                     }
                 }
                 .chartXScale(domain: xDomain)
-                .chartYScale(domain: [maximumHours, 0])
+                .chartYScale(domain: reversesYAxis ? [maximumHours, 0] : [0, maximumHours])
                 .chartXAxis {
                     AxisMarks(values: xAxisValues) { value in
                         AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
@@ -1378,6 +1381,7 @@ struct SettingsView: View {
     @AppStorage(UsageMonitor.paceLookbackMinutesKey) private var paceLookbackMinutes = 60
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
+    @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
@@ -1444,6 +1448,8 @@ struct SettingsView: View {
                     setPaceLookback(previousPaceLookback)
                 }
                 .help("Use this much recent activity to estimate the weekly pace")
+
+                Toggle("Reverse estimated runtime chart", isOn: $reversesEstimatedRuntimeChart)
 
                 Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }

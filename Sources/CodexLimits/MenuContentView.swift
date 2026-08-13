@@ -48,9 +48,14 @@ struct MenuContentView: View {
                 }
                 Spacer()
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(weeklyPaceValueText)
-                        .font(.system(size: 34, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {
+                        Text(weeklyPaceValueText)
+                            .font(.system(size: 34, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                        Text("h")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.primary)
+                    }
                     Text("/ week pace")
                         .foregroundStyle(.secondary)
                 }
@@ -60,6 +65,9 @@ struct MenuContentView: View {
                             .font(.system(size: 20))
                             .foregroundStyle(.primary)
                             .monospacedDigit()
+                        Text("h")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.primary)
                         Text(" used / day")
                             .font(.body)
                             .foregroundStyle(.secondary)
@@ -91,13 +99,11 @@ struct MenuContentView: View {
                 Text(statusTitle(forecast.status))
                     .font(.headline)
                     .foregroundStyle(statusColor(forecast.status))
-                Text(statusMessage(snapshot: snapshot, forecast: forecast))
-                    .foregroundStyle(.secondary)
+                statusMessage(snapshot: snapshot, forecast: forecast)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .overlay(alignment: .bottomLeading) {
-                Text(projectedUsageText)
-                    .foregroundStyle(.secondary)
+                projectedUsageText
                     .offset(y: 19)
             }
 
@@ -275,18 +281,17 @@ struct MenuContentView: View {
 
     private var weeklyPaceValueText: String {
         guard let hours = monitor.weeklyPaceHours else {
-            return "—h"
+            return "—"
         }
         let digits = hours < 10 ? 1 : 0
-        let value = hours.formatted(.number.precision(.fractionLength(digits)))
-        return "\(value)h"
+        return hours.formatted(.number.precision(.fractionLength(digits)))
     }
 
     private var usingPaceValueText: String {
         guard let hoursPerDay = monitor.dailyRuntimeHours else {
-            return "—h"
+            return "—"
         }
-        return "\(oneDecimal(hoursPerDay))h"
+        return oneDecimal(hoursPerDay)
     }
 
     private func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {
@@ -331,7 +336,7 @@ struct MenuContentView: View {
         }
     }
 
-    private func statusMessage(snapshot: UsageSnapshot, forecast: Forecast) -> String {
+    private func statusMessage(snapshot: UsageSnapshot, forecast: Forecast) -> Text {
         switch forecast.status {
         case .slowDown:
             let window = snapshot.mainLimit.window
@@ -339,35 +344,52 @@ struct MenuContentView: View {
             let timeToEmpty = window.remainingPercent / max(forecast.safetyPercentPerDay, 0.01) * 86_400
             let early = max(timeLeft - timeToEmpty, 0)
             return early > 0
-                ? "At this pace, your limit may run out \(durationText(early)) early."
-                : "Your current pace is too close to the limit."
+                ? Text("At this pace, your limit may run out ").foregroundColor(.secondary)
+                    + Text("\(durationText(early)) early").fontWeight(.semibold).foregroundColor(.secondary)
+                    + Text(".").foregroundColor(.secondary)
+                : Text("Your current pace is too close to the limit.").foregroundColor(.secondary)
         case .onTrack:
             if showsUsedPercentage {
                 let expectedUsed = displayedPercent(forecast.expectedRemainingAtReset)
-                return "You’re on track to use \(Int(expectedUsed.rounded()))% by reset."
+                return Text("You’re on track to use ").foregroundColor(.secondary)
+                    + Text("\(Int(expectedUsed.rounded()))%").fontWeight(.semibold).foregroundColor(.secondary)
+                    + Text(" by reset.").foregroundColor(.secondary)
             }
-            return "You’re on track to have \(Int(forecast.expectedRemainingAtReset.rounded()))% left at reset."
+            return Text("You’re on track to have ").foregroundColor(.secondary)
+                + Text("\(Int(forecast.expectedRemainingAtReset.rounded()))% left").fontWeight(.semibold).foregroundColor(.secondary)
+                + Text(" at reset.").foregroundColor(.secondary)
         case .roomToUseMore:
             let room = max(forecast.expectedRemainingAtReset - safetyBuffer, 0)
-            return "You can use about \(Int(room.rounded()))% more before the reset."
+            return Text("You can use about ").foregroundColor(.secondary)
+                + Text("\(Int(room.rounded()))% more").fontWeight(.semibold).foregroundColor(.secondary)
+                + Text(" before the reset.").foregroundColor(.secondary)
         }
     }
 
-    private var projectedUsageText: String {
+    private var projectedUsageText: Text {
         guard let weeklyPaceHours = monitor.weeklyPaceHours,
               weeklyPaceHours > 0,
               let dailyRuntimeHours = monitor.dailyRuntimeHours else {
-            return ""
+            return Text("")
         }
         let multiple = dailyRuntimeHours * 7 / weeklyPaceHours
-        guard multiple.isFinite else { return "" }
-        let digits = multiple < 1 ? 2 : 1
-        let value = multiple.formatted(
-            .number
-                .precision(.fractionLength(digits))
-                .locale(Locale(identifier: "en_US"))
-        )
-        return "Projected weekly usage is \(value)x your limit."
+        guard multiple.isFinite else { return Text("") }
+        let value = if multiple < 1 {
+            multiple.formatted(
+                .number
+                    .precision(.fractionLength(0...2))
+                    .locale(Locale(identifier: "en_US"))
+            )
+        } else {
+            multiple.formatted(
+                .number
+                    .precision(.fractionLength(1))
+                    .locale(Locale(identifier: "en_US"))
+            )
+        }
+        return Text("Projected weekly usage is ").foregroundColor(.secondary)
+            + Text("\(value)x").fontWeight(.semibold).foregroundColor(.secondary)
+            + Text(" your limit.").foregroundColor(.secondary)
     }
 
     private func paceText(forecast: Forecast) -> String {

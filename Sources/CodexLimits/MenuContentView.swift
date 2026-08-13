@@ -523,6 +523,17 @@ private struct WeeklyPaceChart: View {
         }
     }
 
+    private var hoverSpans: [WeeklyPaceHoverSpan] {
+        segments.map { segment in
+            WeeklyPaceHoverSpan(
+                startPosition: timeline.position(for: segment.start.date),
+                endPosition: timeline.position(for: segment.end.date),
+                hoursPerWeek: segment.start.hoursPerWeek,
+                isFastMode: segment.isFastMode
+            )
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 4) {
@@ -583,7 +594,16 @@ private struct WeeklyPaceChart: View {
                         .foregroundStyle(latest.isFastMode ? Color.orange : Color.purple)
                         .symbolSize(28)
                         .annotation(position: .trailing, spacing: 5) {
-                            Text("\(latest.hoursPerWeek.formatted(.number.precision(.fractionLength(latest.hoursPerWeek < 10 ? 1 : 0)))) h")
+                            HStack(alignment: .firstTextBaseline, spacing: 1) {
+                                Text(
+                                    latest.hoursPerWeek.formatted(
+                                        .number.precision(
+                                            .fractionLength(latest.hoursPerWeek < 10 ? 1 : 0)
+                                        )
+                                    )
+                                )
+                                Text("h")
+                            }
                                 .font(.caption2)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
@@ -631,6 +651,13 @@ private struct WeeklyPaceChart: View {
                     }
                 }
                 .chartLegend(.hidden)
+                .chartOverlay { proxy in
+                    WeeklyPaceHoverOverlay(
+                        proxy: proxy,
+                        spans: hoverSpans,
+                        maximumHours: maximumHours
+                    )
+                }
                 .frame(height: 190)
                 .padding(.horizontal, 8)
                 .accessibilityLabel("Estimated hours per week pace")
@@ -642,6 +669,238 @@ private struct WeeklyPaceChart: View {
     private var latestAccessibilityValue: String {
         guard let latest = displayedPoints.last else { return "Not enough data" }
         return "Latest estimate is \(latest.hoursPerWeek.formatted(.number.precision(.fractionLength(1)))) hours per week."
+    }
+
+}
+
+private struct WeeklyPaceHoverOverlay: View {
+    let proxy: ChartProxy
+    let spans: [WeeklyPaceHoverSpan]
+    let maximumHours: Double
+    @State private var hoveredPace: HoveredWeeklyPace?
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                if
+                    let hoveredPace,
+                    let plotFrame = proxy.plotFrame,
+                    let plotX = proxy.position(forX: hoveredPace.position),
+                    let plotY = proxy.position(forY: hoveredPace.hoursPerWeek)
+                {
+                    let plotRect = geometry[plotFrame]
+                    let point = CGPoint(
+                        x: plotRect.minX + plotX,
+                        y: plotRect.minY + plotY
+                    )
+                    let guideStyle = StrokeStyle(lineWidth: 1, dash: [3, 3])
+
+                    Path { path in
+                        path.move(to: CGPoint(x: point.x, y: plotRect.minY))
+                        path.addLine(to: CGPoint(x: point.x, y: plotRect.maxY))
+                    }
+                    .stroke(hoveredPace.color.opacity(0.55), style: guideStyle)
+
+                    Path { path in
+                        path.move(to: CGPoint(x: plotRect.minX, y: point.y))
+                        path.addLine(to: CGPoint(x: plotRect.maxX, y: point.y))
+                    }
+                    .stroke(hoveredPace.color.opacity(0.55), style: guideStyle)
+
+                    Circle()
+                        .fill(hoveredPace.color)
+                        .frame(width: 6, height: 6)
+                        .position(point)
+
+                    HStack(alignment: .firstTextBaseline, spacing: 1) {
+                        Text(hoveredPace.formattedHourValue)
+                        Text("h")
+                    }
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 5)
+                        .background {
+                            RoundedRectangle(cornerRadius: 7)
+                                .fill(.regularMaterial)
+                                .opacity(0.8)
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                        }
+                        .fixedSize()
+                        .position(
+                            x: min(max(point.x, plotRect.minX + 28), plotRect.maxX - 28),
+                            y: point.y + (hoveredPace.placesLabelBelow ? 25 : -25)
+                        )
+                }
+
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        updateHover(phase, geometry: geometry)
+                    }
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+    }
+
+    private func updateHover(_ phase: HoverPhase, geometry: GeometryProxy) {
+        guard case let .active(location) = phase else {
+            clearHover()
+            return
+        }
+        guard let plotFrame = proxy.plotFrame else {
+            clearHover()
+            return
+        }
+        let plotRect = geometry[plotFrame]
+        guard plotRect.contains(location) else {
+            clearHover()
+            return
+        }
+        let plotX = location.x - plotRect.minX
+        guard let position: Double = proxy.value(atX: plotX) else {
+            clearHover()
+            return
+        }
+        guard let exactPaceIndex = spans.firstIndex(where: { $0.contains(position) }) else {
+            clearHover()
+            return
+        }
+        let exactPace = spans[exactPaceIndex]
+
+        guard let placesLabelBelow = stableLabelPlacement(
+            for: exactPaceIndex,
+            plotX: plotX,
+            plotWidth: plotRect.width
+        ) else {
+            clearHover()
+            return
+        }
+        hoveredPace = HoveredWeeklyPace(
+            position: position,
+            hoursPerWeek: exactPace.hoursPerWeek,
+            isFastMode: exactPace.isFastMode,
+            placesLabelBelow: placesLabelBelow
+        )
+    }
+
+    private func clearHover() {
+        hoveredPace = nil
+    }
+
+    private func labelBelowCoverage(in sampleRange: ClosedRange<Double>) -> Double? {
+        var belowOverlap = 0.0
+        var aboveOverlap = 0.0
+        let topEdgeThreshold = maximumHours * 0.2
+
+        for span in spans {
+            let overlap = max(
+                min(span.endPosition, sampleRange.upperBound)
+                    - max(span.startPosition, sampleRange.lowerBound),
+                0
+            )
+            guard overlap > 0 else { continue }
+
+            if span.hoursPerWeek < topEdgeThreshold {
+                belowOverlap += overlap
+            } else {
+                aboveOverlap += overlap
+            }
+        }
+
+        let totalOverlap = belowOverlap + aboveOverlap
+        guard totalOverlap > 0 else { return nil }
+        return belowOverlap / totalOverlap
+    }
+
+    private func stableLabelPlacement(
+        for spanIndex: Int,
+        plotX: CGFloat,
+        plotWidth: CGFloat
+    ) -> Bool? {
+        let minimumRunWidth: CGFloat = 16
+        let naturalPlacement = placesLabelBelow(spans[spanIndex])
+        var lowerIndex = spanIndex
+        var upperIndex = spanIndex
+
+        while lowerIndex > 0 {
+            let previous = spans[lowerIndex - 1]
+            let current = spans[lowerIndex]
+            guard
+                abs(previous.endPosition - current.startPosition) < 0.001,
+                placesLabelBelow(previous) == naturalPlacement
+            else { break }
+            lowerIndex -= 1
+        }
+
+        while upperIndex + 1 < spans.count {
+            let current = spans[upperIndex]
+            let next = spans[upperIndex + 1]
+            guard
+                abs(current.endPosition - next.startPosition) < 0.001,
+                placesLabelBelow(next) == naturalPlacement
+            else { break }
+            upperIndex += 1
+        }
+
+        guard
+            let lowerX = proxy.position(forX: spans[lowerIndex].startPosition),
+            let upperX = proxy.position(forX: spans[upperIndex].endPosition)
+        else { return nil }
+
+        if abs(upperX - lowerX) >= minimumRunWidth {
+            return naturalPlacement
+        }
+
+        guard
+            let lowerPosition: Double = proxy.value(
+                atX: max(plotX - minimumRunWidth, 0)
+            ),
+            let upperPosition: Double = proxy.value(
+                atX: min(plotX + minimumRunWidth, plotWidth)
+            )
+        else { return nil }
+
+        return labelBelowCoverage(
+            in: min(lowerPosition, upperPosition) ... max(lowerPosition, upperPosition)
+        ).map { $0 >= 0.5 }
+    }
+
+    private func placesLabelBelow(_ span: WeeklyPaceHoverSpan) -> Bool {
+        span.hoursPerWeek < maximumHours * 0.2
+    }
+}
+
+private struct WeeklyPaceHoverSpan {
+    let startPosition: Double
+    let endPosition: Double
+    let hoursPerWeek: Double
+    let isFastMode: Bool
+
+    func contains(_ position: Double) -> Bool {
+        position >= startPosition && position <= endPosition
+    }
+}
+
+private struct HoveredWeeklyPace {
+    let position: Double
+    let hoursPerWeek: Double
+    let isFastMode: Bool
+    let placesLabelBelow: Bool
+
+    var color: Color { isFastMode ? .orange : .purple }
+
+    var formattedHourValue: String {
+        let fractionLength = hoursPerWeek < 10 ? 1 : 0
+        return hoursPerWeek.formatted(
+            .number.precision(.fractionLength(fractionLength))
+        )
     }
 }
 

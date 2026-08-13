@@ -513,6 +513,37 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(estimate.hoursPerWeek, 16.667, accuracy: 0.01)
     }
 
+    func testEstimateSeriesFreezesAfterLatestUsageChangeWithoutDroppingPoints() throws {
+        let start = Date(timeIntervalSince1970: 475_000)
+        let now = start.addingTimeInterval(900)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(
+                observedAt: start.addingTimeInterval(300),
+                remainingPercent: 99,
+                resetsAt: reset
+            )
+        ]
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: [ActivityInterval(start: start, end: now)],
+            now: now,
+            sampleTolerance: 90,
+            factorInPauses: false,
+            minimumPointSpacing: 300
+        )
+
+        XCTAssertEqual(points.map(\.date), [
+            start.addingTimeInterval(300),
+            start.addingTimeInterval(600),
+            start.addingTimeInterval(900)
+        ])
+        for point in points {
+            XCTAssertEqual(point.hoursPerWeek, 8.333, accuracy: 0.01)
+        }
+    }
+
     func testEstimateSeriesKeepsUsageWindowsIndependent() throws {
         let start = Date(timeIntervalSince1970: 600_000)
         let firstReset = start.addingTimeInterval(3_600)
@@ -541,6 +572,8 @@ final class WeeklyPaceTests: XCTestCase {
             [firstReset, firstReset, firstReset, secondReset]
         )
         XCTAssertEqual(points[0].hoursPerWeek, 5, accuracy: 0.01)
+        XCTAssertEqual(points[1].hoursPerWeek, 7.5, accuracy: 0.01)
+        XCTAssertEqual(points[2].hoursPerWeek, 10, accuracy: 0.01)
         XCTAssertEqual(points[3].hoursPerWeek, 50, accuracy: 0.01)
     }
 

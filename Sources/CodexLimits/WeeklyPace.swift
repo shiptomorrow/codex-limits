@@ -301,6 +301,7 @@ enum WeeklyPaceCalculator {
                 activity: activity,
                 now: now,
                 seriesEnd: seriesEnd,
+                freezeUnmeasuredTail: nextWindowStart == nil,
                 sampleTolerance: sampleTolerance,
                 factorInPauses: factorInPauses,
                 lookback: lookback,
@@ -315,6 +316,7 @@ enum WeeklyPaceCalculator {
         activity: [ActivityInterval],
         now: Date,
         seriesEnd: Date,
+        freezeUnmeasuredTail: Bool,
         sampleTolerance: TimeInterval,
         factorInPauses: Bool,
         lookback: TimeInterval,
@@ -322,6 +324,12 @@ enum WeeklyPaceCalculator {
     ) -> [WeeklyPacePoint] {
         let samples = samples.sorted { $0.observedAt < $1.observedAt }
         guard samples.count > 1 else { return [] }
+
+        let lastUsageChangeDate = freezeUnmeasuredTail
+            ? samples.indices.dropFirst().last(where: {
+                samples[$0].remainingPercent < samples[$0 - 1].remainingPercent
+            }).map { samples[$0].observedAt }
+            : nil
 
         let firstDate = samples[0].observedAt
         var candidateDates = Set(samples.dropFirst().map(\.observedAt))
@@ -338,11 +346,15 @@ enum WeeklyPaceCalculator {
             .filter { $0 > firstDate && $0 <= now }
             .sorted()
             .compactMap { date in
-            let availableSamples = samples.filter { $0.observedAt <= date }
+            // Keep the historical series intact, but freeze its unmeasured tail.
+            // Once the last percentage decrease is reached, later activity has no
+            // known allowance cost until another decrease is observed.
+            let calculationDate = min(date, lastUsageChangeDate ?? date)
+            let availableSamples = samples.filter { $0.observedAt <= calculationDate }
             guard let estimate = estimate(
                 samples: availableSamples,
                 activity: activity,
-                now: date,
+                now: calculationDate,
                 sampleTolerance: sampleTolerance,
                 factorInPauses: factorInPauses,
                 lookback: lookback

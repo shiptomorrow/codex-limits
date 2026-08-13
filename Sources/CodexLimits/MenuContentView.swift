@@ -129,7 +129,8 @@ struct MenuContentView: View {
                         fetchedAt: snapshot.fetchedAt,
                         forecast: forecast,
                         safetyBuffer: safetyBuffer,
-                        showsUsedPercentage: showsUsedPercentage
+                        showsUsedPercentage: showsUsedPercentage,
+                        activity: monitor.activityIntervals
                     )
                 } else if let weeklyWindow = weeklyWindow(in: snapshot) {
                     WeeklyPaceChart(
@@ -493,6 +494,22 @@ private struct WeeklyPaceChart: View {
         return max(ceil(maximum / 5) * 5, 10)
     }
 
+    private var segments: [WeeklyPaceSegment] {
+        zip(displayedPoints, displayedPoints.dropFirst())
+            .filter {
+                abs($0.0.windowResetsAt.timeIntervalSince($0.1.windowResetsAt)) <= 5 * 60
+            }
+            .enumerated()
+            .map { index, pair in
+                WeeklyPaceSegment(
+                    id: index,
+                    start: pair.0,
+                    end: pair.1,
+                    isFastMode: pair.1.isFastMode
+                )
+            }
+    }
+
     private var xDomain: ClosedRange<Double> {
         let nowPosition = timeline.position(for: fetchedAt)
         let end = max(nowPosition / 0.75, 60 * 60)
@@ -515,6 +532,9 @@ private struct WeeklyPaceChart: View {
                         : "Estimated runtime / week",
                     color: .purple
                 )
+                if displayedPoints.contains(where: \.isFastMode) {
+                    ChartLegendItem(label: "Fast mode (2×)", color: .orange)
+                }
             }
 
             if displayedPoints.isEmpty {
@@ -526,14 +546,17 @@ private struct WeeklyPaceChart: View {
                 .frame(height: 190)
             } else {
                 Chart {
-                    ForEach(displayedPoints) { point in
-                        LineMark(
-                            x: .value("Compressed time", timeline.position(for: point.date)),
-                            y: .value("Hours per week", point.hoursPerWeek)
-                        )
-                        .foregroundStyle(Color.purple)
-                        .lineStyle(StrokeStyle(lineWidth: 2))
-                        .interpolationMethod(.stepEnd)
+                    ForEach(segments) { segment in
+                        ForEach(segment.points) { point in
+                            LineMark(
+                                x: .value("Compressed time", timeline.position(for: point.date)),
+                                y: .value("Hours per week", point.hoursPerWeek),
+                                series: .value("Pace segment", segment.id)
+                            )
+                            .foregroundStyle(segment.isFastMode ? Color.orange : Color.purple)
+                            .lineStyle(StrokeStyle(lineWidth: 2))
+                            .interpolationMethod(.stepEnd)
+                        }
                     }
 
                     RuleMark(x: .value("Now", timeline.position(for: fetchedAt)))
@@ -557,9 +580,9 @@ private struct WeeklyPaceChart: View {
                             x: .value("Latest", timeline.position(for: latest.date)),
                             y: .value("Latest pace", latest.hoursPerWeek)
                         )
-                        .foregroundStyle(Color.purple)
+                        .foregroundStyle(latest.isFastMode ? Color.orange : Color.purple)
                         .symbolSize(28)
-                        .annotation(position: .top, spacing: 5) {
+                        .annotation(position: .trailing, spacing: 5) {
                             Text("\(latest.hoursPerWeek.formatted(.number.precision(.fractionLength(latest.hoursPerWeek < 10 ? 1 : 0)))) h")
                                 .font(.caption2)
                                 .padding(.horizontal, 5)
@@ -620,6 +643,15 @@ private struct WeeklyPaceChart: View {
         guard let latest = displayedPoints.last else { return "Not enough data" }
         return "Latest estimate is \(latest.hoursPerWeek.formatted(.number.precision(.fractionLength(1)))) hours per week."
     }
+}
+
+private struct WeeklyPaceSegment: Identifiable {
+    let id: Int
+    let start: WeeklyPacePoint
+    let end: WeeklyPacePoint
+    let isFastMode: Bool
+
+    var points: [WeeklyPacePoint] { [start, end] }
 }
 
 struct WeeklyPaceCompressedTimeline {
@@ -710,6 +742,7 @@ private struct BurnDownChart: View {
     let forecast: Forecast
     let safetyBuffer: Double
     let showsUsedPercentage: Bool
+    let activity: [ActivityInterval]
 
     private var observed: [BurnPoint] {
         let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
@@ -749,6 +782,26 @@ private struct BurnDownChart: View {
         forecast.currentPercentPerDay > forecast.historicalPercentPerDay ? .red : .blue
     }
 
+    private var observedEndpointColor: Color {
+        let latestUsageSegment = observedSegments.last {
+            $0.start.remaining != $0.end.remaining
+        }
+        return latestUsageSegment?.isFastMode == true ? .orange : currentColor
+    }
+
+    private var observedSegments: [BurnSegment] {
+        zip(observed, observed.dropFirst()).flatMap { start, end in
+            splitSegment(from: start, to: end)
+        }.enumerated().map { index, segment in
+            BurnSegment(
+                id: index,
+                start: segment.start,
+                end: segment.end,
+                isFastMode: segment.isFastMode
+            )
+        }
+    }
+
     private var currentProjection: [BurnPoint] {
         projection(rate: forecast.currentPercentPerDay, remainingAtReset: forecast.expectedRemainingAtReset)
     }
@@ -774,6 +827,9 @@ private struct BurnDownChart: View {
             HStack(spacing: 12) {
                 ChartLegendItem(label: "Target", color: .green, dash: [3, 3])
                 ChartLegendItem(label: "Actual", color: .blue)
+                if observedSegments.contains(where: \.isFastMode) {
+                    ChartLegendItem(label: "Fast (2×)", color: .orange)
+                }
                 ChartLegendItem(label: "Current", color: currentColor, dash: [7, 3])
                 ChartLegendItem(label: "Historical", color: .secondary, dash: [2, 3])
             }
@@ -792,15 +848,17 @@ private struct BurnDownChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
                 }
 
-                ForEach(observed) { point in
-                    LineMark(
-                        x: .value("Time", point.date),
-                        y: .value("Actual", displayedPercent(point.remaining)),
-                        series: .value("Series", "Actual")
-                    )
-                    .foregroundStyle(Color.blue)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                    .interpolationMethod(.stepEnd)
+                ForEach(observedSegments) { segment in
+                    ForEach(segment.points) { point in
+                        LineMark(
+                            x: .value("Time", point.date),
+                            y: .value("Actual", displayedPercent(point.remaining)),
+                            series: .value("Actual segment", segment.id)
+                        )
+                        .foregroundStyle(segment.isFastMode ? Color.orange : Color.blue)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                        .interpolationMethod(.stepEnd)
+                    }
                 }
 
                 ForEach(currentProjection) { point in
@@ -831,7 +889,7 @@ private struct BurnDownChart: View {
                     x: .value("Now", fetchedAt),
                     y: .value("Usage now", displayedPercent(window.remainingPercent))
                 )
-                .foregroundStyle(currentColor)
+                .foregroundStyle(observedEndpointColor)
                 .symbolSize(18)
                 .annotation(position: .trailing, spacing: 5) {
                     Text("Now")
@@ -940,6 +998,39 @@ private struct BurnDownChart: View {
             }
         }
     }
+
+    private func splitSegment(from start: BurnPoint, to end: BurnPoint) -> [BurnSegment] {
+        let boundaries = Set(activity.flatMap { [$0.start, $0.end] }.filter {
+            $0 > start.date && $0 < end.date
+        }).sorted()
+        let dates = [start.date] + boundaries + [end.date]
+        let usageIntervalContainsFastMode = activity.contains {
+            $0.isFastMode && $0.start < end.date && $0.end > start.date
+        }
+
+        return dates.indices.dropLast().map { index in
+            let segmentStart = dates[index]
+            let segmentEnd = dates[index + 1]
+            let midpoint = segmentStart.addingTimeInterval(
+                segmentEnd.timeIntervalSince(segmentStart) / 2
+            )
+            let midpointIsFastMode = activity.contains {
+                $0.isFastMode && $0.start <= midpoint && $0.end >= midpoint
+            }
+            let isFinalSegment = segmentEnd == end.date
+            return BurnSegment(
+                id: index,
+                start: BurnPoint(date: segmentStart, remaining: start.remaining),
+                end: BurnPoint(
+                    date: segmentEnd,
+                    remaining: segmentEnd == end.date ? end.remaining : start.remaining
+                ),
+                // The final step contains the observed usage drop. Attribute it to
+                // any fast work since the prior sample, including concurrent tasks.
+                isFastMode: isFinalSegment ? usageIntervalContainsFastMode : midpointIsFastMode
+            )
+        }
+    }
 }
 
 private struct BurnPoint: Identifiable {
@@ -947,6 +1038,15 @@ private struct BurnPoint: Identifiable {
     let remaining: Double
 
     var id: Date { date }
+}
+
+private struct BurnSegment: Identifiable {
+    let id: Int
+    let start: BurnPoint
+    let end: BurnPoint
+    let isFastMode: Bool
+
+    var points: [BurnPoint] { [start, end] }
 }
 
 private struct ChartLegendItem: View {

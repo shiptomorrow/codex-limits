@@ -2,6 +2,102 @@ import XCTest
 @testable import CodexLimits
 
 final class WeeklyPaceTests: XCTestCase {
+    func testActivityInheritsMostRecentModeForFirstTurnInNewSession() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let interval = ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(600)
+        )
+
+        let split = CodexActivityReader.split(
+            interval,
+            at: [],
+            inheriting: [(
+                date: start.addingTimeInterval(-60),
+                isFastMode: true
+            )]
+        )
+
+        XCTAssertEqual(split, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(600),
+            isFastMode: true
+        )])
+    }
+
+    func testActivityKeepsSessionModeInsteadOfInheritedMode() {
+        let start = Date(timeIntervalSince1970: 2_000)
+        let interval = ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(600)
+        )
+
+        let split = CodexActivityReader.split(
+            interval,
+            at: [(
+                date: start.addingTimeInterval(-120),
+                isFastMode: false
+            )],
+            inheriting: [(
+                date: start.addingTimeInterval(-60),
+                isFastMode: true
+            )]
+        )
+
+        XCTAssertEqual(split, [interval])
+    }
+
+    func testFastModeDoesNotMultiplyObservedAllowanceDecreaseAgain() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let reset = now.addingTimeInterval(86_400)
+        let samples = [
+            UsageSample(observedAt: now.addingTimeInterval(-3_600), remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: now, remainingPercent: 90, resetsAt: reset)
+        ]
+        let activity = [ActivityInterval(
+            start: now.addingTimeInterval(-3_600),
+            end: now,
+            isFastMode: true
+        )]
+
+        let estimate = try XCTUnwrap(WeeklyPaceCalculator.estimate(
+            samples: samples,
+            activity: activity,
+            now: now,
+            sampleTolerance: 90,
+            factorInPauses: false
+        ))
+
+        XCTAssertEqual(estimate.percentagePointsUsed, 10, accuracy: 0.01)
+        XCTAssertEqual(estimate.hoursPerWeek, 10, accuracy: 0.01)
+        XCTAssertTrue(estimate.isFastMode)
+    }
+
+    func testMergedActivityPreservesFastModeBoundaries() {
+        let start = Date(timeIntervalSince1970: 20_000)
+        let intervals = [
+            ActivityInterval(start: start, end: start.addingTimeInterval(600)),
+            ActivityInterval(
+                start: start.addingTimeInterval(300),
+                end: start.addingTimeInterval(900),
+                isFastMode: true
+            )
+        ]
+
+        let merged = WeeklyPaceCalculator.merged(intervals, joiningGapsUpTo: 0)
+
+        XCTAssertEqual(merged.count, 2)
+        XCTAssertEqual(merged[0], ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(300)
+        ))
+        XCTAssertEqual(merged[1], ActivityInterval(
+            start: start.addingTimeInterval(300),
+            end: start.addingTimeInterval(900),
+            isFastMode: true
+        ))
+    }
+
     func testDailyRuntimeUsesTwoCompletedSevenAMDays() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))

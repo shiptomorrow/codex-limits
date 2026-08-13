@@ -18,6 +18,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var dailyRuntimeHours: Double?
     @Published private(set) var historicalDailyRuntimeHours: Double?
     @Published private(set) var weeklyPacePoints: [WeeklyPacePoint] = []
+    @Published private(set) var activityIntervals: [ActivityInterval] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var syncFolderName: String?
@@ -459,6 +460,7 @@ final class UsageMonitor: ObservableObject {
             since: firstSample.observedAt,
             now: snapshot.fetchedAt
         )
+        activityIntervals = activity
         let refreshSeconds = defaults.object(forKey: Self.refreshIntervalSecondsKey) == nil
             ? 60
             : defaults.integer(forKey: Self.refreshIntervalSecondsKey)
@@ -519,6 +521,10 @@ final class UsageMonitor: ObservableObject {
         let activity = await CodexActivityReader.loadIntervals(
             since: first.start,
             now: now
+        )
+        activityIntervals = WeeklyPaceCalculator.merged(
+            activityIntervals + activity,
+            joiningGapsUpTo: 0
         )
         dailyRuntimeHours = DailyRuntimeCalculator.averageRecentDayHours(
             activity: activity,

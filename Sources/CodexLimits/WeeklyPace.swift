@@ -3,6 +3,7 @@ import Foundation
 struct ActivityInterval: Equatable, Sendable {
     let start: Date
     let end: Date
+    var isFastMode = false
 
     var duration: TimeInterval { max(end.timeIntervalSince(start), 0) }
 }
@@ -11,12 +12,14 @@ struct WeeklyPaceEstimate: Equatable, Sendable {
     let hoursPerWeek: Double
     let activeDuration: TimeInterval
     let percentagePointsUsed: Double
+    let isFastMode: Bool
 }
 
 struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
     let date: Date
     let hoursPerWeek: Double
     let windowResetsAt: Date
+    var isFastMode = false
 
     var id: Date { date }
 }
@@ -167,7 +170,11 @@ enum WeeklyPaceCalculator {
         guard !blocks.isEmpty else { return nil }
 
         if let last = blocks.last, now.timeIntervalSince(last.end) <= idleGap {
-            blocks[blocks.count - 1] = ActivityInterval(start: last.start, end: now)
+            blocks[blocks.count - 1] = ActivityInterval(
+                start: last.start,
+                end: now,
+                isFastMode: last.isFastMode
+            )
         }
 
         var selected: [ActivityInterval]
@@ -219,7 +226,8 @@ enum WeeklyPaceCalculator {
         return WeeklyPaceEstimate(
             hoursPerWeek: 100 / usedPerActiveHour,
             activeDuration: measured.duration,
-            percentagePointsUsed: measured.used
+            percentagePointsUsed: measured.used,
+            isFastMode: measured.isFastMode
         )
     }
 
@@ -299,7 +307,8 @@ enum WeeklyPaceCalculator {
             return WeeklyPacePoint(
                 date: date,
                 hoursPerWeek: estimate.hoursPerWeek,
-                windowResetsAt: samples[index].resetsAt
+                windowResetsAt: samples[index].resetsAt,
+                isFastMode: estimate.isFastMode
             )
         }
         return stabilizedSeries(rawPoints)
@@ -323,7 +332,8 @@ enum WeeklyPaceCalculator {
             return WeeklyPacePoint(
                 date: raw.date,
                 hoursPerWeek: median,
-                windowResetsAt: raw.windowResetsAt
+                windowResetsAt: raw.windowResetsAt,
+                isFastMode: raw.isFastMode
             )
         }
     }
@@ -332,23 +342,36 @@ enum WeeklyPaceCalculator {
         _ intervals: [ActivityInterval],
         joiningGapsUpTo allowedGap: TimeInterval
     ) -> [ActivityInterval] {
-        intervals
-            .filter { $0.end > $0.start }
-            .sorted { $0.start < $1.start }
-            .reduce(into: []) { result, interval in
-                guard let last = result.last else {
-                    result.append(interval)
-                    return
-                }
-                if interval.start.timeIntervalSince(last.end) <= allowedGap {
-                    result[result.count - 1] = ActivityInterval(
-                        start: last.start,
-                        end: max(last.end, interval.end)
-                    )
-                } else {
-                    result.append(interval)
-                }
+        let intervals = intervals.filter { $0.end > $0.start }
+        let boundaries = Set(intervals.flatMap { [$0.start, $0.end] }).sorted()
+        let slices = boundaries.indices.dropLast().compactMap { index -> ActivityInterval? in
+            let start = boundaries[index]
+            let end = boundaries[index + 1]
+            let active = intervals.filter { $0.start < end && $0.end > start }
+            guard !active.isEmpty else { return nil }
+            return ActivityInterval(
+                start: start,
+                end: end,
+                isFastMode: active.contains(where: \.isFastMode)
+            )
+        }
+
+        return slices.reduce(into: []) { result, interval in
+            guard let last = result.last else {
+                result.append(interval)
+                return
             }
+            if interval.isFastMode == last.isFastMode,
+               interval.start.timeIntervalSince(last.end) <= allowedGap {
+                result[result.count - 1] = ActivityInterval(
+                    start: last.start,
+                    end: max(last.end, interval.end),
+                    isFastMode: last.isFastMode
+                )
+            } else {
+                result.append(interval)
+            }
+        }
     }
 
     private static func previousActivity(
@@ -363,7 +386,8 @@ enum WeeklyPaceCalculator {
             let included = min(block.duration, remaining)
             result.append(ActivityInterval(
                 start: block.end.addingTimeInterval(-included),
-                end: block.end
+                end: block.end,
+                isFastMode: block.isFastMode
             ))
             remaining -= included
         }
@@ -377,14 +401,18 @@ enum WeeklyPaceCalculator {
         let start = max(interval.start, range.lowerBound)
         let end = min(interval.end, range.upperBound)
         guard end > start else { return nil }
-        return ActivityInterval(start: start, end: end)
+        return ActivityInterval(
+            start: start,
+            end: end,
+            isFastMode: interval.isFastMode
+        )
     }
 
     private static func measurement(
         samples: [UsageSample],
         intervals: [ActivityInterval],
         tolerance: TimeInterval
-    ) -> (used: Double, duration: TimeInterval) {
+    ) -> (used: Double, duration: TimeInterval, isFastMode: Bool) {
         let validIntervals = intervals.filter { interval in
             let hasStartSample = samples.last(where: {
                 $0.observedAt <= interval.start
@@ -404,21 +432,26 @@ enum WeeklyPaceCalculator {
         }
 
         let duration = validIntervals.reduce(0) { $0 + $1.duration }
+        var latestUsageWasFast = false
         let used = samples.indices.dropFirst().reduce(0.0) { total, index in
             let previous = samples[index - 1]
             let current = samples[index]
             let decrease = max(previous.remainingPercent - current.remainingPercent, 0)
             guard decrease > 0 else { return total }
 
-            let belongsToActivity = validIntervals.contains { interval in
+            let matchingIntervals = validIntervals.filter { interval in
                 current.observedAt > interval.start
                     && current.observedAt <= interval.end.addingTimeInterval(tolerance)
                     && previous.observedAt <= interval.end
             }
-            return belongsToActivity ? total + decrease : total
+            guard !matchingIntervals.isEmpty else { return total }
+            let isFastMode = matchingIntervals.contains(where: \.isFastMode)
+            latestUsageWasFast = isFastMode
+            // The observed allowance decrease already includes any fast-mode cost.
+            return total + decrease
         }
 
-        return (used, duration)
+        return (used, duration, latestUsageWasFast)
     }
 }
 
@@ -435,8 +468,9 @@ enum CodexActivityReader {
         let files = sessionFiles(in: root, since: since, now: now)
         var starts: [String: (date: Date, file: URL)] = [:]
         var completedIDs: Set<String> = []
-        var completed: [String: ActivityInterval] = [:]
+        var completed: [String: (interval: ActivityInterval, file: URL)] = [:]
         var tokenTimesByFile: [URL: [Date]] = [:]
+        var modeChangesByFile: [URL: [(date: Date, isFastMode: Bool)]] = [:]
 
         for file in files {
             guard let contents = try? String(contentsOf: file, encoding: .utf8) else { continue }
@@ -445,6 +479,7 @@ enum CodexActivityReader {
                 let isRelevant = line.contains("\"task_started\"")
                     || line.contains("\"task_complete\"")
                     || line.contains("\"token_count\"")
+                    || line.contains("\"thread_settings_applied\"")
                 guard isRelevant,
                       let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -452,6 +487,15 @@ enum CodexActivityReader {
                       let type = payload["type"] as? String else { return }
 
                 switch type {
+                case "thread_settings_applied":
+                    guard let settings = payload["thread_settings"] as? [String: Any],
+                          let serviceTier = settings["service_tier"] as? String,
+                          let timestamp = object["timestamp"] as? String,
+                          let date = timestampDate(timestamp) else { return }
+                    modeChangesByFile[file, default: []].append((
+                        date,
+                        serviceTier == "fast" || serviceTier == "priority"
+                    ))
                 case "task_started":
                     guard let turnID = payload["turn_id"] as? String,
                           let startedAt = seconds(payload["started_at"]) else { return }
@@ -461,9 +505,12 @@ enum CodexActivityReader {
                           let startedAt = seconds(payload["started_at"]),
                           let completedAt = seconds(payload["completed_at"]) else { return }
                     completedIDs.insert(turnID)
-                    completed[turnID] = ActivityInterval(
-                        start: Date(timeIntervalSince1970: startedAt),
-                        end: Date(timeIntervalSince1970: completedAt)
+                    completed[turnID] = (
+                        ActivityInterval(
+                            start: Date(timeIntervalSince1970: startedAt),
+                            end: Date(timeIntervalSince1970: completedAt)
+                        ),
+                        file
                     )
                 case "token_count":
                     guard let timestamp = object["timestamp"] as? String,
@@ -475,16 +522,60 @@ enum CodexActivityReader {
             }
         }
 
-        var intervals = Array(completed.values)
+        let allModeChanges = modeChangesByFile.values.flatMap { $0 }
+        var intervals = completed.values.flatMap {
+            split(
+                $0.interval,
+                at: modeChangesByFile[$0.file, default: []],
+                inheriting: allModeChanges
+            )
+        }
         for (turnID, start) in starts where !completedIDs.contains(turnID) {
             let end = tokenTimesByFile[start.file, default: []]
                 .filter { $0 >= start.date && $0 <= now }
                 .max() ?? start.date
             if end > start.date {
-                intervals.append(ActivityInterval(start: start.date, end: end))
+                intervals += split(
+                    ActivityInterval(start: start.date, end: end),
+                    at: modeChangesByFile[start.file, default: []],
+                    inheriting: allModeChanges
+                )
             }
         }
         return intervals.filter { $0.end >= since && $0.start <= now }
+    }
+
+    static func split(
+        _ interval: ActivityInterval,
+        at rawChanges: [(date: Date, isFastMode: Bool)],
+        inheriting inheritedChanges: [(date: Date, isFastMode: Bool)] = []
+    ) -> [ActivityInterval] {
+        let changes = rawChanges.sorted { $0.date < $1.date }
+        let inheritedMode = inheritedChanges
+            .filter { $0.date <= interval.start }
+            .max(by: { $0.date < $1.date })?
+            .isFastMode
+        var isFastMode = changes.last(where: { $0.date <= interval.start })?.isFastMode
+            ?? inheritedMode
+            ?? false
+        var start = interval.start
+        var result: [ActivityInterval] = []
+
+        for change in changes where change.date > interval.start && change.date < interval.end {
+            result.append(ActivityInterval(
+                start: start,
+                end: change.date,
+                isFastMode: isFastMode
+            ))
+            start = change.date
+            isFastMode = change.isFastMode
+        }
+        result.append(ActivityInterval(
+            start: start,
+            end: interval.end,
+            isFastMode: isFastMode
+        ))
+        return result
     }
 
     private static func sessionFiles(in root: URL, since: Date, now: Date) -> [URL] {

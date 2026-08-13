@@ -3,6 +3,127 @@ import XCTest
 @testable import CodexLimits
 
 final class UsageHistoryTests: XCTestCase {
+    private struct StoredDailyFile: Codable {
+        let version: Int
+        let samples: [UsageSample]
+    }
+
+    func testRecordWritesOnlyWhenRemainingPercentageChanges() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let reset = now.addingTimeInterval(86_400)
+        let first = UsageSample(
+            observedAt: now.addingTimeInterval(-120),
+            remainingPercent: 80,
+            resetsAt: reset
+        )
+        let unchanged = UsageSample(
+            observedAt: now.addingTimeInterval(-60),
+            remainingPercent: 80,
+            resetsAt: reset
+        )
+        let changed = UsageSample(
+            observedAt: now,
+            remainingPercent: 79,
+            resetsAt: reset
+        )
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a",
+            now: { now }
+        )
+
+        _ = await history.load()
+        _ = await history.record(first)
+        let unchangedState = await history.record(unchanged)
+        let changedState = await history.record(changed)
+
+        XCTAssertEqual(unchangedState.samples, [first])
+        XCTAssertEqual(changedState.samples, [first, changed])
+        let file = try XCTUnwrap(jsonFiles(for: "writer-a", in: root).first)
+        let stored = try JSONDecoder().decode(
+            StoredDailyFile.self,
+            from: Data(contentsOf: file)
+        )
+        XCTAssertEqual(stored.samples, [first, changed])
+    }
+
+    func testLoadMigratesExistingRepeatedPercentagesAcrossDailyFiles() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let boundary = Date(timeIntervalSince1970: 1_987_200)
+        let now = boundary.addingTimeInterval(240)
+        let reset = boundary.addingTimeInterval(7 * 86_400)
+        let first = UsageSample(
+            observedAt: boundary.addingTimeInterval(-120),
+            remainingPercent: 80,
+            resetsAt: reset
+        )
+        let repeatedBeforeBoundary = UsageSample(
+            observedAt: boundary.addingTimeInterval(-60),
+            remainingPercent: 80,
+            resetsAt: reset
+        )
+        let repeatedAfterBoundary = UsageSample(
+            observedAt: boundary.addingTimeInterval(60),
+            remainingPercent: 80,
+            resetsAt: reset
+        )
+        let changed = UsageSample(
+            observedAt: boundary.addingTimeInterval(120),
+            remainingPercent: 79,
+            resetsAt: reset
+        )
+        let repeatedChange = UsageSample(
+            observedAt: boundary.addingTimeInterval(180),
+            remainingPercent: 79,
+            resetsAt: reset
+        )
+        let bootstrap = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a",
+            now: { now }
+        )
+        _ = await bootstrap.load()
+        let writer = root
+            .appendingPathComponent("installations", isDirectory: true)
+            .appendingPathComponent("writer-a", isDirectory: true)
+        try FileManager.default.createDirectory(at: writer, withIntermediateDirectories: true)
+        try writeDailyFile(
+            [first, repeatedBeforeBoundary],
+            named: utcDayName(for: first.observedAt),
+            to: writer
+        )
+        try writeDailyFile(
+            [repeatedAfterBoundary, changed, repeatedChange],
+            named: utcDayName(for: changed.observedAt),
+            to: writer
+        )
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a",
+            now: { now }
+        )
+
+        let migrated = await history.load()
+        let migratedAgain = await history.load()
+
+        XCTAssertEqual(migrated.samples, [first, changed])
+        XCTAssertEqual(migratedAgain.samples, [first, changed])
+        let storedSamples = try jsonFiles(for: "writer-a", in: root)
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .flatMap { file in
+                try JSONDecoder().decode(
+                    StoredDailyFile.self,
+                    from: Data(contentsOf: file)
+                ).samples
+            }
+        XCTAssertEqual(storedSamples, [first, changed])
+    }
+
     func testUnavailableFolderKeepsLocalHistoryAndRemainsSelected() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -427,5 +548,17 @@ final class UsageHistoryTests: XCTestCase {
             at: directory,
             includingPropertiesForKeys: nil
         ))?.filter { $0.pathExtension == "json" } ?? []
+    }
+
+    private func writeDailyFile(_ samples: [UsageSample], named day: String, to writer: URL) throws {
+        let data = try JSONEncoder().encode(StoredDailyFile(version: 1, samples: samples))
+        try data.write(to: writer.appendingPathComponent("\(day).json"))
+    }
+
+    private func utcDayName(for date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", parts.year!, parts.month!, parts.day!)
     }
 }

@@ -17,7 +17,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Shows an estimated pace chart so you can see how your sustainable weekly usage changes over time.
 - Projects the current pace and compares it with recent historical usage.
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
-- Keeps up to 90 days of usage history in versioned daily JSON files.
+- Keeps up to 90 days of usage changes in versioned daily JSON files, writing only when the fetched percentage changes.
 - Can optionally replicate usage history through a private folder selected by the user.
 - Refreshes on launch, wake, popover open, every ten minutes, or when requested manually.
 - Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.

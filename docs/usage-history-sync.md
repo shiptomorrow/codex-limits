@@ -21,7 +21,8 @@ One sync folder represents one Codex account. The app does not identify or verif
 
 - Local history and its optional folder replica use the same versioned daily JSON format.
 - Each installation has a random local identifier and writes only files belonging to that identifier.
-- The tuple of observation time, remaining percentage, and window reset identifies a usage sample. Exact copies are deduplicated; readings made at different times remain distinct.
+- Usage history is event-based: a new sample is written only when its remaining percentage differs from the latest stored sample. Observation time and window reset are retained for every actual percentage change.
+- Existing daily files are compacted automatically and idempotently on load. Consecutive samples with the same remaining percentage are reduced to the first sample in that run, including runs spanning daily-file boundaries.
 - A daily file larger than 1 MB is skipped and reported like any other unreadable history file.
 - Samples older than 90 days are ignored. An installation removes only its own expired daily files and never deletes another installation's files.
 - iCloud Drive access uses coordinated file operations. No SQLite database file is synchronized.

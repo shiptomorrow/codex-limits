@@ -597,9 +597,8 @@ private struct WeeklyPaceChart: View {
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
 
                     if showsPreviousWindow, let resetPosition {
-                        RuleMark(x: .value("Weekly reset", resetPosition))
-                            .foregroundStyle(Color.secondary.opacity(0.75))
-                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+                        RuleMark(x: .value("Weekly reset label", resetPosition))
+                            .foregroundStyle(.clear)
                             .annotation(position: .top, spacing: 4) {
                                 Text("Reset")
                                     .font(.caption2)
@@ -677,7 +676,8 @@ private struct WeeklyPaceChart: View {
                     WeeklyPaceHoverOverlay(
                         proxy: proxy,
                         spans: hoverSpans,
-                        maximumHours: maximumHours
+                        maximumHours: maximumHours,
+                        resetPosition: showsPreviousWindow ? resetPosition : nil
                     )
                 }
                 .frame(height: 190)
@@ -699,11 +699,30 @@ private struct WeeklyPaceHoverOverlay: View {
     let proxy: ChartProxy
     let spans: [WeeklyPaceHoverSpan]
     let maximumHours: Double
+    let resetPosition: Double?
     @State private var hoveredPace: HoveredWeeklyPace?
 
     var body: some View {
         GeometryReader { geometry in
             ZStack {
+                if
+                    let resetPosition,
+                    let plotFrame = proxy.plotFrame,
+                    let plotX = proxy.position(forX: resetPosition)
+                {
+                    let plotRect = geometry[plotFrame]
+                    let x = plotRect.minX + plotX
+
+                    Path { path in
+                        path.move(to: CGPoint(x: x, y: plotRect.minY + 8))
+                        path.addLine(to: CGPoint(x: x, y: plotRect.maxY))
+                    }
+                    .stroke(
+                        Color.secondary.opacity(0.75),
+                        style: StrokeStyle(lineWidth: 1.5, dash: [5, 3])
+                    )
+                }
+
                 if
                     let hoveredPace,
                     let plotFrame = proxy.plotFrame,
@@ -1142,16 +1161,6 @@ private struct BurnDownChart: View {
                     }
                 }
 
-                ForEach(currentProjection) { point in
-                    LineMark(
-                        x: .value("Time", point.date),
-                        y: .value("Current", displayedPercent(point.remaining)),
-                        series: .value("Series", "Current")
-                    )
-                    .foregroundStyle(currentColor)
-                    .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [7, 3]))
-                }
-
                 ForEach(historicalProjection) { point in
                     LineMark(
                         x: .value("Time", point.date),
@@ -1160,6 +1169,16 @@ private struct BurnDownChart: View {
                     )
                     .foregroundStyle(Color.secondary)
                     .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [2, 3]))
+                }
+
+                ForEach(currentProjection) { point in
+                    LineMark(
+                        x: .value("Time", point.date),
+                        y: .value("Current", displayedPercent(point.remaining)),
+                        series: .value("Series", "Current")
+                    )
+                    .foregroundStyle(currentColor)
+                    .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [7, 3]))
                 }
 
                 RuleMark(x: .value("Now", fetchedAt))

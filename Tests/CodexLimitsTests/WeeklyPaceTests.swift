@@ -331,6 +331,67 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(hours, 1.5, accuracy: 0.001)
     }
 
+    func testHistoricalDailyRuntimeUsesActiveDayInterquartileMeanFromPreviousTwoWeeks() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 24,
+            hour: 12
+        )))
+        let currentDayStart = try XCTUnwrap(calendar.date(
+            bySettingHour: DailyRuntimeCalculator.dayStartHour,
+            minute: 0,
+            second: 0,
+            of: now
+        ))
+        let activeHours = [0.241, 0.601, 1.007, 3.606, 4.591, 5.757]
+        var activity = try activeHours.enumerated().map { index, hours in
+            let start = try XCTUnwrap(calendar.date(
+                byAdding: .day,
+                value: -(index + 1),
+                to: currentDayStart
+            ))
+            return ActivityInterval(
+                start: start,
+                end: start.addingTimeInterval(hours * 3_600)
+            )
+        }
+        let belowMinimumStart = try XCTUnwrap(calendar.date(
+            byAdding: .day,
+            value: -7,
+            to: currentDayStart
+        ))
+        activity.append(ActivityInterval(
+            start: belowMinimumStart,
+            end: belowMinimumStart.addingTimeInterval(4 * 60)
+        ))
+        activity.append(ActivityInterval(
+            start: currentDayStart,
+            end: currentDayStart.addingTimeInterval(8 * 3_600)
+        ))
+        let tooOldStart = try XCTUnwrap(calendar.date(
+            byAdding: .day,
+            value: -15,
+            to: currentDayStart
+        ))
+        activity.append(ActivityInterval(
+            start: tooOldStart,
+            end: tooOldStart.addingTimeInterval(10 * 3_600)
+        ))
+
+        let hours = try XCTUnwrap(
+            DailyRuntimeCalculator.interquartileMeanCompletedDayHours(
+                activity: activity,
+                now: now,
+                calendar: calendar
+            )
+        )
+
+        XCTAssertEqual(hours, 2.45125, accuracy: 0.0001)
+    }
+
     func testCompressedTimelineCapsLongGapsAtOneHour() {
         let start = Date(timeIntervalSince1970: 700_000)
         let nearby = start.addingTimeInterval(30 * 60)
@@ -414,9 +475,42 @@ final class WeeklyPaceTests: XCTestCase {
             factorInPauses: false
         )
 
-        XCTAssertEqual(points.map(\.date), Array(samples.dropFirst()).map(\.observedAt))
+        XCTAssertEqual(points.map(\.date), [
+            start.addingTimeInterval(1_800),
+            start.addingTimeInterval(2_700),
+            start.addingTimeInterval(3_600),
+            start.addingTimeInterval(4_500),
+            start.addingTimeInterval(5_400)
+        ])
         XCTAssertEqual(try XCTUnwrap(points.first).hoursPerWeek, 50, accuracy: 0.01)
         XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 33.333, accuracy: 0.01)
+    }
+
+    func testEstimateUsesChangeEventsWithoutMinuteBoundarySamples() throws {
+        let start = Date(timeIntervalSince1970: 450_000)
+        let now = start.addingTimeInterval(600)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(
+                observedAt: start.addingTimeInterval(300),
+                remainingPercent: 99,
+                resetsAt: reset
+            )
+        ]
+        let activity = [ActivityInterval(start: start, end: now)]
+
+        let estimate = try XCTUnwrap(WeeklyPaceCalculator.estimate(
+            samples: samples,
+            activity: activity,
+            now: now,
+            sampleTolerance: 90,
+            factorInPauses: false
+        ))
+
+        XCTAssertEqual(estimate.activeDuration, 600, accuracy: 0.01)
+        XCTAssertEqual(estimate.percentagePointsUsed, 1, accuracy: 0.01)
+        XCTAssertEqual(estimate.hoursPerWeek, 16.667, accuracy: 0.01)
     }
 
     func testEstimateSeriesKeepsUsageWindowsIndependent() throws {
@@ -441,10 +535,13 @@ final class WeeklyPaceTests: XCTestCase {
             factorInPauses: false
         )
 
-        XCTAssertEqual(points.count, 2)
-        XCTAssertEqual(points.map(\.windowResetsAt), [firstReset, secondReset])
+        XCTAssertEqual(points.count, 4)
+        XCTAssertEqual(
+            points.map(\.windowResetsAt),
+            [firstReset, firstReset, firstReset, secondReset]
+        )
         XCTAssertEqual(points[0].hoursPerWeek, 5, accuracy: 0.01)
-        XCTAssertEqual(points[1].hoursPerWeek, 50, accuracy: 0.01)
+        XCTAssertEqual(points[3].hoursPerWeek, 50, accuracy: 0.01)
     }
 
     func testEstimateSeriesToleratesSmallResetTimeDrift() {
@@ -468,7 +565,13 @@ final class WeeklyPaceTests: XCTestCase {
             factorInPauses: false
         )
 
-        XCTAssertEqual(points.map(\.date), Array(samples.dropFirst()).map(\.observedAt))
+        XCTAssertEqual(points.map(\.date), [
+            start.addingTimeInterval(900),
+            start.addingTimeInterval(1_800),
+            start.addingTimeInterval(2_700),
+            start.addingTimeInterval(3_600),
+            start.addingTimeInterval(4_500)
+        ])
     }
 
     func testExcludesIdleGapLongerThanFifteenMinutes() throws {

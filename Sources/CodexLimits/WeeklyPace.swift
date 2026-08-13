@@ -27,6 +27,7 @@ struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
 enum DailyRuntimeCalculator {
     static let dayStartHour = 7
     static let completedDayCount = 2
+    static let historicalDayCount = 14
     static let minimumIncludedDayHours = 5.0 / 60
 
     static func averageRecentDayHours(
@@ -80,6 +81,35 @@ enum DailyRuntimeCalculator {
             return nil
         }
         return includedHours.reduce(0, +) / Double(includedHours.count)
+    }
+
+    static func interquartileMeanCompletedDayHours(
+        activity: [ActivityInterval],
+        now: Date,
+        calendar: Calendar = .current,
+        dayCount: Int = historicalDayCount
+    ) -> Double? {
+        guard let windows = completedDayWindows(
+            now: now,
+            calendar: calendar,
+            dayCount: dayCount
+        ) else {
+            return nil
+        }
+        let includedHours = windows.map { window in
+            hours(activity: activity, from: window.start, to: window.end)
+        }
+        .filter(isIncludedDay)
+        .sorted()
+        guard !includedHours.isEmpty else {
+            return nil
+        }
+
+        let trimCount = includedHours.count / 4
+        let interquartileHours = includedHours[
+            trimCount ..< (includedHours.count - trimCount)
+        ]
+        return interquartileHours.reduce(0, +) / Double(interquartileHours.count)
     }
 
     static func completedDayWindows(
@@ -166,7 +196,9 @@ enum WeeklyPaceCalculator {
 
         let includedPause = factorInPauses ? idleGap : 0
         var blocks = merged(rawActivity, joiningGapsUpTo: includedPause)
-            .filter { $0.end >= samples[0].observedAt && $0.start <= now }
+            .compactMap {
+                intersection($0, with: samples[0].observedAt ... now)
+            }
         guard !blocks.isEmpty else { return nil }
 
         if let last = blocks.last, now.timeIntervalSince(last.end) <= idleGap {
@@ -254,11 +286,21 @@ enum WeeklyPaceCalculator {
             }
         }
 
-        return windows.flatMap { windowSamples in
-            estimateSingleWindowSeries(
+        return windows.indices.flatMap { index in
+            let windowSamples = windows[index]
+            let nextWindowStart = windows.indices.contains(index + 1)
+                ? windows[index + 1].first?.observedAt
+                : nil
+            let lastObservation = windowSamples.last?.observedAt ?? now
+            let seriesEnd = min(
+                now,
+                max(lastObservation, nextWindowStart ?? now)
+            )
+            return estimateSingleWindowSeries(
                 samples: windowSamples,
                 activity: activity,
                 now: now,
+                seriesEnd: seriesEnd,
                 sampleTolerance: sampleTolerance,
                 factorInPauses: factorInPauses,
                 lookback: lookback,
@@ -272,6 +314,7 @@ enum WeeklyPaceCalculator {
         samples: [UsageSample],
         activity: [ActivityInterval],
         now: Date,
+        seriesEnd: Date,
         sampleTolerance: TimeInterval,
         factorInPauses: Bool,
         lookback: TimeInterval,
@@ -280,24 +323,24 @@ enum WeeklyPaceCalculator {
         let samples = samples.sorted { $0.observedAt < $1.observedAt }
         guard samples.count > 1 else { return [] }
 
-        var candidateIndices: [Int] = []
-        var lastCandidateDate: Date?
-        for index in samples.indices.dropFirst() {
-            let sample = samples[index]
-            let usageChanged = sample.remainingPercent != samples[index - 1].remainingPercent
-            let spacingReached = lastCandidateDate.map {
-                sample.observedAt.timeIntervalSince($0) >= minimumPointSpacing
-            } ?? true
-            if usageChanged || spacingReached || index == samples.indices.last {
-                candidateIndices.append(index)
-                lastCandidateDate = sample.observedAt
+        let firstDate = samples[0].observedAt
+        var candidateDates = Set(samples.dropFirst().map(\.observedAt))
+        if minimumPointSpacing > 0, seriesEnd > firstDate {
+            var date = firstDate.addingTimeInterval(minimumPointSpacing)
+            while date < seriesEnd {
+                candidateDates.insert(date)
+                date = date.addingTimeInterval(minimumPointSpacing)
             }
         }
+        candidateDates.insert(seriesEnd)
 
-        let rawPoints: [WeeklyPacePoint] = candidateIndices.compactMap { index in
-            let date = samples[index].observedAt
+        let rawPoints: [WeeklyPacePoint] = candidateDates
+            .filter { $0 > firstDate && $0 <= now }
+            .sorted()
+            .compactMap { date in
+            let availableSamples = samples.filter { $0.observedAt <= date }
             guard let estimate = estimate(
-                samples: Array(samples[...index]),
+                samples: availableSamples,
                 activity: activity,
                 now: date,
                 sampleTolerance: sampleTolerance,
@@ -307,7 +350,7 @@ enum WeeklyPaceCalculator {
             return WeeklyPacePoint(
                 date: date,
                 hoursPerWeek: estimate.hoursPerWeek,
-                windowResetsAt: samples[index].resetsAt,
+                windowResetsAt: samples[0].resetsAt,
                 isFastMode: estimate.isFastMode
             )
         }
@@ -413,25 +456,7 @@ enum WeeklyPaceCalculator {
         intervals: [ActivityInterval],
         tolerance: TimeInterval
     ) -> (used: Double, duration: TimeInterval, isFastMode: Bool) {
-        let validIntervals = intervals.filter { interval in
-            let hasStartSample = samples.last(where: {
-                $0.observedAt <= interval.start
-                    && interval.start.timeIntervalSince($0.observedAt) <= tolerance
-            }) ?? samples.first(where: {
-                $0.observedAt > interval.start
-                    && $0.observedAt.timeIntervalSince(interval.start) <= tolerance
-            })
-            let hasEndSample = samples.first(where: {
-                $0.observedAt >= interval.end
-                    && $0.observedAt.timeIntervalSince(interval.end) <= tolerance
-            }) ?? samples.last(where: {
-                $0.observedAt < interval.end
-                    && interval.end.timeIntervalSince($0.observedAt) <= tolerance
-            })
-            return hasStartSample != nil && hasEndSample != nil
-        }
-
-        let duration = validIntervals.reduce(0) { $0 + $1.duration }
+        let duration = intervals.reduce(0) { $0 + $1.duration }
         var latestUsageWasFast = false
         let used = samples.indices.dropFirst().reduce(0.0) { total, index in
             let previous = samples[index - 1]
@@ -439,7 +464,7 @@ enum WeeklyPaceCalculator {
             let decrease = max(previous.remainingPercent - current.remainingPercent, 0)
             guard decrease > 0 else { return total }
 
-            let matchingIntervals = validIntervals.filter { interval in
+            let matchingIntervals = intervals.filter { interval in
                 current.observedAt > interval.start
                     && current.observedAt <= interval.end.addingTimeInterval(tolerance)
                     && previous.observedAt <= interval.end

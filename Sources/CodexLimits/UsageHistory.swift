@@ -50,9 +50,12 @@ actor UsageHistory {
     func load(legacySamples: [UsageSample] = []) -> State {
         do {
             try prepareRoot(localDirectory, createIfMissing: true, coordinated: false)
-            let hadCleanupErrors = try removeExpiredOwnFiles(from: localDirectory, coordinated: false)
             try add(legacySamples, to: localDirectory, installationID: installationID, coordinated: false)
-            errorMessage = hadCleanupErrors
+            let hadMigrationErrors = try compactOwnHistory(
+                in: localDirectory,
+                coordinated: false
+            )
+            errorMessage = hadMigrationErrors
                 ? "Some usage history couldn’t be read."
                 : nil
         } catch {
@@ -64,12 +67,29 @@ actor UsageHistory {
     func record(_ sample: UsageSample) -> State {
         do {
             try prepareRoot(localDirectory, createIfMissing: true, coordinated: false)
-            _ = try removeExpiredOwnFiles(from: localDirectory, coordinated: false)
-            try add([sample], to: localDirectory, installationID: installationID, coordinated: false)
+            _ = try compactOwnHistory(in: localDirectory, coordinated: false)
+            let existing = readAll(from: localDirectory).samples
+            let latest = normalized(existing + knownSamples).last
+            let shouldRecord = latest?.remainingPercent != sample.remainingPercent
+            if shouldRecord {
+                try add(
+                    [sample],
+                    to: localDirectory,
+                    installationID: installationID,
+                    coordinated: false
+                )
+            }
             if let syncDirectory {
                 try prepareRoot(syncDirectory, createIfMissing: false, coordinated: true)
-                _ = try removeExpiredOwnFiles(from: syncDirectory, coordinated: true)
-                try add([sample], to: syncDirectory, installationID: installationID, coordinated: true)
+                _ = try compactOwnHistory(in: syncDirectory, coordinated: true)
+                if shouldRecord {
+                    try add(
+                        [sample],
+                        to: syncDirectory,
+                        installationID: installationID,
+                        coordinated: true
+                    )
+                }
             }
             errorMessage = nil
         } catch {
@@ -104,8 +124,8 @@ actor UsageHistory {
         guard let syncDirectory else { return state() }
         do {
             try prepareRoot(syncDirectory, createIfMissing: false, coordinated: true)
-            _ = try removeExpiredOwnFiles(from: localDirectory, coordinated: false)
-            _ = try removeExpiredOwnFiles(from: syncDirectory, coordinated: true)
+            _ = try compactOwnHistory(in: localDirectory, coordinated: false)
+            _ = try compactOwnHistory(in: syncDirectory, coordinated: true)
             let hadImportErrors = try importHistory(from: syncDirectory)
             try publishOwnHistory(to: syncDirectory)
             errorMessage = hadImportErrors
@@ -203,7 +223,10 @@ actor UsageHistory {
         for (day, newSamples) in grouped {
             let url = writerDirectory.appendingPathComponent("\(day).json")
             let existing = try readDailyFileIfPresent(at: url, coordinated: coordinated)
-            try write(normalized(existing + newSamples), to: url, coordinated: coordinated)
+            let merged = normalized(existing + newSamples)
+            if merged != existing {
+                try write(merged, to: url, coordinated: coordinated)
+            }
         }
     }
 
@@ -222,11 +245,10 @@ actor UsageHistory {
                     let localFile = localWriter.appendingPathComponent(remoteFile.lastPathComponent)
                     let remoteSamples = try readDailyFileIfPresent(at: remoteFile, coordinated: true)
                     let localSamples = try readDailyFileIfPresent(at: localFile, coordinated: false)
-                    try write(
-                        normalized(localSamples + remoteSamples),
-                        to: localFile,
-                        coordinated: false
-                    )
+                    let merged = normalized(localSamples + remoteSamples)
+                    if merged != localSamples {
+                        try write(merged, to: localFile, coordinated: false)
+                    }
                 } catch {
                     hadError = true
                 }
@@ -247,30 +269,54 @@ actor UsageHistory {
             let localSamples = try readDailyFileIfPresent(at: localFile, coordinated: false)
             let remoteSamples = try readDailyFileIfPresent(at: remoteFile, coordinated: true)
             let merged = normalized(localSamples + remoteSamples)
-            try write(merged, to: localFile, coordinated: false)
-            try write(merged, to: remoteFile, coordinated: true)
+            if merged != localSamples {
+                try write(merged, to: localFile, coordinated: false)
+            }
+            if merged != remoteSamples {
+                try write(merged, to: remoteFile, coordinated: true)
+            }
         }
     }
 
-    private func removeExpiredOwnFiles(from root: URL, coordinated: Bool) throws -> Bool {
+    private func compactOwnHistory(in root: URL, coordinated: Bool) throws -> Bool {
         let writer = installationsDirectory(in: root)
             .appendingPathComponent(installationID, isDirectory: true)
         guard FileManager.default.fileExists(atPath: writer.path) else { return false }
+        let files = try jsonFiles(in: writer)
+        var readableFiles: [(url: URL, samples: [UsageSample])] = []
         var hadReadError = false
-        for file in try jsonFiles(in: writer) {
-            let existing: [UsageSample]
+        for file in files {
             do {
-                existing = try readDailyFileIfPresent(at: file, coordinated: coordinated)
+                readableFiles.append((
+                    url: file,
+                    samples: try readDailyFileIfPresent(at: file, coordinated: coordinated)
+                ))
             } catch {
                 hadReadError = true
-                continue
             }
-            let retained = normalized(existing)
+        }
+
+        let compacted = normalized(readableFiles.flatMap(\.samples))
+        let samplesByDay = Dictionary(grouping: compacted, by: { dayName(for: $0.observedAt) })
+        var writtenDays: Set<String> = []
+
+        for file in readableFiles {
+            let day = file.url.deletingPathExtension().lastPathComponent
+            let retained = samplesByDay[day] ?? []
+            writtenDays.insert(day)
             if retained.isEmpty {
-                try removeItem(at: file, coordinated: coordinated)
-            } else if retained != existing {
-                try write(retained, to: file, coordinated: coordinated)
+                try removeItem(at: file.url, coordinated: coordinated)
+            } else if retained != file.samples {
+                try write(retained, to: file.url, coordinated: coordinated)
             }
+        }
+
+        for (day, samples) in samplesByDay where !writtenDays.contains(day) {
+            try write(
+                samples,
+                to: writer.appendingPathComponent("\(day).json"),
+                coordinated: coordinated
+            )
         }
         return hadReadError
     }
@@ -450,7 +496,7 @@ actor UsageHistory {
 
     private func normalized(_ samples: [UsageSample]) -> [UsageSample] {
         let cutoff = now().addingTimeInterval(-Self.retention)
-        return Array(Set(samples.filter {
+        let valid = Array(Set(samples.filter {
             $0.observedAt >= cutoff
                 && $0.observedAt <= $0.resetsAt
                 && $0.remainingPercent.isFinite
@@ -462,6 +508,11 @@ actor UsageHistory {
             }
             return $0.resetsAt < $1.resetsAt
         }
+        var compacted: [UsageSample] = []
+        for sample in valid where compacted.last?.remainingPercent != sample.remainingPercent {
+            compacted.append(sample)
+        }
+        return compacted
     }
 
     private func installationsDirectory(in root: URL) -> URL {

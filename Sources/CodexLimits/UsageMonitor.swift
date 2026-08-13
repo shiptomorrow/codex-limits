@@ -172,7 +172,8 @@ final class UsageMonitor: ObservableObject {
             }
             await recordWeeklySample(from: newSnapshot)
             await updateDailyRuntime(now: newSnapshot.fetchedAt)
-            guard samples.contains(sample) else {
+            guard samples.contains(sample)
+                    || samples.last?.remainingPercent == sample.remainingPercent else {
                 logger.info(
                     "Recorded pending remaining percentage increase to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
                 )
@@ -511,7 +512,7 @@ final class UsageMonitor: ObservableObject {
     private func updateDailyRuntime(now: Date) async {
         guard let windows = DailyRuntimeCalculator.completedDayWindows(
             now: now,
-            dayCount: DailyRuntimeCalculator.completedDayCount * 2
+            dayCount: DailyRuntimeCalculator.historicalDayCount
         ),
               let first = windows.first else {
             dailyRuntimeHours = nil
@@ -530,10 +531,9 @@ final class UsageMonitor: ObservableObject {
             activity: activity,
             now: now
         )
-        historicalDailyRuntimeHours = DailyRuntimeCalculator.averageCompletedDayHours(
+        historicalDailyRuntimeHours = DailyRuntimeCalculator.interquartileMeanCompletedDayHours(
             activity: activity,
-            now: now,
-            dayOffset: DailyRuntimeCalculator.completedDayCount
+            now: now
         )
     }
 

@@ -102,10 +102,7 @@ struct MenuContentView: View {
                     .foregroundStyle(statusColor(forecast.status))
                 statusMessage(snapshot: snapshot, forecast: forecast)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            .overlay(alignment: .bottomLeading) {
                 projectedUsageText
-                    .offset(y: 19)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -343,7 +340,7 @@ struct MenuContentView: View {
         case .slowDown:
             let window = snapshot.mainLimit.window
             let timeLeft = window.resetsAt.timeIntervalSince(snapshot.fetchedAt)
-            let timeToEmpty = window.remainingPercent / max(forecast.safetyPercentPerDay, 0.01) * 86_400
+            let timeToEmpty = window.remainingPercent / max(forecast.currentPercentPerDay, 0.01) * 86_400
             let early = max(timeLeft - timeToEmpty, 0)
             return early > 0
                 ? Text("At this pace, your limit may run out ").foregroundColor(.secondary)

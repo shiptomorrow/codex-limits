@@ -68,8 +68,10 @@ enum ForecastEngine {
         let recommended = daysLeft > 0
             ? max(window.remainingPercent - safetyBuffer, 0) / daysLeft
             : 0
+        let slowDownThreshold = safetyBuffer * 2
         let status: PaceStatus
-        if safety < safetyBuffer || (previousStatus == .slowDown && safety < safetyBuffer + 1) {
+        if expected < slowDownThreshold
+            || (previousStatus == .slowDown && expected < slowDownThreshold + 1) {
             status = .slowDown
         } else if expected > 8 || (previousStatus == .roomToUseMore && expected > 7) {
             status = .roomToUseMore

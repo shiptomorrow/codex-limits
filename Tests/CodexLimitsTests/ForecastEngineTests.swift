@@ -94,7 +94,7 @@ final class ForecastEngineTests: XCTestCase {
         let day: TimeInterval = 86_400
         let now = Date(timeIntervalSince1970: 200 * day)
         let window = UsageWindow(
-            remainingPercent: 49.210526,
+            remainingPercent: 46.571429,
             resetsAt: now.addingTimeInterval(3 * day),
             durationMinutes: 7 * 24 * 60
         )
@@ -108,8 +108,32 @@ final class ForecastEngineTests: XCTestCase {
             previousStatus: .slowDown
         )
 
-        XCTAssertEqual(result.safetyRemainingAtReset, 3.5, accuracy: 0.01)
+        XCTAssertEqual(result.expectedRemainingAtReset, 6.5, accuracy: 0.01)
         XCTAssertEqual(result.status, .slowDown)
+    }
+
+    func testConservativeForecastDoesNotOverrideSafeExpectedForecast() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 250 * day)
+        let window = UsageWindow(
+            remainingPercent: 86,
+            resetsAt: now.addingTimeInterval(6 * day),
+            durationMinutes: 7 * 24 * 60
+        )
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: [],
+            tokenHistory: [],
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: nil,
+            runtimePercentPerDay: 12
+        )
+
+        XCTAssertEqual(result.expectedRemainingAtReset, 14, accuracy: 0.01)
+        XCTAssertEqual(result.safetyRemainingAtReset, 0, accuracy: 0.01)
+        XCTAssertEqual(result.status, .roomToUseMore)
     }
 
     func testRuntimeRateDrivesCurrentProjectionWithoutHistoricalBlend() {

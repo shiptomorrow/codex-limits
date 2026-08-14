@@ -3,6 +3,17 @@ import Combine
 import Foundation
 import OSLog
 
+enum UsageRefreshSchedule {
+    static let defaultSeconds = 15
+    static let minimumSeconds = 1
+    static let maximumSeconds = 3_600
+    static let choices = [1, 2, 5, 10, 15, 30] + Array(stride(from: 60, through: 3_600, by: 60))
+
+    static func clamped(_ seconds: Int) -> Int {
+        min(max(seconds, minimumSeconds), maximumSeconds)
+    }
+}
+
 @MainActor
 final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
@@ -43,7 +54,11 @@ final class UsageMonitor: ObservableObject {
     private var configuredSyncDirectory: URL?
     private var historyConnectionActive = false
     private var weeklySamples: [UsageSample] = []
-    private var lastWeeklyPaceCalculationAt: Date?
+    private var lastHistoryExchangeAt: Date?
+    private var lastScheduledActivityWindows: [String: UsageWindow]?
+    private var pendingActivitySnapshot: UsageSnapshot?
+    private var activityAnalysisTask: Task<Void, Never>?
+    private static let maintenanceInterval: TimeInterval = 10 * 60
 
     init() {
         let defaults = UserDefaults.standard
@@ -110,7 +125,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     func updateRefreshInterval(seconds: Int) {
-        let clampedSeconds = min(max(seconds, 15), 3_600)
+        let clampedSeconds = UsageRefreshSchedule.clamped(seconds)
         UserDefaults.standard.set(clampedSeconds, forKey: Self.refreshIntervalSecondsKey)
         guard started else { return }
         scheduleRefreshTimer()
@@ -118,24 +133,24 @@ final class UsageMonitor: ObservableObject {
 
     func updateFactorInPauses(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.factorInPausesKey)
-        lastWeeklyPaceCalculationAt = nil
+        lastScheduledActivityWindows = nil
         guard let snapshot else { return }
-        Task { await updateWeeklyPace(from: snapshot) }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
     func updatePaceLookback(minutes: Int) {
         let clampedMinutes = min(max(minutes, 15), 180)
         UserDefaults.standard.set(clampedMinutes, forKey: Self.paceLookbackMinutesKey)
-        lastWeeklyPaceCalculationAt = nil
+        lastScheduledActivityWindows = nil
         guard let snapshot else { return }
-        Task { await updateWeeklyPace(from: snapshot) }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
     func updateShowPreviousWeeklyWindow(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.showPreviousWeeklyWindowKey)
-        lastWeeklyPaceCalculationAt = nil
+        lastScheduledActivityWindows = nil
         guard let snapshot else { return }
-        Task { await updateWeeklyPace(from: snapshot) }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
     func refresh() async {
@@ -151,11 +166,15 @@ final class UsageMonitor: ObservableObject {
         }
 
         let fetchTask = Task { try await client.fetch() }
-        let historyState = await exchangeHistory()
-        apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
-        let exchangeErrorMessage = historyState.errorMessage
-        recalculate()
-        persist()
+        var exchangeErrorMessage = syncErrorMessage
+        if maintenanceIsDue(since: lastHistoryExchangeAt, now: Date()) {
+            let historyState = await exchangeHistory()
+            apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
+            exchangeErrorMessage = historyState.errorMessage
+            lastHistoryExchangeAt = Date()
+            recalculate()
+            persist()
+        }
 
         do {
             let newSnapshot = try await fetchTask.value
@@ -171,7 +190,6 @@ final class UsageMonitor: ObservableObject {
                 syncErrorMessage = exchangeErrorMessage
             }
             await recordWeeklySample(from: newSnapshot)
-            await updateDailyRuntime(now: newSnapshot.fetchedAt)
             guard samples.contains(sample)
                     || samples.last?.remainingPercent == sample.remainingPercent else {
                 logger.info(
@@ -184,7 +202,7 @@ final class UsageMonitor: ObservableObject {
             errorMessage = nil
             recalculate()
             persist()
-            await updateWeeklyPace(from: newSnapshot)
+            scheduleActivityAnalysisIfNeeded(for: newSnapshot)
         } catch let error as CodexClientError {
             errorMessage = error.localizedDescription
         } catch {
@@ -194,6 +212,7 @@ final class UsageMonitor: ObservableObject {
 
     func shutdown() {
         refreshTimerCancellable?.cancel()
+        activityAnalysisTask?.cancel()
         client.shutdown()
     }
 
@@ -203,12 +222,16 @@ final class UsageMonitor: ObservableObject {
         let defaults = UserDefaults.standard
         let seconds: Int
         if defaults.object(forKey: Self.refreshIntervalSecondsKey) != nil {
-            seconds = min(max(defaults.integer(forKey: Self.refreshIntervalSecondsKey), 15), 3_600)
+            seconds = UsageRefreshSchedule.clamped(
+                defaults.integer(forKey: Self.refreshIntervalSecondsKey)
+            )
         } else if defaults.object(forKey: "refreshIntervalMinutes") != nil {
-            seconds = min(max(defaults.integer(forKey: "refreshIntervalMinutes") * 60, 15), 3_600)
+            seconds = UsageRefreshSchedule.clamped(
+                defaults.integer(forKey: "refreshIntervalMinutes") * 60
+            )
             defaults.set(seconds, forKey: Self.refreshIntervalSecondsKey)
         } else {
-            seconds = 60
+            seconds = UsageRefreshSchedule.defaultSeconds
         }
         refreshTimerCancellable = Timer.publish(
             every: TimeInterval(seconds),
@@ -264,7 +287,7 @@ final class UsageMonitor: ObservableObject {
         weeklySamples = []
         weeklyPaceHours = nil
         weeklyPacePoints = []
-        lastWeeklyPaceCalculationAt = nil
+        lastScheduledActivityWindows = nil
         previousStatus = nil
         recalculate()
         persist()
@@ -416,12 +439,6 @@ final class UsageMonitor: ObservableObject {
             weeklyPacePoints = []
             return
         }
-        if let lastWeeklyPaceCalculationAt,
-           snapshot.fetchedAt.timeIntervalSince(lastWeeklyPaceCalculationAt) < 60 {
-            return
-        }
-        lastWeeklyPaceCalculationAt = snapshot.fetchedAt
-
         let defaults = UserDefaults.standard
         let showPreviousWindow = defaults.object(forKey: Self.showPreviousWeeklyWindowKey) == nil
             ? true
@@ -463,8 +480,8 @@ final class UsageMonitor: ObservableObject {
         )
         activityIntervals = activity
         let refreshSeconds = defaults.object(forKey: Self.refreshIntervalSecondsKey) == nil
-            ? 60
-            : defaults.integer(forKey: Self.refreshIntervalSecondsKey)
+            ? UsageRefreshSchedule.defaultSeconds
+            : UsageRefreshSchedule.clamped(defaults.integer(forKey: Self.refreshIntervalSecondsKey))
         let tolerance = min(max(TimeInterval(refreshSeconds) * 1.5, 90), 15 * 60)
         let factorInPauses = defaults.object(forKey: Self.factorInPausesKey) == nil
             ? false
@@ -535,6 +552,51 @@ final class UsageMonitor: ObservableObject {
             activity: activity,
             now: now
         )
+    }
+
+    private func scheduleActivityAnalysisIfNeeded(for snapshot: UsageSnapshot) {
+        let windows = Dictionary(uniqueKeysWithValues: ([snapshot.mainLimit] + snapshot.otherLimits).map {
+            ($0.id, $0.window)
+        })
+        guard activityWindowsChanged(from: lastScheduledActivityWindows, to: windows) else { return }
+
+        lastScheduledActivityWindows = windows
+        pendingActivitySnapshot = snapshot
+        startPendingActivityAnalysis()
+    }
+
+    private func startPendingActivityAnalysis() {
+        guard activityAnalysisTask == nil,
+              let snapshot = pendingActivitySnapshot else { return }
+        pendingActivitySnapshot = nil
+
+        activityAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            await self.updateDailyRuntime(now: snapshot.fetchedAt)
+            await self.updateWeeklyPace(from: snapshot)
+            self.activityAnalysisTask = nil
+            self.startPendingActivityAnalysis()
+        }
+    }
+
+    private func activityWindowsChanged(
+        from previous: [String: UsageWindow]?,
+        to current: [String: UsageWindow]
+    ) -> Bool {
+        guard let previous, Set(previous.keys) == Set(current.keys) else { return true }
+        return current.contains { id, window in
+            guard let oldWindow = previous[id] else { return true }
+            return window.remainingPercent != oldWindow.remainingPercent
+                || !UsageReadingValidation.isSameWindow(
+                    resetsAt: window.resetsAt,
+                    previousReset: oldWindow.resetsAt
+                )
+        }
+    }
+
+    private func maintenanceIsDue(since lastRun: Date?, now: Date) -> Bool {
+        guard let lastRun else { return true }
+        return now.timeIntervalSince(lastRun) >= Self.maintenanceInterval
     }
 
     private static func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {

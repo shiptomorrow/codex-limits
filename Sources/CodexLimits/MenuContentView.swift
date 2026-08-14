@@ -1373,7 +1373,7 @@ private struct ChartLegendItem: View {
 struct SettingsView: View {
     @ObservedObject var monitor: UsageMonitor
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
-    @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = 60
+    @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = UsageRefreshSchedule.defaultSeconds
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.paceLookbackMinutesKey) private var paceLookbackMinutes = 60
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
@@ -1492,7 +1492,7 @@ struct SettingsView: View {
     }
 
     private var refreshIntervals: [Int] {
-        [15, 30] + Array(stride(from: 60, through: 3_600, by: 60))
+        UsageRefreshSchedule.choices
     }
 
     private var paceLookbacks: [Int] {
@@ -1511,7 +1511,8 @@ struct SettingsView: View {
     }
 
     private var previousRefreshInterval: Int {
-        refreshIntervals.last(where: { $0 < refreshIntervalSeconds }) ?? 15
+        refreshIntervals.last(where: { $0 < refreshIntervalSeconds })
+            ?? UsageRefreshSchedule.minimumSeconds
     }
 
     private var refreshIntervalLabel: String {

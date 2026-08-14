@@ -65,6 +65,15 @@ actor UsageHistory {
     }
 
     func record(_ sample: UsageSample) -> State {
+        if errorMessage == nil,
+           knownSamples.last?.remainingPercent == sample.remainingPercent {
+            return State(
+                samples: knownSamples,
+                folderName: syncDirectory?.lastPathComponent,
+                errorMessage: nil
+            )
+        }
+
         do {
             try prepareRoot(localDirectory, createIfMissing: true, coordinated: false)
             _ = try compactOwnHistory(in: localDirectory, coordinated: false)

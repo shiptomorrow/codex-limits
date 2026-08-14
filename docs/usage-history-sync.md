@@ -10,7 +10,7 @@ One sync folder represents one Codex account. The app does not identify or verif
 
 - Choosing a sync folder enables synchronization. The app accepts an empty folder that it can initialize or a folder with a supported Codex Limits format marker; it rejects other nonempty folders.
 - On first connection, the app merges the existing local 90-day history with the history already in the folder without replacing either side.
-- Sync runs on launch, wake, panel open, manual refresh, and the existing ten-minute background refresh.
+- Sync runs on launch and at most once every ten minutes while usage checks continue in the background.
 - Each Mac imports available history independently during those refreshes. The app does not track whether another Mac has downloaded a change.
 - Reading current usage from Codex and exchanging folder history are independent operations. Failure of either one does not prevent the other result from updating the app.
 - Stopping sync disconnects the folder without deleting local or folder history.
@@ -35,7 +35,7 @@ The settings interface uses a `History sync` section with this description:
 
 > Keep usage history in a folder available on your other Macs.
 
-`Choose Folder…` selects and connects a folder. When connected, the section shows the folder name and `Stop Syncing`; it shows a short status only when there is a problem. There is no separate toggle, folder-opening action, sync-now action, last-sync timestamp, or claim that another Mac is up to date. The existing `Refresh` action also triggers sync.
+`Choose Folder…` selects and connects a folder. When connected, the section shows the folder name and `Stop Syncing`; it shows a short status only when there is a problem. There is no separate toggle, folder-opening action, sync-now action, last-sync timestamp, or claim that another Mac is up to date. Usage refreshes pick up sync work when the ten-minute maintenance interval is due.
 
 The account invariant is presented as:
 

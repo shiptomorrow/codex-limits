@@ -19,7 +19,9 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage changes in versioned daily JSON files, writing only when the fetched percentage changes.
 - Can optionally replicate usage history through a private folder selected by the user.
-- Refreshes on launch, wake, popover open, every ten minutes, or when requested manually.
+- Checks current usage every 15 seconds by default, configurable from one second to one hour.
+- Refreshes session-derived pace estimates when a reported usage percentage or window changes.
+- Exchanges shared history at most once every ten minutes.
 - Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.
 
 The default safety buffer is 3%. You can change it in the app settings.

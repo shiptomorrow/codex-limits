@@ -32,6 +32,8 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var activityIntervals: [ActivityInterval] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var activityErrorMessage: String?
+    @Published private(set) var activityCacheIntegrityFailed = false
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
 
@@ -93,6 +95,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     var menuBarText: String {
+        if activityCacheIntegrityFailed { return "-%" }
         guard let remaining = snapshot?.mainLimit.window.remainingPercent else { return "—" }
         let displayed = UsagePercentageDisplay.value(
             remainingPercent: remaining,
@@ -439,7 +442,7 @@ final class UsageMonitor: ObservableObject {
         }
     }
 
-    private func updateWeeklyPace(from snapshot: UsageSnapshot) async {
+    private func updateWeeklyPace(from snapshot: UsageSnapshot) async throws {
         defer {
             recalculate()
             persist()
@@ -484,7 +487,7 @@ final class UsageMonitor: ObservableObject {
             return
         }
 
-        let activity = await CodexActivityReader.loadIntervals(
+        let activity = try await CodexActivityReader.loadIntervals(
             since: firstSample.observedAt,
             now: snapshot.fetchedAt
         )
@@ -544,7 +547,7 @@ final class UsageMonitor: ObservableObject {
         return hours / weeklyPaceHours * 100
     }
 
-    private func updateDailyRuntime(now: Date) async {
+    private func updateDailyRuntime(now: Date) async throws {
         guard let windows = DailyRuntimeCalculator.completedDayWindows(
             now: now,
             dayCount: DailyRuntimeCalculator.historicalDayCount
@@ -554,7 +557,7 @@ final class UsageMonitor: ObservableObject {
             historicalDailyRuntimeHours = nil
             return
         }
-        let activity = await CodexActivityReader.loadIntervals(
+        let activity = try await CodexActivityReader.loadIntervals(
             since: first.start,
             now: now
         )
@@ -590,8 +593,20 @@ final class UsageMonitor: ObservableObject {
 
         activityAnalysisTask = Task { [weak self] in
             guard let self else { return }
-            await self.updateDailyRuntime(now: snapshot.fetchedAt)
-            await self.updateWeeklyPace(from: snapshot)
+            do {
+                try await self.updateDailyRuntime(now: snapshot.fetchedAt)
+                try await self.updateWeeklyPace(from: snapshot)
+                self.activityCacheIntegrityFailed = false
+                self.activityErrorMessage = nil
+            } catch {
+                self.weeklyPaceHours = nil
+                self.weeklyPacePoints = []
+                self.dailyRuntimeHours = nil
+                self.historicalDailyRuntimeHours = nil
+                self.activityCacheIntegrityFailed = error is CodexActivityReaderError
+                self.activityErrorMessage = error.localizedDescription
+                self.logger.error("Activity analysis failed: \(error.localizedDescription, privacy: .public)")
+            }
             self.activityAnalysisTask = nil
             self.startPendingActivityAnalysis()
         }

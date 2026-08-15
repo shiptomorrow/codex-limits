@@ -223,10 +223,13 @@ struct MenuContentView: View {
                 }
             }
 
-            if let error = monitor.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
+            ForEach(
+                [monitor.errorMessage, monitor.activityErrorMessage].compactMap { $0 },
+                id: \.self
+            ) { error in
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -562,8 +565,19 @@ private struct WeeklyPaceChart: View {
             WeeklyPaceHoverSpan(
                 startPosition: timeline.position(for: segment.start.date),
                 endPosition: timeline.position(for: segment.end.date),
+                date: segment.start.date,
+                endDate: segment.end.date,
                 hoursPerWeek: segment.start.hoursPerWeek,
                 isFastMode: segment.isFastMode
+            )
+        }
+    }
+
+    private var latestOverlayValue: LatestWeeklyPaceValue? {
+        displayedPoints.last.map {
+            LatestWeeklyPaceValue(
+                position: timeline.position(for: $0.date),
+                hoursPerWeek: $0.hoursPerWeek
             )
         }
     }
@@ -626,22 +640,6 @@ private struct WeeklyPaceChart: View {
                         )
                         .foregroundStyle(latest.isFastMode ? Color.orange : Color.purple)
                         .symbolSize(28)
-                        .annotation(position: .trailing, spacing: 5) {
-                            HStack(alignment: .firstTextBaseline, spacing: 1) {
-                                Text(
-                                    latest.hoursPerWeek.formatted(
-                                        .number.precision(
-                                            .fractionLength(latest.hoursPerWeek < 10 ? 1 : 0)
-                                        )
-                                    )
-                                )
-                                Text("h")
-                            }
-                                .font(.caption2)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background { Capsule().fill(.regularMaterial).opacity(0.7) }
-                        }
                     }
                 }
                 .chartXScale(domain: xDomain)
@@ -689,7 +687,8 @@ private struct WeeklyPaceChart: View {
                         proxy: proxy,
                         spans: hoverSpans,
                         maximumHours: maximumHours,
-                        resetPosition: showsPreviousWindow ? resetPosition : nil
+                        resetPosition: showsPreviousWindow ? resetPosition : nil,
+                        latestValue: latestOverlayValue
                     )
                 }
                 .frame(height: 190)
@@ -712,6 +711,7 @@ private struct WeeklyPaceHoverOverlay: View {
     let spans: [WeeklyPaceHoverSpan]
     let maximumHours: Double
     let resetPosition: Double?
+    let latestValue: LatestWeeklyPaceValue?
     @State private var hoveredPace: HoveredWeeklyPace?
 
     var body: some View {
@@ -765,27 +765,56 @@ private struct WeeklyPaceHoverOverlay: View {
                         .frame(width: 6, height: 6)
                         .position(point)
 
-                    HStack(alignment: .firstTextBaseline, spacing: 1) {
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
                         Text(hoveredPace.formattedHourValue)
                         Text("h")
                     }
                         .font(.caption.weight(.semibold))
                         .monospacedDigit()
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 5)
-                        .background {
-                            RoundedRectangle(cornerRadius: 7)
-                                .fill(.regularMaterial)
-                                .opacity(0.8)
-                        }
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
-                        }
+                        .weeklyPacePill()
                         .fixedSize()
                         .position(
                             x: min(max(point.x, plotRect.minX + 28), plotRect.maxX - 28),
                             y: point.y + (hoveredPace.placesLabelBelow ? 25 : -25)
+                        )
+
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
+                        Text(hoveredPace.formattedDateAndTime)
+                        Text(hoveredPace.formattedDayPeriod)
+                    }
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                        .weeklyPacePill()
+                        .fixedSize()
+                        .position(
+                            x: min(max(point.x, plotRect.minX + 38), plotRect.maxX - 38),
+                            y: min(plotRect.maxY + 11, geometry.size.height - 10)
+                        )
+                }
+
+                if
+                    let latestValue,
+                    let plotFrame = proxy.plotFrame,
+                    let plotX = proxy.position(forX: latestValue.position),
+                    let plotY = proxy.position(forY: latestValue.hoursPerWeek)
+                {
+                    let plotRect = geometry[plotFrame]
+                    let point = CGPoint(
+                        x: plotRect.minX + plotX,
+                        y: plotRect.minY + plotY
+                    )
+
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
+                        Text(latestValue.formattedHourValue)
+                        Text("h")
+                    }
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                        .weeklyPacePill()
+                        .fixedSize()
+                        .position(
+                            x: min(point.x + 28, geometry.size.width - 24),
+                            y: point.y
                         )
                 }
 
@@ -821,11 +850,14 @@ private struct WeeklyPaceHoverOverlay: View {
             clearHover()
             return
         }
-        guard let exactPaceIndex = spans.firstIndex(where: { $0.contains(position) }) else {
+        guard let exactPaceIndex = spans.lastIndex(where: { $0.contains(position) }) else {
             clearHover()
             return
         }
         let exactPace = spans[exactPaceIndex]
+        let sampleDate = position == exactPace.endPosition
+            ? exactPace.endDate
+            : exactPace.date
 
         guard let placesLabelBelow = stableLabelPlacement(
             for: exactPaceIndex,
@@ -837,6 +869,7 @@ private struct WeeklyPaceHoverOverlay: View {
         }
         hoveredPace = HoveredWeeklyPace(
             position: position,
+            date: sampleDate,
             hoursPerWeek: exactPace.hoursPerWeek,
             isFastMode: exactPace.isFastMode,
             placesLabelBelow: placesLabelBelow
@@ -933,6 +966,8 @@ private struct WeeklyPaceHoverOverlay: View {
 private struct WeeklyPaceHoverSpan {
     let startPosition: Double
     let endPosition: Double
+    let date: Date
+    let endDate: Date
     let hoursPerWeek: Double
     let isFastMode: Bool
 
@@ -941,8 +976,20 @@ private struct WeeklyPaceHoverSpan {
     }
 }
 
+private struct LatestWeeklyPaceValue {
+    let position: Double
+    let hoursPerWeek: Double
+
+    var formattedHourValue: String {
+        hoursPerWeek.formatted(
+            .number.precision(.fractionLength(hoursPerWeek < 10 ? 1 : 0))
+        )
+    }
+}
+
 private struct HoveredWeeklyPace {
     let position: Double
+    let date: Date
     let hoursPerWeek: Double
     let isFastMode: Bool
     let placesLabelBelow: Bool
@@ -954,6 +1001,38 @@ private struct HoveredWeeklyPace {
         return hoursPerWeek.formatted(
             .number.precision(.fractionLength(fractionLength))
         )
+    }
+
+    var formattedDateAndTime: String {
+        formattedDate(using: "EEE h:mm")
+    }
+
+    var formattedDayPeriod: String {
+        formattedDate(using: "a").lowercased()
+    }
+
+    private func formattedDate(using format: String) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = format
+        return formatter.string(from: date)
+    }
+}
+
+private extension View {
+    func weeklyPacePill() -> some View {
+        padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(.regularMaterial)
+                    .opacity(0.9)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+            }
     }
 }
 

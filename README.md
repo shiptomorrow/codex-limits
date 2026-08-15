@@ -33,6 +33,7 @@ Codex Limits is local-first:
 - It does not copy or store Codex credentials.
 - It starts the user-managed Codex CLI and reads usage through its local app-server interface.
 - For the weekly-hours estimate, it reads only task timestamps, task boundaries, and token-count metadata from local Codex session files. It does not use prompt or response text.
+- It keeps a local incremental cache of that timing metadata and session file sizes so unchanged JSONL content does not need to be parsed again.
 - It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
 - Weekly-limit samples used by the activity estimate remain local and are not copied to a sync folder.
 - If history sync is enabled, it replicates only those samples to the selected folder. Preferences, credentials, and raw Codex responses remain local.

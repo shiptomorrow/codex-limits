@@ -2,6 +2,69 @@ import XCTest
 @testable import CodexLimits
 
 final class WeeklyPaceTests: XCTestCase {
+    func testActivityCacheReadsOnlyAppendedSessionEvents() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        try fixture.write([
+            fixture.taskStarted(turnID: "turn-1", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(60))
+        ])
+
+        let first = try await fixture.load()
+        let unchanged = try await fixture.load()
+        try fixture.append(fixture.tokenCount(at: start.addingTimeInterval(120)))
+        let appended = try await fixture.load()
+
+        XCTAssertEqual(first, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(60)
+        )])
+        XCTAssertEqual(unchanged, first)
+        XCTAssertEqual(appended, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(120)
+        )])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cacheURL.path))
+    }
+
+    func testActivityCachePoisonsItselfWhenCachedPrefixChanges() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        let original = fixture.taskStarted(turnID: "turn-1", at: start)
+        try fixture.write([
+            original,
+            fixture.tokenCount(at: start.addingTimeInterval(60))
+        ])
+        _ = try await fixture.load()
+
+        let rewritten = original.replacingOccurrences(of: "turn-1", with: "turn-2")
+        try fixture.write([
+            rewritten,
+            fixture.tokenCount(at: start.addingTimeInterval(60)),
+            fixture.tokenCount(at: start.addingTimeInterval(120))
+        ])
+
+        do {
+            _ = try await fixture.load()
+            XCTFail("Expected a cached-prefix integrity error")
+        } catch let error as CodexActivityReaderError {
+            guard case .cacheIntegrity = error else {
+                return XCTFail("Unexpected activity error: \(error)")
+            }
+        }
+
+        do {
+            _ = try await fixture.load()
+            XCTFail("Expected the persisted integrity error")
+        } catch let error as CodexActivityReaderError {
+            guard case .cacheIntegrity = error else {
+                return XCTFail("Unexpected persisted activity error: \(error)")
+            }
+        }
+    }
+
     func testActivityInheritsMostRecentModeForFirstTurnInNewSession() {
         let start = Date(timeIntervalSince1970: 1_000)
         let interval = ActivityInterval(
@@ -797,5 +860,69 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(withoutPauses.activeDuration, 600, accuracy: 0.01)
         XCTAssertEqual(withPauses.hoursPerWeek, 8.333, accuracy: 0.01)
         XCTAssertEqual(withoutPauses.hoursPerWeek, 4.167, accuracy: 0.01)
+    }
+}
+
+private struct ActivityCacheFixture {
+    let root: URL
+    let sessionsRoot: URL
+    let cacheURL: URL
+    let sessionURL: URL
+    let now = Date(timeIntervalSince1970: 1_776_427_200) // 2026-04-16 12:00:00 UTC
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexLimitsActivityCache-\(UUID().uuidString)", isDirectory: true)
+        sessionsRoot = root.appendingPathComponent("sessions", isDirectory: true)
+        cacheURL = root.appendingPathComponent("cache/events.json")
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let components = calendar.dateComponents([.year, .month, .day], from: now)
+        let day = sessionsRoot
+            .appendingPathComponent(String(format: "%04d", components.year!), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        sessionURL = day.appendingPathComponent("rollout-test.jsonl")
+    }
+
+    func load() async throws -> [ActivityInterval] {
+        try await CodexActivityReader.loadIntervals(
+            since: now.addingTimeInterval(-3_600),
+            now: now,
+            sessionsRoot: sessionsRoot,
+            cacheURL: cacheURL
+        )
+    }
+
+    func write(_ lines: [String]) throws {
+        try Data((lines.joined(separator: "\n") + "\n").utf8)
+            .write(to: sessionURL, options: .atomic)
+    }
+
+    func append(_ line: String) throws {
+        let handle = try FileHandle(forWritingTo: sessionURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    func taskStarted(turnID: String, at date: Date) -> String {
+        #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"\#(turnID)","started_at":\#(date.timeIntervalSince1970)}}"#
+    }
+
+    func tokenCount(at date: Date) -> String {
+        #"{"timestamp":"\#(timestamp(date))","type":"event_msg","payload":{"type":"token_count"}}"#
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 }

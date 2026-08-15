@@ -527,93 +527,30 @@ enum WeeklyPaceCalculator {
 }
 
 enum CodexActivityReader {
-    static func loadIntervals(since: Date, now: Date) async -> [ActivityInterval] {
-        await Task.detached(priority: .utility) {
-            loadIntervalsSynchronously(since: since, now: now)
-        }.value
-    }
-
-    private static func loadIntervalsSynchronously(since: Date, now: Date) -> [ActivityInterval] {
+    static func loadIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions", isDirectory: true)
-        let files = sessionFiles(in: root, since: since, now: now)
-        var starts: [String: (date: Date, file: URL)] = [:]
-        var completedIDs: Set<String> = []
-        var completed: [String: (interval: ActivityInterval, file: URL)] = [:]
-        var tokenTimesByFile: [URL: [Date]] = [:]
-        var modeChangesByFile: [URL: [(date: Date, isFastMode: Bool)]] = [:]
+        let cache = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?
+            .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
+            .appendingPathComponent("ActivityCache", isDirectory: true)
+            .appendingPathComponent("events-v2.json")
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limits-events-v2.json")
+        return try await loadIntervals(since: since, now: now, sessionsRoot: root, cacheURL: cache)
+    }
 
-        for file in files {
-            guard let contents = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            contents.enumerateLines { line, _ in
-                guard line.contains("\"event_msg\"") else { return }
-                let isRelevant = line.contains("\"task_started\"")
-                    || line.contains("\"task_complete\"")
-                    || line.contains("\"token_count\"")
-                    || line.contains("\"thread_settings_applied\"")
-                guard isRelevant,
-                      let data = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let payload = object["payload"] as? [String: Any],
-                      let type = payload["type"] as? String else { return }
-
-                switch type {
-                case "thread_settings_applied":
-                    guard let settings = payload["thread_settings"] as? [String: Any],
-                          let serviceTier = settings["service_tier"] as? String,
-                          let timestamp = object["timestamp"] as? String,
-                          let date = timestampDate(timestamp) else { return }
-                    modeChangesByFile[file, default: []].append((
-                        date,
-                        serviceTier == "fast" || serviceTier == "priority"
-                    ))
-                case "task_started":
-                    guard let turnID = payload["turn_id"] as? String,
-                          let startedAt = seconds(payload["started_at"]) else { return }
-                    starts[turnID] = (Date(timeIntervalSince1970: startedAt), file)
-                case "task_complete":
-                    guard let turnID = payload["turn_id"] as? String,
-                          let startedAt = seconds(payload["started_at"]),
-                          let completedAt = seconds(payload["completed_at"]) else { return }
-                    completedIDs.insert(turnID)
-                    completed[turnID] = (
-                        ActivityInterval(
-                            start: Date(timeIntervalSince1970: startedAt),
-                            end: Date(timeIntervalSince1970: completedAt)
-                        ),
-                        file
-                    )
-                case "token_count":
-                    guard let timestamp = object["timestamp"] as? String,
-                          let date = timestampDate(timestamp) else { return }
-                    tokenTimesByFile[file, default: []].append(date)
-                default:
-                    break
-                }
-            }
-        }
-
-        let allModeChanges = modeChangesByFile.values.flatMap { $0 }
-        var intervals = completed.values.flatMap {
-            split(
-                $0.interval,
-                at: modeChangesByFile[$0.file, default: []],
-                inheriting: allModeChanges
-            )
-        }
-        for (turnID, start) in starts where !completedIDs.contains(turnID) {
-            let end = tokenTimesByFile[start.file, default: []]
-                .filter { $0 >= start.date && $0 <= now }
-                .max() ?? start.date
-            if end > start.date {
-                intervals += split(
-                    ActivityInterval(start: start.date, end: end),
-                    at: modeChangesByFile[start.file, default: []],
-                    inheriting: allModeChanges
-                )
-            }
-        }
-        return intervals.filter { $0.end >= since && $0.start <= now }
+    static func loadIntervals(
+        since: Date,
+        now: Date,
+        sessionsRoot: URL,
+        cacheURL: URL
+    ) async throws -> [ActivityInterval] {
+        try await Task.detached(priority: .utility) {
+            try CodexActivityCache(sessionsRoot: sessionsRoot, cacheURL: cacheURL)
+                .loadIntervals(since: since, now: now)
+        }.value
     }
 
     static func split(
@@ -649,43 +586,4 @@ enum CodexActivityReader {
         return result
     }
 
-    private static func sessionFiles(in root: URL, since: Date, now: Date) -> [URL] {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        var day = calendar.startOfDay(for: since.addingTimeInterval(-86_400))
-        let finalDay = calendar.startOfDay(for: now.addingTimeInterval(86_400))
-        var files: [URL] = []
-
-        while day <= finalDay {
-            let components = calendar.dateComponents([.year, .month, .day], from: day)
-            let directory = root
-                .appendingPathComponent(String(format: "%04d", components.year!))
-                .appendingPathComponent(String(format: "%02d", components.month!))
-                .appendingPathComponent(String(format: "%02d", components.day!))
-            if let contents = try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                files += contents.filter {
-                    $0.pathExtension == "jsonl"
-                        && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) <= 50_000_000
-                }
-            }
-            day = calendar.date(byAdding: .day, value: 1, to: day)!
-        }
-        return files
-    }
-
-    private static func seconds(_ value: Any?) -> TimeInterval? {
-        if let value = value as? NSNumber { return value.doubleValue }
-        if let value = value as? Double { return value }
-        return nil
-    }
-
-    private static func timestampDate(_ value: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value)
-    }
 }

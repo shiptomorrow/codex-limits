@@ -15,6 +15,8 @@ enum UsagePercentageDisplay {
 
 enum EstimatedRuntimeChartPreferences {
     static let reversesYAxisKey = "reverseEstimatedRuntimeChart"
+    static let plotsOnlyUsageChangesKey = "plotEstimatedRuntimeOnlyOnUsageChanges"
+    static let smoothsSpikesKey = "smoothEstimatedRuntimeSpikes"
 }
 
 enum OtherLimitPreferences {

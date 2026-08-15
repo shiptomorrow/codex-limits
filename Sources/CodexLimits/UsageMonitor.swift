@@ -153,6 +153,16 @@ final class UsageMonitor: ObservableObject {
         scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
+    func updateSmoothsEstimatedRuntimeSpikes(_ enabled: Bool) {
+        UserDefaults.standard.set(
+            enabled,
+            forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey
+        )
+        lastScheduledActivityWindows = nil
+        guard let snapshot else { return }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
     func refresh() async {
         guard !isRefreshing else { return }
         isRefreshing = true
@@ -490,19 +500,27 @@ final class UsageMonitor: ObservableObject {
             ? 60
             : min(max(defaults.integer(forKey: Self.paceLookbackMinutesKey), 15), 180)
         let lookback = TimeInterval(lookbackMinutes * 60)
+        let smoothsSpikes = defaults.object(
+            forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey
+        ) == nil || defaults.bool(forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey)
         let calculation = await Task.detached(priority: .utility) {
-            let points = WeeklyPaceCalculator.estimateSeries(
+            let rawPoints = WeeklyPaceCalculator.estimateSeries(
                 samples: relevantSamples,
                 activity: activity,
                 now: snapshot.fetchedAt,
                 sampleTolerance: tolerance,
                 factorInPauses: factorInPauses,
-                lookback: lookback
+                lookback: lookback,
+                smoothsSpikes: false
             )
-            let current = points.last(where: {
+            let effectivePoints = WeeklyPaceCalculator.spikeFilteredSeries(
+                rawPoints,
+                enabled: smoothsSpikes
+            )
+            let current = effectivePoints.last(where: {
                 abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
             })?.hoursPerWeek
-            return (points, current)
+            return (rawPoints, current)
         }.value
         weeklyPacePoints = calculation.0
         weeklyPaceHours = calculation.1

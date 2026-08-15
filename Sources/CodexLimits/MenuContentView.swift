@@ -11,6 +11,8 @@ struct MenuContentView: View {
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
+    @AppStorage(EstimatedRuntimeChartPreferences.plotsOnlyUsageChangesKey) private var plotsOnlyUsageChanges = false
+    @AppStorage(EstimatedRuntimeChartPreferences.smoothsSpikesKey) private var smoothsEstimatedRuntimeSpikes = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
@@ -143,7 +145,9 @@ struct MenuContentView: View {
                         fetchedAt: snapshot.fetchedAt,
                         factorInPauses: factorInPauses,
                         showsPreviousWindow: showPreviousWeeklyWindow,
-                        reversesYAxis: reversesEstimatedRuntimeChart
+                        reversesYAxis: reversesEstimatedRuntimeChart,
+                        plotsOnlyUsageChanges: plotsOnlyUsageChanges,
+                        smoothsSpikes: smoothsEstimatedRuntimeSpikes
                     )
                 }
             }
@@ -465,9 +469,17 @@ private struct WeeklyPaceChart: View {
     let factorInPauses: Bool
     let showsPreviousWindow: Bool
     let reversesYAxis: Bool
+    let plotsOnlyUsageChanges: Bool
+    let smoothsSpikes: Bool
 
     private var displayedPoints: [WeeklyPacePoint] {
-        points
+        WeeklyPaceCalculator.chartSeries(
+            WeeklyPaceCalculator.spikeFilteredSeries(
+                points,
+                enabled: smoothsSpikes
+            ),
+            plotsOnlyUsageChanges: plotsOnlyUsageChanges
+        )
             .filter {
                 showsPreviousWindow
                     || abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
@@ -1379,6 +1391,8 @@ struct SettingsView: View {
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
+    @AppStorage(EstimatedRuntimeChartPreferences.plotsOnlyUsageChangesKey) private var plotsOnlyUsageChanges = false
+    @AppStorage(EstimatedRuntimeChartPreferences.smoothsSpikesKey) private var smoothsEstimatedRuntimeSpikes = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
@@ -1447,6 +1461,15 @@ struct SettingsView: View {
                 .help("Use this much recent activity to estimate the weekly pace")
 
                 Toggle("Reverse estimated runtime chart", isOn: $reversesEstimatedRuntimeChart)
+
+                Toggle("Only plot exact usage updates", isOn: $plotsOnlyUsageChanges)
+                    .help("Add estimated runtime points only when the remaining usage percentage decreases")
+
+                Toggle("Smooth estimated runtime spikes", isOn: $smoothsEstimatedRuntimeSpikes)
+                    .onChange(of: smoothsEstimatedRuntimeSpikes) { _, value in
+                        monitor.updateSmoothsEstimatedRuntimeSpikes(value)
+                    }
+                    .help("Suppress isolated estimated runtime changes larger than 50 percent")
 
                 Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }

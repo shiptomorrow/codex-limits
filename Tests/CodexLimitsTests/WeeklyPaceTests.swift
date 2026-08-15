@@ -544,6 +544,37 @@ final class WeeklyPaceTests: XCTestCase {
         }
     }
 
+    func testEstimateSeriesCanPlotOnlyUsageChanges() throws {
+        let start = Date(timeIntervalSince1970: 480_000)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(300), remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(600), remainingPercent: 99, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(900), remainingPercent: 99, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(1_200), remainingPercent: 98, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(1_500), remainingPercent: 98, resetsAt: reset)
+        ]
+
+        let allPoints = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: [ActivityInterval(start: start, end: start.addingTimeInterval(1_500))],
+            now: start.addingTimeInterval(1_500),
+            sampleTolerance: 90,
+            factorInPauses: false,
+            minimumPointSpacing: 300
+        )
+        let points = WeeklyPaceCalculator.chartSeries(
+            allPoints,
+            plotsOnlyUsageChanges: true
+        )
+
+        XCTAssertEqual(points.map(\.date), [
+            start.addingTimeInterval(600),
+            start.addingTimeInterval(1_200)
+        ])
+    }
+
     func testEstimateSeriesKeepsUsageWindowsIndependent() throws {
         let start = Date(timeIntervalSince1970: 600_000)
         let firstReset = start.addingTimeInterval(3_600)
@@ -703,6 +734,28 @@ final class WeeklyPaceTests: XCTestCase {
         let stabilized = WeeklyPaceCalculator.stabilizedSeries(points)
 
         XCTAssertEqual(stabilized.map(\.hoursPerWeek), [6.3, 6.2, 6.3, 10.1, 9.9])
+    }
+
+    func testSpikeFilteringCanBeDisabled() {
+        let start = Date(timeIntervalSince1970: 290_000)
+        let reset = start.addingTimeInterval(86_400)
+        let points = [6.3, 6.2, 9.8, 5.9].enumerated().map { index, hours in
+            WeeklyPacePoint(
+                date: start.addingTimeInterval(Double(index) * 900),
+                hoursPerWeek: hours,
+                windowResetsAt: reset
+            )
+        }
+
+        XCTAssertEqual(
+            WeeklyPaceCalculator.spikeFilteredSeries(points, enabled: false),
+            points
+        )
+        XCTAssertEqual(
+            WeeklyPaceCalculator.spikeFilteredSeries(points, enabled: true)
+                .map(\.hoursPerWeek),
+            [6.3, 6.2, 6.3, 5.9]
+        )
     }
 
     func testCanExcludeEveryIdleSecond() throws {

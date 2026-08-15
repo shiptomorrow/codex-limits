@@ -20,6 +20,7 @@ struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
     let hoursPerWeek: Double
     let windowResetsAt: Date
     var isFastMode = false
+    var isUsageChange = false
 
     var id: Date { date }
 }
@@ -270,7 +271,8 @@ enum WeeklyPaceCalculator {
         sampleTolerance: TimeInterval,
         factorInPauses: Bool,
         lookback: TimeInterval = 60 * 60,
-        minimumPointSpacing: TimeInterval = 15 * 60
+        minimumPointSpacing: TimeInterval = 15 * 60,
+        smoothsSpikes: Bool = true
     ) -> [WeeklyPacePoint] {
         let samples = rawSamples
             .filter { $0.observedAt <= now }
@@ -286,7 +288,7 @@ enum WeeklyPaceCalculator {
             }
         }
 
-        return windows.indices.flatMap { index in
+        let rawPoints = windows.indices.flatMap { index in
             let windowSamples = windows[index]
             let nextWindowStart = windows.indices.contains(index + 1)
                 ? windows[index + 1].first?.observedAt
@@ -309,6 +311,7 @@ enum WeeklyPaceCalculator {
             )
         }
         .sorted { $0.date < $1.date }
+        return spikeFilteredSeries(rawPoints, enabled: smoothsSpikes)
     }
 
     private static func estimateSingleWindowSeries(
@@ -332,6 +335,11 @@ enum WeeklyPaceCalculator {
             : nil
 
         let firstDate = samples[0].observedAt
+        let usageChangeDates = Set(samples.indices.dropFirst().compactMap { index in
+            samples[index].remainingPercent < samples[index - 1].remainingPercent
+                ? samples[index].observedAt
+                : nil
+        })
         var candidateDates = Set(samples.dropFirst().map(\.observedAt))
         if minimumPointSpacing > 0, seriesEnd > firstDate {
             var date = firstDate.addingTimeInterval(minimumPointSpacing)
@@ -363,10 +371,35 @@ enum WeeklyPaceCalculator {
                 date: date,
                 hoursPerWeek: estimate.hoursPerWeek,
                 windowResetsAt: samples[0].resetsAt,
-                isFastMode: estimate.isFastMode
+                isFastMode: estimate.isFastMode,
+                isUsageChange: usageChangeDates.contains(date)
             )
         }
-        return stabilizedSeries(rawPoints)
+        return rawPoints
+    }
+
+    static func chartSeries(
+        _ points: [WeeklyPacePoint],
+        plotsOnlyUsageChanges: Bool
+    ) -> [WeeklyPacePoint] {
+        plotsOnlyUsageChanges ? points.filter(\.isUsageChange) : points
+    }
+
+    static func spikeFilteredSeries(
+        _ points: [WeeklyPacePoint],
+        enabled: Bool
+    ) -> [WeeklyPacePoint] {
+        guard enabled else { return points }
+        let windows = points.sorted { $0.date < $1.date }.reduce(into: [[WeeklyPacePoint]]()) {
+            windows, point in
+            if let reset = windows.last?.last?.windowResetsAt,
+               abs(reset.timeIntervalSince(point.windowResetsAt)) <= resetTimeTolerance {
+                windows[windows.count - 1].append(point)
+            } else {
+                windows.append([point])
+            }
+        }
+        return windows.flatMap(stabilizedSeries)
     }
 
     static func stabilizedSeries(_ points: [WeeklyPacePoint]) -> [WeeklyPacePoint] {
@@ -388,7 +421,8 @@ enum WeeklyPaceCalculator {
                 date: raw.date,
                 hoursPerWeek: median,
                 windowResetsAt: raw.windowResetsAt,
-                isFastMode: raw.isFastMode
+                isFastMode: raw.isFastMode,
+                isUsageChange: raw.isUsageChange
             )
         }
     }

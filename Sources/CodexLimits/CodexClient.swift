@@ -27,24 +27,26 @@ private enum CodexConnectionError: Error {
 
 @MainActor
 final class CodexClient {
-    private final class Connection {
+    private final class Connection: @unchecked Sendable {
         let process: Process
         let input: FileHandle
         let output: FileHandle
+        let errorOutput: FileHandle
         let executableIdentity: ExecutableIdentity
         let startedAt: Date
-        var readerTask: Task<Void, Never>?
 
         init(
             process: Process,
             input: FileHandle,
             output: FileHandle,
+            errorOutput: FileHandle,
             executableIdentity: ExecutableIdentity,
             startedAt: Date
         ) {
             self.process = process
             self.input = input
             self.output = output
+            self.errorOutput = errorOutput
             self.executableIdentity = executableIdentity
             self.startedAt = startedAt
         }
@@ -149,15 +151,20 @@ final class CodexClient {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
+        let errorOutput = Pipe()
         process.executableURL = executable.url
         process.arguments = ["app-server", "--stdio"]
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorOutput
 
         do {
             try process.run()
         } catch {
+            CodexDiagnostics.record(
+                "Could not start Codex CLI app-server",
+                details: "Executable: \(executable.url.path)\nError: \(error)"
+            )
             throw CodexConnectionError.disconnected
         }
 
@@ -165,11 +172,13 @@ final class CodexClient {
             process: process,
             input: input.fileHandleForWriting,
             output: output.fileHandleForReading,
+            errorOutput: errorOutput.fileHandleForReading,
             executableIdentity: executable.identity,
             startedAt: now()
         )
         self.connection = connection
         startReader(for: connection)
+        startErrorReader(for: connection)
         process.terminationHandler = { [weak self, weak connection] _ in
             guard let connection else { return }
             Task { @MainActor in
@@ -214,16 +223,72 @@ final class CodexClient {
 
     private func startReader(for connection: Connection) {
         let output = connection.output
-        connection.readerTask = Task.detached(priority: .utility) { [weak self, weak connection] in
+        DispatchQueue.global(qos: .utility).async { [weak self, weak connection] in
             guard let connection else { return }
-            do {
-                for try await line in output.bytes.lines {
-                    await self?.receive(Data(line.utf8), from: connection)
+            var buffer = Data()
+            while true {
+                let chunk = output.availableData
+                guard !chunk.isEmpty else { break }
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    var line = Data(buffer[..<newline])
+                    buffer.removeSubrange(...newline)
+                    if line.last == 0x0D { line.removeLast() }
+                    let completeLine = line
+                    let delivered = DispatchSemaphore(value: 0)
+                    Task { @MainActor [weak self, weak connection] in
+                        if let connection {
+                            self?.receive(completeLine, from: connection)
+                        }
+                        delivered.signal()
+                    }
+                    delivered.wait()
                 }
-            } catch {
-                // EOF and read failures are handled identically below.
             }
-            await self?.connectionEnded(connection)
+            if !buffer.isEmpty {
+                let remaining = buffer
+                let delivered = DispatchSemaphore(value: 0)
+                Task { @MainActor [weak self, weak connection] in
+                    if let connection {
+                        self?.receive(remaining, from: connection)
+                    }
+                    delivered.signal()
+                }
+                delivered.wait()
+            }
+            Task { @MainActor [weak self, weak connection] in
+                if let connection {
+                    self?.connectionEnded(connection)
+                }
+            }
+        }
+    }
+
+    private func startErrorReader(for connection: Connection) {
+        let errorOutput = connection.errorOutput
+        DispatchQueue.global(qos: .utility).async {
+            var buffer = Data()
+            while true {
+                let chunk = errorOutput.availableData
+                guard !chunk.isEmpty else { break }
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    var line = Data(buffer[..<newline])
+                    buffer.removeSubrange(...newline)
+                    if line.last == 0x0D { line.removeLast() }
+                    guard !line.isEmpty else { continue }
+                    CodexDiagnostics.record(
+                        "Codex CLI stderr",
+                        details: String(decoding: line, as: UTF8.self)
+                    )
+                }
+            }
+            if !buffer.isEmpty {
+                CodexDiagnostics.record(
+                    "Codex CLI stderr",
+                    details: String(decoding: buffer, as: UTF8.self)
+                )
+            }
         }
     }
 
@@ -249,6 +314,10 @@ final class CodexClient {
                     guard let self, let connection else { return }
                     try? await Task.sleep(nanoseconds: self.requestTimeoutNanoseconds)
                     guard !Task.isCancelled else { return }
+                    CodexDiagnostics.record(
+                        "Codex app-server request timed out",
+                        details: "Method: \(method)\nRequest ID: \(id)"
+                    )
                     self.failConnection(connection, error: CodexConnectionError.timedOut)
                 }
                 pendingRequests[id]?.timeoutTask = timeoutTask
@@ -267,13 +336,32 @@ final class CodexClient {
     }
 
     private func receive(_ data: Data, from connection: Connection) {
-        guard self.connection === connection,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let id = object["id"] as? Int,
+        guard self.connection === connection else { return }
+        let object: [String: Any]
+        do {
+            guard let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CodexClientError.invalidResponse
+            }
+            object = decoded
+        } catch {
+            CodexDiagnostics.record(
+                "Codex app-server emitted malformed JSON",
+                details: String(decoding: data, as: UTF8.self)
+            )
+            failConnection(connection, error: CodexClientError.invalidResponse)
+            return
+        }
+
+        // App-server notifications do not carry request IDs and are not responses.
+        guard let id = object["id"] as? Int,
               let pending = pendingRequests.removeValue(forKey: id) else { return }
 
         pending.timeoutTask?.cancel()
         if object["error"] != nil {
+            CodexDiagnostics.record(
+                "Codex app-server returned an RPC error",
+                details: String(decoding: data, as: UTF8.self)
+            )
             pending.continuation.resume(throwing: CodexClientError.invalidResponse)
         } else {
             pending.continuation.resume(returning: data)
@@ -287,6 +375,14 @@ final class CodexClient {
     }
 
     private func connectionEnded(_ connection: Connection) {
+        guard self.connection === connection else { return }
+        let status = connection.process.isRunning
+            ? "unknown"
+            : String(connection.process.terminationStatus)
+        CodexDiagnostics.record(
+            "Codex CLI app-server disconnected unexpectedly",
+            details: "Termination status: \(status)"
+        )
         failConnection(connection, error: CodexConnectionError.disconnected)
     }
 
@@ -298,8 +394,9 @@ final class CodexClient {
     private func stopConnection(error: Error) {
         let connection = self.connection
         self.connection = nil
-        connection?.readerTask?.cancel()
         try? connection?.input.close()
+        try? connection?.output.close()
+        try? connection?.errorOutput.close()
         if connection?.process.isRunning == true {
             connection?.process.terminate()
         }
@@ -318,8 +415,27 @@ final class CodexClient {
         fetchedAt: Date
     ) throws -> UsageSnapshot {
         let decoder = JSONDecoder()
-        guard let rateResult = try decoder.decode(RPCResponse<RateLimitsResult>.self, from: rateLimitsResponse).result,
-              let usageResult = try decoder.decode(RPCResponse<UsageResult>.self, from: usageResponse).result else {
+        let rateResponse: RPCResponse<RateLimitsResult>
+        let usage: RPCResponse<UsageResult>
+        do {
+            rateResponse = try decoder.decode(
+                RPCResponse<RateLimitsResult>.self,
+                from: rateLimitsResponse
+            )
+            usage = try decoder.decode(RPCResponse<UsageResult>.self, from: usageResponse)
+        } catch {
+            CodexDiagnostics.record(
+                "Could not decode Codex app-server usage responses",
+                details: "Decode error: \(error)\nRate limits response: \(String(decoding: rateLimitsResponse, as: UTF8.self))\nUsage response: \(String(decoding: usageResponse, as: UTF8.self))"
+            )
+            throw CodexClientError.invalidResponse
+        }
+        guard let rateResult = rateResponse.result,
+              let usageResult = usage.result else {
+            CodexDiagnostics.record(
+                "Codex app-server response did not contain a result",
+                details: "Rate limits response: \(String(decoding: rateLimitsResponse, as: UTF8.self))\nUsage response: \(String(decoding: usageResponse, as: UTF8.self))"
+            )
             throw CodexClientError.invalidResponse
         }
 

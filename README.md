@@ -37,6 +37,7 @@ Codex Limits is local-first:
 - It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
 - Weekly-limit samples used by the activity estimate remain local and are not copied to a sync folder.
 - If history sync is enabled, it replicates only those samples to the selected folder. Preferences, credentials, and raw Codex responses remain local.
+- Failed Codex app-server responses and CLI errors are written to the rotating local diagnostic log at `~/Library/Logs/Codex Limits/codex-client.log`.
 - Synced history is readable JSON and contains observation times, remaining percentages, and reset times. Choose a private folder that is not shared with other people.
 - It has no telemetry, analytics, notifications, or direct network client.
 - The Codex CLI may contact the Codex service as part of its normal operation.

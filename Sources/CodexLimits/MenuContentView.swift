@@ -1213,6 +1213,30 @@ private struct BurnDownChart: View {
         return dates
     }
 
+    private var hoverSegments: [BurnDownHoverSegment] {
+        let actual = observedSegments.map { segment in
+            BurnDownHoverSegment(
+                startDate: segment.start.date,
+                endDate: segment.end.date,
+                startPercent: displayedPercent(segment.start.remaining),
+                endPercent: displayedPercent(segment.end.remaining),
+                color: segment.isFastMode ? .orange : .blue,
+                isStep: true
+            )
+        }
+        let projected = zip(currentProjection, currentProjection.dropFirst()).map { start, end in
+            BurnDownHoverSegment(
+                startDate: start.date,
+                endDate: end.date,
+                startPercent: displayedPercent(start.remaining),
+                endPercent: displayedPercent(end.remaining),
+                color: currentColor,
+                isStep: false
+            )
+        }
+        return actual + projected
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
@@ -1347,6 +1371,12 @@ private struct BurnDownChart: View {
                 }
             }
             .chartLegend(.hidden)
+            .chartOverlay { proxy in
+                BurnDownHoverOverlay(
+                    proxy: proxy,
+                    segments: hoverSegments
+                )
+            }
             .frame(height: 190)
             .padding(.horizontal, 8)
             .accessibilityLabel("Usage forecast")
@@ -1421,6 +1451,168 @@ private struct BurnDownChart: View {
                 isFastMode: isFinalSegment ? usageIntervalContainsFastMode : midpointIsFastMode
             )
         }
+    }
+}
+
+private struct BurnDownHoverOverlay: View {
+    let proxy: ChartProxy
+    let segments: [BurnDownHoverSegment]
+    @State private var hoveredValue: HoveredBurnDownValue?
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                if
+                    let hoveredValue,
+                    let plotFrame = proxy.plotFrame,
+                    let plotX = proxy.position(forX: hoveredValue.date),
+                    let plotY = proxy.position(forY: hoveredValue.percent)
+                {
+                    let plotRect = geometry[plotFrame]
+                    let point = CGPoint(
+                        x: plotRect.minX + plotX,
+                        y: plotRect.minY + plotY
+                    )
+                    let guideStyle = StrokeStyle(lineWidth: 1, dash: [3, 3])
+
+                    Path { path in
+                        path.move(to: CGPoint(x: point.x, y: plotRect.minY))
+                        path.addLine(to: CGPoint(x: point.x, y: plotRect.maxY))
+                    }
+                    .stroke(hoveredValue.color.opacity(0.55), style: guideStyle)
+
+                    Path { path in
+                        path.move(to: CGPoint(x: plotRect.minX, y: point.y))
+                        path.addLine(to: CGPoint(x: plotRect.maxX, y: point.y))
+                    }
+                    .stroke(hoveredValue.color.opacity(0.55), style: guideStyle)
+
+                    Circle()
+                        .fill(hoveredValue.color)
+                        .frame(width: 6, height: 6)
+                        .position(point)
+
+                    HStack(alignment: .firstTextBaseline, spacing: 1) {
+                        Text(hoveredValue.formattedPercentValue)
+                        Text("%")
+                    }
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                        .weeklyPacePill()
+                        .fixedSize()
+                        .position(
+                            x: min(max(point.x, plotRect.minX + 28), plotRect.maxX - 28),
+                            y: point.y + (hoveredValue.placesLabelBelow ? 25 : -25)
+                        )
+
+                    HStack(alignment: .firstTextBaseline, spacing: 2) {
+                        Text(hoveredValue.formattedDateAndTime)
+                        Text(hoveredValue.formattedDayPeriod)
+                    }
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                        .weeklyPacePill()
+                        .fixedSize()
+                        .position(
+                            x: min(max(point.x, plotRect.minX + 38), plotRect.maxX - 38),
+                            y: min(plotRect.maxY + 11, geometry.size.height - 10)
+                        )
+                }
+
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        updateHover(phase, geometry: geometry)
+                    }
+            }
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+    }
+
+    private func updateHover(_ phase: HoverPhase, geometry: GeometryProxy) {
+        guard case let .active(location) = phase else {
+            hoveredValue = nil
+            return
+        }
+        guard let plotFrame = proxy.plotFrame else {
+            hoveredValue = nil
+            return
+        }
+        let plotRect = geometry[plotFrame]
+        guard plotRect.contains(location) else {
+            hoveredValue = nil
+            return
+        }
+        let plotX = location.x - plotRect.minX
+        guard let date: Date = proxy.value(atX: plotX) else {
+            hoveredValue = nil
+            return
+        }
+        guard let segment = segments.last(where: { $0.contains(date) }) else {
+            hoveredValue = nil
+            return
+        }
+
+        let percent = segment.percent(at: date)
+        hoveredValue = HoveredBurnDownValue(
+            date: date,
+            percent: percent,
+            color: segment.color,
+            placesLabelBelow: percent > 80
+        )
+    }
+}
+
+private struct BurnDownHoverSegment {
+    let startDate: Date
+    let endDate: Date
+    let startPercent: Double
+    let endPercent: Double
+    let color: Color
+    let isStep: Bool
+
+    func contains(_ date: Date) -> Bool {
+        date >= startDate && date <= endDate
+    }
+
+    func percent(at date: Date) -> Double {
+        guard !isStep else { return date == endDate ? endPercent : startPercent }
+        let duration = endDate.timeIntervalSince(startDate)
+        guard duration > 0 else { return endPercent }
+        let progress = date.timeIntervalSince(startDate) / duration
+        return startPercent + progress * (endPercent - startPercent)
+    }
+}
+
+private struct HoveredBurnDownValue {
+    let date: Date
+    let percent: Double
+    let color: Color
+    let placesLabelBelow: Bool
+
+    var formattedPercentValue: String {
+        percent.formatted(
+            .number.precision(.fractionLength(percent < 10 ? 1 : 0))
+        )
+    }
+
+    var formattedDateAndTime: String {
+        formattedDate(using: "EEE h:mm")
+    }
+
+    var formattedDayPeriod: String {
+        formattedDate(using: "a").lowercased()
+    }
+
+    private func formattedDate(using format: String) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = format
+        return formatter.string(from: date)
     }
 }
 

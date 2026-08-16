@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusContentView: StatusItemContentView?
     private var snapshotCancellable: AnyCancellable?
     private var activityErrorCancellable: AnyCancellable?
+    private var usageErrorCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
     private var settingsWindow: NSWindow?
 
@@ -57,6 +58,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .sink { [weak self] _ in self?.updateStatusItem() }
 
         activityErrorCancellable = monitor.$activityErrorMessage
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusItem() }
+
+        usageErrorCancellable = monitor.$usageReadFailed
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusItem() }
 

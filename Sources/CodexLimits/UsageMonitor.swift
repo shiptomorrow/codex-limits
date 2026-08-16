@@ -34,6 +34,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var activityErrorMessage: String?
     @Published private(set) var activityCacheIntegrityFailed = false
+    @Published private(set) var usageReadFailed = false
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
 
@@ -95,7 +96,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     var menuBarText: String {
-        if activityCacheIntegrityFailed { return "-%" }
+        if activityCacheIntegrityFailed || usageReadFailed { return "-%" }
         guard let remaining = snapshot?.mainLimit.window.remainingPercent else { return "—" }
         let displayed = UsagePercentageDisplay.value(
             remainingPercent: remaining,
@@ -191,6 +192,7 @@ final class UsageMonitor: ObservableObject {
 
         do {
             let newSnapshot = try await fetchTask.value
+            usageReadFailed = false
             let window = newSnapshot.mainLimit.window
             let sample = UsageSample(
                 observedAt: newSnapshot.fetchedAt,
@@ -218,8 +220,10 @@ final class UsageMonitor: ObservableObject {
             scheduleActivityAnalysisIfNeeded(for: newSnapshot)
         } catch let error as CodexClientError {
             errorMessage = error.localizedDescription
+            usageReadFailed = true
         } catch {
             errorMessage = "Couldn’t read Codex usage. Try refreshing again."
+            usageReadFailed = true
         }
     }
 

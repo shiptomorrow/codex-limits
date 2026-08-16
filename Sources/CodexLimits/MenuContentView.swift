@@ -232,7 +232,10 @@ struct MenuContentView: View {
             Divider()
             HStack {
                 TimelineView(.periodic(from: .now, by: 60)) { context in
-                    Text(updatedText(snapshot.fetchedAt, now: context.date))
+                    Text(updatedText(
+                        monitor.lastUsageChangeAt ?? snapshot.fetchedAt,
+                        now: context.date
+                    ))
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -449,6 +452,10 @@ struct MenuContentView: View {
         if seconds < 3_600 { return "Updated \(Int(seconds / 60)) min ago" }
         if seconds < 86_400 {
             let hours = Int(seconds / 3_600)
+            if seconds < 5 * 3_600 {
+                let minutes = Int(seconds / 60) % 60
+                return "Updated \(hours) \(hours == 1 ? "hr" : "hrs") \(minutes) min ago"
+            }
             return "Updated \(hours) \(hours == 1 ? "hr" : "hrs") ago"
         }
         let days = Int(seconds / 86_400)

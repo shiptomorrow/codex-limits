@@ -109,6 +109,10 @@ final class UsageMonitor: ObservableObject {
         return UsageReadingValidation.samples(samples, matchingReset: reset)
     }
 
+    var lastUsageChangeAt: Date? {
+        currentWindowSamples.last?.observedAt ?? snapshot?.fetchedAt
+    }
+
     func start() async {
         guard !started else { return }
         started = true

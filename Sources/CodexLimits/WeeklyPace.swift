@@ -13,14 +13,35 @@ struct WeeklyPaceEstimate: Equatable, Sendable {
     let activeDuration: TimeInterval
     let percentagePointsUsed: Double
     let isFastMode: Bool
+    let fastModeProportion: Double
 }
 
 struct WeeklyPacePoint: Equatable, Identifiable, Sendable {
     let date: Date
     let hoursPerWeek: Double
     let windowResetsAt: Date
-    var isFastMode = false
-    var isUsageChange = false
+    var isFastMode: Bool
+    var isUsageChange: Bool
+    var fastModeProportion: Double
+
+    init(
+        date: Date,
+        hoursPerWeek: Double,
+        windowResetsAt: Date,
+        isFastMode: Bool = false,
+        isUsageChange: Bool = false,
+        fastModeProportion: Double? = nil
+    ) {
+        self.date = date
+        self.hoursPerWeek = hoursPerWeek
+        self.windowResetsAt = windowResetsAt
+        self.isFastMode = isFastMode
+        self.isUsageChange = isUsageChange
+        self.fastModeProportion = min(max(
+            fastModeProportion ?? (isFastMode ? 1 : 0),
+            0
+        ), 1)
+    }
 
     var id: Date { date }
 }
@@ -255,12 +276,19 @@ enum WeeklyPaceCalculator {
         guard measured.used > 0, measured.duration > 0 else { return nil }
         let usedPerActiveHour = measured.used / (measured.duration / 3_600)
         guard usedPerActiveHour.isFinite, usedPerActiveHour > 0 else { return nil }
+        let modeBreakdown = latestUsageModeBreakdown(
+            samples: samples,
+            intervals: merged(rawActivity, joiningGapsUpTo: 0),
+            tolerance: sampleTolerance
+        )
 
         return WeeklyPaceEstimate(
             hoursPerWeek: 100 / usedPerActiveHour,
             activeDuration: measured.duration,
             percentagePointsUsed: measured.used,
-            isFastMode: measured.isFastMode
+            isFastMode: modeBreakdown?.isFastMode ?? measured.isFastMode,
+            fastModeProportion: modeBreakdown?.fastModeProportion
+                ?? measured.fastModeProportion
         )
     }
 
@@ -268,11 +296,10 @@ enum WeeklyPaceCalculator {
         samples rawSamples: [UsageSample],
         activity: [ActivityInterval],
         now: Date,
-        sampleTolerance: TimeInterval,
         factorInPauses: Bool,
-        lookback: TimeInterval = 60 * 60,
-        minimumPointSpacing: TimeInterval = 15 * 60,
-        smoothsSpikes: Bool = true
+        proratesShortWindows: Bool = true,
+        proratingThreshold: TimeInterval = 15 * 60,
+        proratingDistance: TimeInterval = 30 * 60
     ) -> [WeeklyPacePoint] {
         let samples = rawSamples
             .filter { $0.observedAt <= now }
@@ -288,141 +315,90 @@ enum WeeklyPaceCalculator {
             }
         }
 
-        let rawPoints = windows.indices.flatMap { index in
-            let windowSamples = windows[index]
-            let nextWindowStart = windows.indices.contains(index + 1)
-                ? windows[index + 1].first?.observedAt
-                : nil
-            let lastObservation = windowSamples.last?.observedAt ?? now
-            let seriesEnd = min(
-                now,
-                max(lastObservation, nextWindowStart ?? now)
-            )
-            return estimateSingleWindowSeries(
+        let includedPause = factorInPauses ? idleGap : 0
+        let activity = merged(activity, joiningGapsUpTo: includedPause)
+        let threshold = max(proratingThreshold, 0)
+        let distance = max(proratingDistance, threshold)
+
+        return windows.flatMap { windowSamples in
+            usageChangePoints(
                 samples: windowSamples,
                 activity: activity,
-                now: now,
-                seriesEnd: seriesEnd,
-                freezeUnmeasuredTail: nextWindowStart == nil,
-                sampleTolerance: sampleTolerance,
-                factorInPauses: factorInPauses,
-                lookback: lookback,
-                minimumPointSpacing: minimumPointSpacing
+                proratesShortWindows: proratesShortWindows,
+                proratingThreshold: threshold,
+                proratingDistance: distance
             )
         }
         .sorted { $0.date < $1.date }
-        return spikeFilteredSeries(rawPoints, enabled: smoothsSpikes)
     }
 
-    private static func estimateSingleWindowSeries(
+    private struct UsageChangeMeasurement {
+        let sample: UsageSample
+        let percentagePointsUsed: Double
+        let activeDuration: TimeInterval
+        let isFastMode: Bool
+        let fastModeProportion: Double
+    }
+
+    private static func usageChangePoints(
         samples: [UsageSample],
         activity: [ActivityInterval],
-        now: Date,
-        seriesEnd: Date,
-        freezeUnmeasuredTail: Bool,
-        sampleTolerance: TimeInterval,
-        factorInPauses: Bool,
-        lookback: TimeInterval,
-        minimumPointSpacing: TimeInterval
+        proratesShortWindows: Bool,
+        proratingThreshold: TimeInterval,
+        proratingDistance: TimeInterval
     ) -> [WeeklyPacePoint] {
         let samples = samples.sorted { $0.observedAt < $1.observedAt }
         guard samples.count > 1 else { return [] }
 
-        let lastUsageChangeDate = freezeUnmeasuredTail
-            ? samples.indices.dropFirst().last(where: {
-                samples[$0].remainingPercent < samples[$0 - 1].remainingPercent
-            }).map { samples[$0].observedAt }
-            : nil
+        let measurements = samples.indices.dropFirst().compactMap { index -> UsageChangeMeasurement? in
+            let previous = samples[index - 1]
+            let current = samples[index]
+            let decrease = previous.remainingPercent - current.remainingPercent
+            guard decrease > 0 else { return nil }
 
-        let firstDate = samples[0].observedAt
-        let usageChangeDates = Set(samples.indices.dropFirst().compactMap { index in
-            samples[index].remainingPercent < samples[index - 1].remainingPercent
-                ? samples[index].observedAt
-                : nil
-        })
-        var candidateDates = Set(samples.dropFirst().map(\.observedAt))
-        if minimumPointSpacing > 0, seriesEnd > firstDate {
-            var date = firstDate.addingTimeInterval(minimumPointSpacing)
-            while date < seriesEnd {
-                candidateDates.insert(date)
-                date = date.addingTimeInterval(minimumPointSpacing)
+            let intervals = activity.compactMap {
+                intersection($0, with: previous.observedAt ... current.observedAt)
             }
-        }
-        candidateDates.insert(seriesEnd)
+            let duration = intervals.reduce(0) { $0 + $1.duration }
+            guard duration > 0 else { return nil }
+            let fastDuration = intervals
+                .filter(\.isFastMode)
+                .reduce(0) { $0 + $1.duration }
 
-        let rawPoints: [WeeklyPacePoint] = candidateDates
-            .filter { $0 > firstDate && $0 <= now }
-            .sorted()
-            .compactMap { date in
-            // Keep the historical series intact, but freeze its unmeasured tail.
-            // Once the last percentage decrease is reached, later activity has no
-            // known allowance cost until another decrease is observed.
-            let calculationDate = min(date, lastUsageChangeDate ?? date)
-            let availableSamples = samples.filter { $0.observedAt <= calculationDate }
-            guard let estimate = estimate(
-                samples: availableSamples,
-                activity: activity,
-                now: calculationDate,
-                sampleTolerance: sampleTolerance,
-                factorInPauses: factorInPauses,
-                lookback: lookback
-            ) else { return nil }
-            return WeeklyPacePoint(
-                date: date,
-                hoursPerWeek: estimate.hoursPerWeek,
-                windowResetsAt: samples[0].resetsAt,
-                isFastMode: estimate.isFastMode,
-                isUsageChange: usageChangeDates.contains(date)
+            return UsageChangeMeasurement(
+                sample: current,
+                percentagePointsUsed: decrease,
+                activeDuration: duration,
+                isFastMode: intervals.last?.isFastMode == true,
+                fastModeProportion: min(max(fastDuration / duration, 0), 1)
             )
         }
-        return rawPoints
-    }
 
-    static func chartSeries(
-        _ points: [WeeklyPacePoint],
-        plotsOnlyUsageChanges: Bool
-    ) -> [WeeklyPacePoint] {
-        plotsOnlyUsageChanges ? points.filter(\.isUsageChange) : points
-    }
+        return measurements.indices.map { index in
+            let current = measurements[index]
+            var duration = current.activeDuration
+            var used = current.percentagePointsUsed
 
-    static func spikeFilteredSeries(
-        _ points: [WeeklyPacePoint],
-        enabled: Bool
-    ) -> [WeeklyPacePoint] {
-        guard enabled else { return points }
-        let windows = points.sorted { $0.date < $1.date }.reduce(into: [[WeeklyPacePoint]]()) {
-            windows, point in
-            if let reset = windows.last?.last?.windowResetsAt,
-               abs(reset.timeIntervalSince(point.windowResetsAt)) <= resetTimeTolerance {
-                windows[windows.count - 1].append(point)
-            } else {
-                windows.append([point])
+            if proratesShortWindows,
+               duration < proratingThreshold,
+               duration < proratingDistance {
+                var remainingDuration = proratingDistance - duration
+                for prior in measurements[..<index].reversed() where remainingDuration > 0 {
+                    let includedDuration = min(prior.activeDuration, remainingDuration)
+                    duration += includedDuration
+                    used += prior.percentagePointsUsed
+                        * includedDuration / prior.activeDuration
+                    remainingDuration -= includedDuration
+                }
             }
-        }
-        return windows.flatMap(stabilizedSeries)
-    }
 
-    static func stabilizedSeries(_ points: [WeeklyPacePoint]) -> [WeeklyPacePoint] {
-        guard points.count >= 3 else { return points }
-        return points.indices.map { index in
-            guard index >= 2 else { return points[index] }
-            let raw = points[index]
-            let localValues = points[(index - 2) ... index]
-                .map(\.hoursPerWeek)
-                .sorted()
-            let median = localValues[1]
-            // A large one-sample change is usually caused by whole-percentage usage
-            // readings or an activity block crossing the rolling lookback boundary.
-            // Delay it until a second point confirms the new level.
-            guard raw.hoursPerWeek > median * 1.5 || raw.hoursPerWeek < median / 1.5 else {
-                return raw
-            }
             return WeeklyPacePoint(
-                date: raw.date,
-                hoursPerWeek: median,
-                windowResetsAt: raw.windowResetsAt,
-                isFastMode: raw.isFastMode,
-                isUsageChange: raw.isUsageChange
+                date: current.sample.observedAt,
+                hoursPerWeek: duration / 3_600 * 100 / used,
+                windowResetsAt: current.sample.resetsAt,
+                isFastMode: current.isFastMode,
+                isUsageChange: true,
+                fastModeProportion: current.fastModeProportion
             )
         }
     }
@@ -501,9 +477,10 @@ enum WeeklyPaceCalculator {
         samples: [UsageSample],
         intervals: [ActivityInterval],
         tolerance: TimeInterval
-    ) -> (used: Double, duration: TimeInterval, isFastMode: Bool) {
+    ) -> (used: Double, duration: TimeInterval, isFastMode: Bool, fastModeProportion: Double) {
         let duration = intervals.reduce(0) { $0 + $1.duration }
         var latestUsageWasFast = false
+        var latestFastModeProportion = 0.0
         let used = samples.indices.dropFirst().reduce(0.0) { total, index in
             let previous = samples[index - 1]
             let current = samples[index]
@@ -516,20 +493,69 @@ enum WeeklyPaceCalculator {
                     && previous.observedAt <= interval.end
             }
             guard !matchingIntervals.isEmpty else { return total }
-            let isFastMode = matchingIntervals.contains(where: \.isFastMode)
+            let isFastMode = matchingIntervals.last?.isFastMode == true
             latestUsageWasFast = isFastMode
+            let activityBetweenUpdates = matchingIntervals.compactMap {
+                intersection(
+                    $0,
+                    with: previous.observedAt ... current.observedAt
+                )
+            }
+            let updateDuration = activityBetweenUpdates.reduce(0) { $0 + $1.duration }
+            let fastDuration = activityBetweenUpdates
+                .filter(\.isFastMode)
+                .reduce(0) { $0 + $1.duration }
+            latestFastModeProportion = updateDuration > 0
+                ? min(max(fastDuration / updateDuration, 0), 1)
+                : (isFastMode ? 1 : 0)
             // The observed allowance decrease already includes any fast-mode cost.
             return total + decrease
         }
 
-        return (used, duration, latestUsageWasFast)
+        return (used, duration, latestUsageWasFast, latestFastModeProportion)
+    }
+
+    private static func latestUsageModeBreakdown(
+        samples: [UsageSample],
+        intervals: [ActivityInterval],
+        tolerance: TimeInterval
+    ) -> (isFastMode: Bool, fastModeProportion: Double)? {
+        for index in samples.indices.dropFirst().reversed() {
+            let previous = samples[index - 1]
+            let current = samples[index]
+            guard previous.remainingPercent > current.remainingPercent else { continue }
+            let matchingIntervals = intervals.filter { interval in
+                current.observedAt > interval.start
+                    && current.observedAt <= interval.end.addingTimeInterval(tolerance)
+                    && previous.observedAt <= interval.end
+            }
+            guard !matchingIntervals.isEmpty else { continue }
+            let activityBetweenUpdates = matchingIntervals.compactMap {
+                intersection($0, with: previous.observedAt ... current.observedAt)
+            }
+            let duration = activityBetweenUpdates.reduce(0) { $0 + $1.duration }
+            guard duration > 0 else { continue }
+            let fastDuration = activityBetweenUpdates
+                .filter(\.isFastMode)
+                .reduce(0) { $0 + $1.duration }
+            return (
+                isFastMode: activityBetweenUpdates.last?.isFastMode == true,
+                fastModeProportion: min(max(fastDuration / duration, 0), 1)
+            )
+        }
+        return nil
     }
 }
 
 enum CodexActivityReader {
     static func loadIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions", isDirectory: true)
+        let codexRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+        let sessionsRoot = codexRoot.appendingPathComponent("sessions", isDirectory: true)
+        let archivedSessionsRoot = codexRoot.appendingPathComponent(
+            "archived_sessions",
+            isDirectory: true
+        )
         let cache = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -538,17 +564,28 @@ enum CodexActivityReader {
             .appendingPathComponent("ActivityCache", isDirectory: true)
             .appendingPathComponent("events-v2.json")
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limits-events-v2.json")
-        return try await loadIntervals(since: since, now: now, sessionsRoot: root, cacheURL: cache)
+        return try await loadIntervals(
+            since: since,
+            now: now,
+            sessionsRoot: sessionsRoot,
+            archivedSessionsRoot: archivedSessionsRoot,
+            cacheURL: cache
+        )
     }
 
     static func loadIntervals(
         since: Date,
         now: Date,
         sessionsRoot: URL,
+        archivedSessionsRoot: URL? = nil,
         cacheURL: URL
     ) async throws -> [ActivityInterval] {
         try await Task.detached(priority: .utility) {
-            try CodexActivityCache(sessionsRoot: sessionsRoot, cacheURL: cacheURL)
+            try CodexActivityCache(
+                sessionsRoot: sessionsRoot,
+                archivedSessionsRoot: archivedSessionsRoot,
+                cacheURL: cacheURL
+            )
                 .loadIntervals(since: since, now: now)
         }.value
     }

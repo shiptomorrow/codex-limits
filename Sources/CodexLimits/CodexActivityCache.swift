@@ -12,6 +12,13 @@ enum CodexActivityReaderError: LocalizedError, Equatable {
 }
 
 struct CodexActivityCache {
+    private struct SessionFile {
+        let url: URL
+        let cacheKey: String
+
+        var identity: String { url.lastPathComponent }
+    }
+
     private struct Store: Codable {
         let version: Int
         var corruptionMessage: String?
@@ -67,6 +74,7 @@ struct CodexActivityCache {
     private static let maximumSessionFileSize = 50_000_000
 
     let sessionsRoot: URL
+    let archivedSessionsRoot: URL?
     let cacheURL: URL
 
     func loadIntervals(since: Date, now: Date) throws -> [ActivityInterval] {
@@ -79,8 +87,8 @@ struct CodexActivityCache {
         var changed = false
 
         for file in files {
-            let key = relativePath(for: file)
-            let values = try file.resourceValues(forKeys: [
+            let key = file.cacheKey
+            let values = try file.url.resourceValues(forKeys: [
                 .contentModificationDateKey,
                 .fileSizeKey
             ])
@@ -89,35 +97,41 @@ struct CodexActivityCache {
 
             if var entry = store.files[key] {
                 if size < entry.observedSize {
-                    try poison(&store, detail: "\(file.lastPathComponent) became smaller")
+                    try poison(&store, detail: "\(file.url.lastPathComponent) became smaller")
                 }
                 if size == entry.observedSize {
                     if modificationTime != entry.modificationTime {
-                        try poison(&store, detail: "\(file.lastPathComponent) changed without growing")
+                        try poison(
+                            &store,
+                            detail: "\(file.url.lastPathComponent) changed without growing"
+                        )
                     }
                     continue
                 }
 
-                guard try guardsMatch(entry, file: file) else {
-                    try poison(&store, detail: "\(file.lastPathComponent) rewrote its cached prefix")
+                guard try guardsMatch(entry, file: file.url) else {
+                    try poison(
+                        &store,
+                        detail: "\(file.url.lastPathComponent) rewrote its cached prefix"
+                    )
                 }
-                let update = try parse(file: file, from: entry.parsedOffset)
+                let update = try parse(file: file.url, from: entry.parsedOffset)
                 entry.events.append(update.events)
                 entry.parsedOffset += update.consumedBytes
                 entry.observedSize = size
                 entry.modificationTime = modificationTime
-                entry.prefixGuard = try prefixGuard(file: file, through: entry.parsedOffset)
-                entry.suffixGuard = try suffixGuard(file: file, through: entry.parsedOffset)
+                entry.prefixGuard = try prefixGuard(file: file.url, through: entry.parsedOffset)
+                entry.suffixGuard = try suffixGuard(file: file.url, through: entry.parsedOffset)
                 store.files[key] = entry
                 changed = true
             } else {
-                let update = try parse(file: file, from: 0)
+                let update = try parse(file: file.url, from: 0)
                 let entry = Entry(
                     observedSize: size,
                     modificationTime: modificationTime,
                     parsedOffset: update.consumedBytes,
-                    prefixGuard: try prefixGuard(file: file, through: update.consumedBytes),
-                    suffixGuard: try suffixGuard(file: file, through: update.consumedBytes),
+                    prefixGuard: try prefixGuard(file: file.url, through: update.consumedBytes),
+                    suffixGuard: try suffixGuard(file: file.url, through: update.consumedBytes),
                     events: update.events
                 )
                 store.files[key] = entry
@@ -128,7 +142,11 @@ struct CodexActivityCache {
         if changed {
             try save(store)
         }
-        return intervals(from: files.compactMap { store.files[relativePath(for: $0)] }, since: since, now: now)
+        return intervals(
+            from: files.compactMap { store.files[$0.cacheKey] },
+            since: since,
+            now: now
+        )
     }
 
     private func loadStore() -> Store {
@@ -304,15 +322,23 @@ struct CodexActivityCache {
         return try handle.read(upToCount: Int(count)) ?? Data()
     }
 
-    private func sessionFiles(since: Date, now: Date) -> [URL] {
+    private func sessionFiles(since: Date, now: Date) -> [SessionFile] {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         var day = calendar.startOfDay(for: since.addingTimeInterval(-86_400))
         let finalDay = calendar.startOfDay(for: now.addingTimeInterval(86_400))
-        var files: [URL] = []
+        var activeFiles: [SessionFile] = []
+        var includedDayNames: Set<String> = []
 
         while day <= finalDay {
             let components = calendar.dateComponents([.year, .month, .day], from: day)
+            let dayName = String(
+                format: "%04d-%02d-%02d",
+                components.year!,
+                components.month!,
+                components.day!
+            )
+            includedDayNames.insert(dayName)
             let directory = sessionsRoot
                 .appendingPathComponent(String(format: "%04d", components.year!))
                 .appendingPathComponent(String(format: "%02d", components.month!))
@@ -322,15 +348,55 @@ struct CodexActivityCache {
                 includingPropertiesForKeys: [.fileSizeKey],
                 options: [.skipsHiddenFiles]
             ) {
-                files += contents.filter {
-                    $0.pathExtension == "jsonl"
-                        && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-                            <= Self.maximumSessionFileSize
+                activeFiles += contents.compactMap { url in
+                    guard isReadableSessionFile(url) else { return nil }
+                    return SessionFile(
+                        url: url,
+                        cacheKey: relativePath(for: url)
+                    )
                 }
             }
             day = calendar.date(byAdding: .day, value: 1, to: day)!
         }
-        return files
+
+        let archivedFiles = archivedSessionFiles(includedDayNames: includedDayNames)
+        var filesByIdentity = Dictionary(
+            uniqueKeysWithValues: archivedFiles.map { ($0.identity, $0) }
+        )
+        for file in activeFiles {
+            filesByIdentity[file.identity] = file
+        }
+        return filesByIdentity.values.sorted { $0.cacheKey < $1.cacheKey }
+    }
+
+    private func archivedSessionFiles(includedDayNames: Set<String>) -> [SessionFile] {
+        guard let archivedSessionsRoot,
+              let contents = try? FileManager.default.contentsOfDirectory(
+                at: archivedSessionsRoot,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+
+        return contents.compactMap { url in
+            guard isReadableSessionFile(url),
+                  includedDayNames.contains(where: {
+                    url.lastPathComponent.hasPrefix("rollout-\($0)T")
+                  }) else {
+                return nil
+            }
+            return SessionFile(
+                url: url,
+                cacheKey: "archived/\(url.lastPathComponent)"
+            )
+        }
+    }
+
+    private func isReadableSessionFile(_ url: URL) -> Bool {
+        url.pathExtension == "jsonl"
+            && ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                <= Self.maximumSessionFileSize
     }
 
     private func relativePath(for file: URL) -> String {

@@ -69,4 +69,34 @@ final class UsageWindowValidationTests: XCTestCase {
 
         XCTAssertEqual(filtered.map(\.remainingPercent), [2, 100])
     }
+
+    func testCurrentWindowSamplesTolerateResetTimestampDrift() {
+        let reset = Date(timeIntervalSince1970: 2_000_000)
+        let samples = [
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 3),
+                remainingPercent: 72,
+                resetsAt: reset
+            ),
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 1),
+                remainingPercent: 88,
+                resetsAt: reset.addingTimeInterval(-1)
+            ),
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 2),
+                remainingPercent: 87,
+                resetsAt: reset.addingTimeInterval(1)
+            ),
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 4),
+                remainingPercent: 100,
+                resetsAt: reset.addingTimeInterval(7 * 24 * 60 * 60)
+            )
+        ]
+
+        let current = UsageReadingValidation.samples(samples, matchingReset: reset)
+
+        XCTAssertEqual(current.map(\.remainingPercent), [88, 87, 72])
+    }
 }

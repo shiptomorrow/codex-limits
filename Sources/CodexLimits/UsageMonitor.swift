@@ -19,7 +19,6 @@ final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
     static let refreshIntervalSecondsKey = "refreshIntervalSeconds"
     static let factorInPausesKey = "factorInPauses"
-    static let paceLookbackMinutesKey = "paceLookbackMinutes"
     static let showPreviousWeeklyWindowKey = "showPreviousWeeklyWindow"
 
     @Published private(set) var snapshot: UsageSnapshot?
@@ -107,7 +106,7 @@ final class UsageMonitor: ObservableObject {
 
     var currentWindowSamples: [UsageSample] {
         guard let reset = snapshot?.mainLimit.window.resetsAt else { return [] }
-        return samples.filter { $0.resetsAt == reset }.sorted { $0.observedAt < $1.observedAt }
+        return UsageReadingValidation.samples(samples, matchingReset: reset)
     }
 
     func start() async {
@@ -142,9 +141,33 @@ final class UsageMonitor: ObservableObject {
         scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
-    func updatePaceLookback(minutes: Int) {
-        let clampedMinutes = min(max(minutes, 15), 180)
-        UserDefaults.standard.set(clampedMinutes, forKey: Self.paceLookbackMinutesKey)
+    func updateProratesShortWindows(_ enabled: Bool) {
+        UserDefaults.standard.set(
+            enabled,
+            forKey: EstimatedRuntimeChartPreferences.proratesShortWindowsKey
+        )
+        lastScheduledActivityWindows = nil
+        guard let snapshot else { return }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
+    func updateProratingThreshold(minutes: Int) {
+        let minutes = EstimatedRuntimeChartPreferences.clampedProratingThreshold(minutes)
+        UserDefaults.standard.set(
+            minutes,
+            forKey: EstimatedRuntimeChartPreferences.proratingThresholdMinutesKey
+        )
+        lastScheduledActivityWindows = nil
+        guard let snapshot else { return }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
+    func updateProratingDistance(minutes: Int) {
+        let minutes = EstimatedRuntimeChartPreferences.clampedProratingDistance(minutes)
+        UserDefaults.standard.set(
+            minutes,
+            forKey: EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey
+        )
         lastScheduledActivityWindows = nil
         guard let snapshot else { return }
         scheduleActivityAnalysisIfNeeded(for: snapshot)
@@ -152,16 +175,6 @@ final class UsageMonitor: ObservableObject {
 
     func updateShowPreviousWeeklyWindow(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.showPreviousWeeklyWindowKey)
-        lastScheduledActivityWindows = nil
-        guard let snapshot else { return }
-        scheduleActivityAnalysisIfNeeded(for: snapshot)
-    }
-
-    func updateSmoothsEstimatedRuntimeSpikes(_ enabled: Bool) {
-        UserDefaults.standard.set(
-            enabled,
-            forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey
-        )
         lastScheduledActivityWindows = nil
         guard let snapshot else { return }
         scheduleActivityAnalysisIfNeeded(for: snapshot)
@@ -496,38 +509,42 @@ final class UsageMonitor: ObservableObject {
             now: snapshot.fetchedAt
         )
         activityIntervals = activity
-        let refreshSeconds = defaults.object(forKey: Self.refreshIntervalSecondsKey) == nil
-            ? UsageRefreshSchedule.defaultSeconds
-            : UsageRefreshSchedule.clamped(defaults.integer(forKey: Self.refreshIntervalSecondsKey))
-        let tolerance = min(max(TimeInterval(refreshSeconds) * 1.5, 90), 15 * 60)
         let factorInPauses = defaults.object(forKey: Self.factorInPausesKey) == nil
             ? false
             : defaults.bool(forKey: Self.factorInPausesKey)
-        let lookbackMinutes = defaults.object(forKey: Self.paceLookbackMinutesKey) == nil
-            ? 60
-            : min(max(defaults.integer(forKey: Self.paceLookbackMinutesKey), 15), 180)
-        let lookback = TimeInterval(lookbackMinutes * 60)
-        let smoothsSpikes = defaults.object(
-            forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey
-        ) == nil || defaults.bool(forKey: EstimatedRuntimeChartPreferences.smoothsSpikesKey)
+        let proratesShortWindows = defaults.object(
+            forKey: EstimatedRuntimeChartPreferences.proratesShortWindowsKey
+        ) == nil || defaults.bool(
+            forKey: EstimatedRuntimeChartPreferences.proratesShortWindowsKey
+        )
+        let thresholdMinutes = defaults.object(
+            forKey: EstimatedRuntimeChartPreferences.proratingThresholdMinutesKey
+        ) == nil
+            ? EstimatedRuntimeChartPreferences.defaultProratingThresholdMinutes
+            : EstimatedRuntimeChartPreferences.clampedProratingThreshold(defaults.integer(
+                forKey: EstimatedRuntimeChartPreferences.proratingThresholdMinutesKey
+            ))
+        let distanceMinutes = defaults.object(
+            forKey: EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey
+        ) == nil
+            ? EstimatedRuntimeChartPreferences.defaultProratingDistanceMinutes
+            : EstimatedRuntimeChartPreferences.clampedProratingDistance(defaults.integer(
+                forKey: EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey
+            ))
         let calculation = await Task.detached(priority: .utility) {
-            let rawPoints = WeeklyPaceCalculator.estimateSeries(
+            let points = WeeklyPaceCalculator.estimateSeries(
                 samples: relevantSamples,
                 activity: activity,
                 now: snapshot.fetchedAt,
-                sampleTolerance: tolerance,
                 factorInPauses: factorInPauses,
-                lookback: lookback,
-                smoothsSpikes: false
+                proratesShortWindows: proratesShortWindows,
+                proratingThreshold: TimeInterval(thresholdMinutes * 60),
+                proratingDistance: TimeInterval(max(distanceMinutes, thresholdMinutes) * 60)
             )
-            let effectivePoints = WeeklyPaceCalculator.spikeFilteredSeries(
-                rawPoints,
-                enabled: smoothsSpikes
-            )
-            let current = effectivePoints.last(where: {
+            let current = points.last(where: {
                 abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
             })?.hoursPerWeek
-            return (rawPoints, current)
+            return (points, current)
         }.value
         weeklyPacePoints = calculation.0
         weeklyPaceHours = calculation.1

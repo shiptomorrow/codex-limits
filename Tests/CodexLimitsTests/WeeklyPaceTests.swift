@@ -65,6 +65,61 @@ final class WeeklyPaceTests: XCTestCase {
         }
     }
 
+    func testActivityCacheReadsArchivedSessionEvents() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        try fixture.write([
+            fixture.taskStarted(turnID: "archived-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(180))
+        ], to: fixture.archivedSessionURL)
+
+        let intervals = try await fixture.load()
+
+        XCTAssertEqual(intervals, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(180)
+        )])
+    }
+
+    func testActivityCacheKeepsActivityWhenSessionMovesToArchive() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        try fixture.write([
+            fixture.taskStarted(turnID: "moved-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(240))
+        ])
+        let active = try await fixture.load()
+
+        try FileManager.default.moveItem(
+            at: fixture.sessionURL,
+            to: fixture.archivedSessionURL
+        )
+        let archived = try await fixture.load()
+
+        XCTAssertEqual(archived, active)
+    }
+
+    func testActivityCachePrefersActiveCopyOfArchivedSession() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        let lines = [
+            fixture.taskStarted(turnID: "duplicate-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(300))
+        ]
+        try fixture.write(lines)
+        try fixture.write(lines, to: fixture.archivedSessionURL)
+
+        let intervals = try await fixture.load()
+
+        XCTAssertEqual(intervals, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(300)
+        )])
+    }
+
     func testActivityInheritsMostRecentModeForFirstTurnInNewSession() {
         let start = Date(timeIntervalSince1970: 1_000)
         let interval = ActivityInterval(
@@ -134,6 +189,79 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(estimate.percentagePointsUsed, 10, accuracy: 0.01)
         XCTAssertEqual(estimate.hoursPerWeek, 10, accuracy: 0.01)
         XCTAssertTrue(estimate.isFastMode)
+        XCTAssertEqual(estimate.fastModeProportion, 1, accuracy: 0.001)
+    }
+
+    func testEstimateRecordsFastModeProportionBetweenUsageUpdates() throws {
+        let start = Date(timeIntervalSince1970: 15_000)
+        let now = start.addingTimeInterval(1_000)
+        let reset = now.addingTimeInterval(86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: now, remainingPercent: 99, resetsAt: reset)
+        ]
+        let activity = [
+            ActivityInterval(start: start, end: start.addingTimeInterval(350)),
+            ActivityInterval(
+                start: start.addingTimeInterval(350),
+                end: start.addingTimeInterval(650),
+                isFastMode: true
+            ),
+            ActivityInterval(start: start.addingTimeInterval(650), end: now)
+        ]
+
+        let estimate = try XCTUnwrap(WeeklyPaceCalculator.estimate(
+            samples: samples,
+            activity: activity,
+            now: now,
+            sampleTolerance: 90,
+            factorInPauses: false
+        ))
+
+        XCTAssertFalse(estimate.isFastMode)
+        XCTAssertEqual(estimate.fastModeProportion, 0.3, accuracy: 0.001)
+    }
+
+    func testStepStrokeUsesHorizontalThenVerticalForMixedMode() {
+        let strokes = WeeklyPaceStepStrokeCalculator.strokes(
+            start: CGPoint(x: 0, y: 0),
+            end: CGPoint(x: 100, y: 100),
+            startIsFastMode: false,
+            endIsFastMode: true,
+            fastModeProportion: 0.7
+        )
+
+        XCTAssertEqual(strokes, [
+            WeeklyPaceStepStroke(
+                points: [CGPoint(x: 0, y: 0), CGPoint(x: 60, y: 0)],
+                isFastMode: false
+            ),
+            WeeklyPaceStepStroke(
+                points: [CGPoint(x: 60, y: 0), CGPoint(x: 100, y: 0), CGPoint(x: 100, y: 100)],
+                isFastMode: true
+            )
+        ])
+    }
+
+    func testStepStrokeCentersFastShareWhenEndpointColorsMatch() {
+        let strokes = WeeklyPaceStepStrokeCalculator.strokes(
+            start: CGPoint(x: 0, y: 0),
+            end: CGPoint(x: 100, y: 50),
+            startIsFastMode: false,
+            endIsFastMode: false,
+            fastModeProportion: 0.3
+        )
+
+        XCTAssertEqual(strokes, [
+            WeeklyPaceStepStroke(
+                points: [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0), CGPoint(x: 100, y: 50)],
+                isFastMode: false
+            ),
+            WeeklyPaceStepStroke(
+                points: [CGPoint(x: 35, y: 0), CGPoint(x: 65, y: 0)],
+                isFastMode: true
+            )
+        ])
     }
 
     func testMergedActivityPreservesFastModeBoundaries() {
@@ -534,19 +662,16 @@ final class WeeklyPaceTests: XCTestCase {
             samples: samples,
             activity: activity,
             now: start.addingTimeInterval(5_400),
-            sampleTolerance: 90,
-            factorInPauses: false
+            factorInPauses: false,
+            proratesShortWindows: false
         )
 
         XCTAssertEqual(points.map(\.date), [
             start.addingTimeInterval(1_800),
-            start.addingTimeInterval(2_700),
             start.addingTimeInterval(3_600),
-            start.addingTimeInterval(4_500),
             start.addingTimeInterval(5_400)
         ])
-        XCTAssertEqual(try XCTUnwrap(points.first).hoursPerWeek, 50, accuracy: 0.01)
-        XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 33.333, accuracy: 0.01)
+        XCTAssertEqual(points.map(\.hoursPerWeek), [50, 50, 25])
     }
 
     func testEstimateUsesChangeEventsWithoutMinuteBoundarySamples() throws {
@@ -576,66 +701,71 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(estimate.hoursPerWeek, 16.667, accuracy: 0.01)
     }
 
-    func testEstimateSeriesFreezesAfterLatestUsageChangeWithoutDroppingPoints() throws {
+    func testEstimateSeriesProratesOldestPartialWindowToTargetRuntime() throws {
         let start = Date(timeIntervalSince1970: 475_000)
-        let now = start.addingTimeInterval(900)
         let reset = start.addingTimeInterval(7 * 86_400)
         let samples = [
-            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
-            UsageSample(
-                observedAt: start.addingTimeInterval(300),
-                remainingPercent: 99,
-                resetsAt: reset
-            )
+            UsageSample(observedAt: start, remainingPercent: 85, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(64 * 60), remainingPercent: 84, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(73 * 60), remainingPercent: 83, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(74.5 * 60), remainingPercent: 82, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(77.2 * 60), remainingPercent: 81, resetsAt: reset)
         ]
+        let now = try XCTUnwrap(samples.last?.observedAt)
         let points = WeeklyPaceCalculator.estimateSeries(
             samples: samples,
             activity: [ActivityInterval(start: start, end: now)],
             now: now,
-            sampleTolerance: 90,
             factorInPauses: false,
-            minimumPointSpacing: 300
+            proratesShortWindows: true,
+            proratingThreshold: 15 * 60,
+            proratingDistance: 30 * 60
         )
 
-        XCTAssertEqual(points.map(\.date), [
-            start.addingTimeInterval(300),
-            start.addingTimeInterval(600),
-            start.addingTimeInterval(900)
-        ])
-        for point in points {
-            XCTAssertEqual(point.hoursPerWeek, 8.333, accuracy: 0.01)
-        }
+        let expectedUsage = 3 + 16.8 / 64
+        XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 0.5 * 100 / expectedUsage, accuracy: 0.01)
     }
 
-    func testEstimateSeriesCanPlotOnlyUsageChanges() throws {
+    func testEstimateSeriesCanDisableProratingForAbsolutelyRawPace() throws {
         let start = Date(timeIntervalSince1970: 480_000)
         let reset = start.addingTimeInterval(7 * 86_400)
         let samples = [
-            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
-            UsageSample(observedAt: start.addingTimeInterval(300), remainingPercent: 100, resetsAt: reset),
-            UsageSample(observedAt: start.addingTimeInterval(600), remainingPercent: 99, resetsAt: reset),
-            UsageSample(observedAt: start.addingTimeInterval(900), remainingPercent: 99, resetsAt: reset),
-            UsageSample(observedAt: start.addingTimeInterval(1_200), remainingPercent: 98, resetsAt: reset),
-            UsageSample(observedAt: start.addingTimeInterval(1_500), remainingPercent: 98, resetsAt: reset)
+            UsageSample(observedAt: start, remainingPercent: 82, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(2.7 * 60), remainingPercent: 81, resetsAt: reset)
         ]
-
-        let allPoints = WeeklyPaceCalculator.estimateSeries(
+        let points = WeeklyPaceCalculator.estimateSeries(
             samples: samples,
-            activity: [ActivityInterval(start: start, end: start.addingTimeInterval(1_500))],
-            now: start.addingTimeInterval(1_500),
-            sampleTolerance: 90,
+            activity: [ActivityInterval(start: start, end: start.addingTimeInterval(2.7 * 60))],
+            now: start.addingTimeInterval(2.7 * 60),
             factorInPauses: false,
-            minimumPointSpacing: 300
-        )
-        let points = WeeklyPaceCalculator.chartSeries(
-            allPoints,
-            plotsOnlyUsageChanges: true
+            proratesShortWindows: false,
+            proratingThreshold: 15 * 60,
+            proratingDistance: 30 * 60
         )
 
-        XCTAssertEqual(points.map(\.date), [
-            start.addingTimeInterval(600),
-            start.addingTimeInterval(1_200)
-        ])
+        XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 4.5, accuracy: 0.01)
+    }
+
+    func testEstimateSeriesDoesNotProrateAtThreshold() throws {
+        let start = Date(timeIntervalSince1970: 490_000)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(60 * 60), remainingPercent: 99, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(75 * 60), remainingPercent: 98, resetsAt: reset)
+        ]
+        let now = try XCTUnwrap(samples.last?.observedAt)
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: [ActivityInterval(start: start, end: now)],
+            now: now,
+            factorInPauses: false,
+            proratesShortWindows: true,
+            proratingThreshold: 15 * 60,
+            proratingDistance: 30 * 60
+        )
+
+        XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 25, accuracy: 0.01)
     }
 
     func testEstimateSeriesKeepsUsageWindowsIndependent() throws {
@@ -656,19 +786,19 @@ final class WeeklyPaceTests: XCTestCase {
             samples: samples,
             activity: activity,
             now: firstReset.addingTimeInterval(1_800),
-            sampleTolerance: 90,
-            factorInPauses: false
+            factorInPauses: false,
+            proratesShortWindows: true,
+            proratingThreshold: 60 * 60,
+            proratingDistance: 60 * 60
         )
 
-        XCTAssertEqual(points.count, 4)
+        XCTAssertEqual(points.count, 2)
         XCTAssertEqual(
             points.map(\.windowResetsAt),
-            [firstReset, firstReset, firstReset, secondReset]
+            [firstReset, secondReset]
         )
         XCTAssertEqual(points[0].hoursPerWeek, 5, accuracy: 0.01)
-        XCTAssertEqual(points[1].hoursPerWeek, 7.5, accuracy: 0.01)
-        XCTAssertEqual(points[2].hoursPerWeek, 10, accuracy: 0.01)
-        XCTAssertEqual(points[3].hoursPerWeek, 50, accuracy: 0.01)
+        XCTAssertEqual(points[1].hoursPerWeek, 50, accuracy: 0.01)
     }
 
     func testEstimateSeriesToleratesSmallResetTimeDrift() {
@@ -688,14 +818,13 @@ final class WeeklyPaceTests: XCTestCase {
             samples: samples,
             activity: activity,
             now: start.addingTimeInterval(4_500),
-            sampleTolerance: 90,
-            factorInPauses: false
+            factorInPauses: false,
+            proratesShortWindows: false
         )
 
         XCTAssertEqual(points.map(\.date), [
             start.addingTimeInterval(900),
             start.addingTimeInterval(1_800),
-            start.addingTimeInterval(2_700),
             start.addingTimeInterval(3_600),
             start.addingTimeInterval(4_500)
         ])
@@ -767,60 +896,6 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(estimate.hoursPerWeek, 9.848, accuracy: 0.01)
     }
 
-    func testStabilizedSeriesSuppressesIsolatedOutlier() {
-        let start = Date(timeIntervalSince1970: 250_000)
-        let reset = start.addingTimeInterval(86_400)
-        let points = [6.3, 6.2, 9.8, 5.9].enumerated().map { index, hours in
-            WeeklyPacePoint(
-                date: start.addingTimeInterval(Double(index) * 900),
-                hoursPerWeek: hours,
-                windowResetsAt: reset
-            )
-        }
-
-        let stabilized = WeeklyPaceCalculator.stabilizedSeries(points)
-
-        XCTAssertEqual(stabilized.map(\.hoursPerWeek), [6.3, 6.2, 6.3, 5.9])
-    }
-
-    func testStabilizedSeriesShowsSustainedPaceChangeAfterOnePoint() {
-        let start = Date(timeIntervalSince1970: 275_000)
-        let reset = start.addingTimeInterval(86_400)
-        let points = [6.3, 6.2, 9.8, 10.1, 9.9].enumerated().map { index, hours in
-            WeeklyPacePoint(
-                date: start.addingTimeInterval(Double(index) * 900),
-                hoursPerWeek: hours,
-                windowResetsAt: reset
-            )
-        }
-
-        let stabilized = WeeklyPaceCalculator.stabilizedSeries(points)
-
-        XCTAssertEqual(stabilized.map(\.hoursPerWeek), [6.3, 6.2, 6.3, 10.1, 9.9])
-    }
-
-    func testSpikeFilteringCanBeDisabled() {
-        let start = Date(timeIntervalSince1970: 290_000)
-        let reset = start.addingTimeInterval(86_400)
-        let points = [6.3, 6.2, 9.8, 5.9].enumerated().map { index, hours in
-            WeeklyPacePoint(
-                date: start.addingTimeInterval(Double(index) * 900),
-                hoursPerWeek: hours,
-                windowResetsAt: reset
-            )
-        }
-
-        XCTAssertEqual(
-            WeeklyPaceCalculator.spikeFilteredSeries(points, enabled: false),
-            points
-        )
-        XCTAssertEqual(
-            WeeklyPaceCalculator.spikeFilteredSeries(points, enabled: true)
-                .map(\.hoursPerWeek),
-            [6.3, 6.2, 6.3, 5.9]
-        )
-    }
-
     func testCanExcludeEveryIdleSecond() throws {
         let now = Date(timeIntervalSince1970: 300_000)
         let reset = now.addingTimeInterval(86_400)
@@ -866,14 +941,17 @@ final class WeeklyPaceTests: XCTestCase {
 private struct ActivityCacheFixture {
     let root: URL
     let sessionsRoot: URL
+    let archivedSessionsRoot: URL
     let cacheURL: URL
     let sessionURL: URL
-    let now = Date(timeIntervalSince1970: 1_776_427_200) // 2026-04-16 12:00:00 UTC
+    let archivedSessionURL: URL
+    let now = Date(timeIntervalSince1970: 1_776_427_200) // 2026-04-17 12:00:00 UTC
 
     init() throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexLimitsActivityCache-\(UUID().uuidString)", isDirectory: true)
         sessionsRoot = root.appendingPathComponent("sessions", isDirectory: true)
+        archivedSessionsRoot = root.appendingPathComponent("archived_sessions", isDirectory: true)
         cacheURL = root.appendingPathComponent("cache/events.json")
 
         var calendar = Calendar(identifier: .gregorian)
@@ -884,7 +962,19 @@ private struct ActivityCacheFixture {
             .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
         try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
-        sessionURL = day.appendingPathComponent("rollout-test.jsonl")
+        let dayName = String(
+            format: "%04d-%02d-%02d",
+            components.year!,
+            components.month!,
+            components.day!
+        )
+        let sessionName = "rollout-\(dayName)T12-00-00-test.jsonl"
+        sessionURL = day.appendingPathComponent(sessionName)
+        try FileManager.default.createDirectory(
+            at: archivedSessionsRoot,
+            withIntermediateDirectories: true
+        )
+        archivedSessionURL = archivedSessionsRoot.appendingPathComponent(sessionName)
     }
 
     func load() async throws -> [ActivityInterval] {
@@ -892,13 +982,14 @@ private struct ActivityCacheFixture {
             since: now.addingTimeInterval(-3_600),
             now: now,
             sessionsRoot: sessionsRoot,
+            archivedSessionsRoot: archivedSessionsRoot,
             cacheURL: cacheURL
         )
     }
 
-    func write(_ lines: [String]) throws {
+    func write(_ lines: [String], to url: URL? = nil) throws {
         try Data((lines.joined(separator: "\n") + "\n").utf8)
-            .write(to: sessionURL, options: .atomic)
+            .write(to: url ?? sessionURL, options: .atomic)
     }
 
     func append(_ line: String) throws {

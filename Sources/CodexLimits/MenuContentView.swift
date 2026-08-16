@@ -11,8 +11,6 @@ struct MenuContentView: View {
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
-    @AppStorage(EstimatedRuntimeChartPreferences.plotsOnlyUsageChangesKey) private var plotsOnlyUsageChanges = false
-    @AppStorage(EstimatedRuntimeChartPreferences.smoothsSpikesKey) private var smoothsEstimatedRuntimeSpikes = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
@@ -145,9 +143,7 @@ struct MenuContentView: View {
                         fetchedAt: snapshot.fetchedAt,
                         factorInPauses: factorInPauses,
                         showsPreviousWindow: showPreviousWeeklyWindow,
-                        reversesYAxis: reversesEstimatedRuntimeChart,
-                        plotsOnlyUsageChanges: plotsOnlyUsageChanges,
-                        smoothsSpikes: smoothsEstimatedRuntimeSpikes
+                        reversesYAxis: reversesEstimatedRuntimeChart
                     )
                 }
             }
@@ -472,17 +468,9 @@ private struct WeeklyPaceChart: View {
     let factorInPauses: Bool
     let showsPreviousWindow: Bool
     let reversesYAxis: Bool
-    let plotsOnlyUsageChanges: Bool
-    let smoothsSpikes: Bool
 
     private var displayedPoints: [WeeklyPacePoint] {
-        WeeklyPaceCalculator.chartSeries(
-            WeeklyPaceCalculator.spikeFilteredSeries(
-                points,
-                enabled: smoothsSpikes
-            ),
-            plotsOnlyUsageChanges: plotsOnlyUsageChanges
-        )
+        points
             .filter {
                 showsPreviousWindow
                     || abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60
@@ -542,7 +530,10 @@ private struct WeeklyPaceChart: View {
                     id: index,
                     start: pair.0,
                     end: pair.1,
-                    isFastMode: pair.1.isFastMode
+                    isFastMode: pair.1.isFastMode,
+                    fastModeProportion: pair.1.isUsageChange
+                        ? pair.1.fastModeProportion
+                        : (pair.1.isFastMode ? 1 : 0)
                 )
             }
     }
@@ -591,7 +582,7 @@ private struct WeeklyPaceChart: View {
                         : "Estimated runtime / week",
                     color: .purple
                 )
-                if displayedPoints.contains(where: \.isFastMode) {
+                if displayedPoints.contains(where: { $0.fastModeProportion > 0 }) {
                     ChartLegendItem(label: "Fast mode (2×)", color: .orange)
                 }
             }
@@ -605,19 +596,6 @@ private struct WeeklyPaceChart: View {
                 .frame(height: 190)
             } else {
                 Chart {
-                    ForEach(segments) { segment in
-                        ForEach(segment.points) { point in
-                            LineMark(
-                                x: .value("Compressed time", timeline.position(for: point.date)),
-                                y: .value("Hours per week", point.hoursPerWeek),
-                                series: .value("Pace segment", segment.id)
-                            )
-                            .foregroundStyle(segment.isFastMode ? Color.orange : Color.purple)
-                            .lineStyle(StrokeStyle(lineWidth: 2))
-                            .interpolationMethod(.stepEnd)
-                        }
-                    }
-
                     RuleMark(x: .value("Now", timeline.position(for: fetchedAt)))
                         .foregroundStyle(Color.secondary.opacity(0.35))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
@@ -683,13 +661,20 @@ private struct WeeklyPaceChart: View {
                 }
                 .chartLegend(.hidden)
                 .chartOverlay { proxy in
-                    WeeklyPaceHoverOverlay(
-                        proxy: proxy,
-                        spans: hoverSpans,
-                        maximumHours: maximumHours,
-                        resetPosition: showsPreviousWindow ? resetPosition : nil,
-                        latestValue: latestOverlayValue
-                    )
+                    ZStack {
+                        WeeklyPaceLineOverlay(
+                            proxy: proxy,
+                            segments: segments,
+                            timeline: timeline
+                        )
+                        WeeklyPaceHoverOverlay(
+                            proxy: proxy,
+                            spans: hoverSpans,
+                            maximumHours: maximumHours,
+                            resetPosition: showsPreviousWindow ? resetPosition : nil,
+                            latestValue: latestOverlayValue
+                        )
+                    }
                 }
                 .frame(height: 190)
                 .padding(.horizontal, 8)
@@ -1041,8 +1026,194 @@ private struct WeeklyPaceSegment: Identifiable {
     let start: WeeklyPacePoint
     let end: WeeklyPacePoint
     let isFastMode: Bool
+    let fastModeProportion: Double
+}
 
-    var points: [WeeklyPacePoint] { [start, end] }
+private struct WeeklyPaceLineOverlay: View {
+    let proxy: ChartProxy
+    let segments: [WeeklyPaceSegment]
+    let timeline: WeeklyPaceCompressedTimeline
+
+    var body: some View {
+        GeometryReader { geometry in
+            if let plotFrame = proxy.plotFrame {
+                let plotRect = geometry[plotFrame]
+                Canvas { context, _ in
+                    context.clip(to: Path(plotRect))
+                    for segment in segments {
+                        guard
+                            let startX = proxy.position(forX: timeline.position(for: segment.start.date)),
+                            let endX = proxy.position(forX: timeline.position(for: segment.end.date)),
+                            let startY = proxy.position(forY: segment.start.hoursPerWeek),
+                            let endY = proxy.position(forY: segment.end.hoursPerWeek)
+                        else { continue }
+
+                        let strokes = WeeklyPaceStepStrokeCalculator.strokes(
+                            start: CGPoint(x: plotRect.minX + startX, y: plotRect.minY + startY),
+                            end: CGPoint(x: plotRect.minX + endX, y: plotRect.minY + endY),
+                            startIsFastMode: segment.start.isFastMode,
+                            endIsFastMode: segment.end.isFastMode,
+                            fastModeProportion: segment.fastModeProportion
+                        )
+                        for stroke in strokes {
+                            var path = Path()
+                            guard let first = stroke.points.first else { continue }
+                            path.move(to: first)
+                            for point in stroke.points.dropFirst() {
+                                path.addLine(to: point)
+                            }
+                            context.stroke(
+                                path,
+                                with: .color(stroke.isFastMode ? .orange : .purple),
+                                style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+struct WeeklyPaceStepStroke: Equatable {
+    let points: [CGPoint]
+    let isFastMode: Bool
+}
+
+enum WeeklyPaceStepStrokeCalculator {
+    static func strokes(
+        start: CGPoint,
+        end: CGPoint,
+        startIsFastMode: Bool,
+        endIsFastMode: Bool,
+        fastModeProportion rawFastModeProportion: Double
+    ) -> [WeeklyPaceStepStroke] {
+        let corner = CGPoint(x: end.x, y: start.y)
+        let horizontalLength = abs(corner.x - start.x)
+        let verticalLength = abs(end.y - corner.y)
+        let totalLength = horizontalLength + verticalLength
+        guard totalLength > 0 else { return [] }
+        let fastModeProportion = min(max(rawFastModeProportion, 0), 1)
+
+        if startIsFastMode == endIsFastMode {
+            let base = slice(
+                from: 0,
+                to: totalLength,
+                isFastMode: startIsFastMode,
+                start: start,
+                corner: corner,
+                end: end,
+                horizontalLength: horizontalLength,
+                totalLength: totalLength
+            )
+            guard !startIsFastMode, fastModeProportion > 0, horizontalLength > 0 else {
+                return base.map { [$0] } ?? []
+            }
+            let fastLength = horizontalLength * fastModeProportion
+            let fastStart = (horizontalLength - fastLength) / 2
+            let fastStroke = slice(
+                from: fastStart,
+                to: fastStart + fastLength,
+                isFastMode: true,
+                start: start,
+                corner: corner,
+                end: end,
+                horizontalLength: horizontalLength,
+                totalLength: totalLength
+            )
+            return [base, fastStroke].compactMap { $0 }
+        }
+
+        let transitionDistance: CGFloat
+        let firstIsFastMode: Bool
+        if startIsFastMode {
+            transitionDistance = totalLength * fastModeProportion
+            firstIsFastMode = true
+        } else {
+            transitionDistance = totalLength * (1 - fastModeProportion)
+            firstIsFastMode = false
+        }
+        return [
+            slice(
+                from: 0,
+                to: transitionDistance,
+                isFastMode: firstIsFastMode,
+                start: start,
+                corner: corner,
+                end: end,
+                horizontalLength: horizontalLength,
+                totalLength: totalLength
+            ),
+            slice(
+                from: transitionDistance,
+                to: totalLength,
+                isFastMode: !firstIsFastMode,
+                start: start,
+                corner: corner,
+                end: end,
+                horizontalLength: horizontalLength,
+                totalLength: totalLength
+            )
+        ].compactMap { $0 }
+    }
+
+    private static func slice(
+        from rawStartDistance: CGFloat,
+        to rawEndDistance: CGFloat,
+        isFastMode: Bool,
+        start: CGPoint,
+        corner: CGPoint,
+        end: CGPoint,
+        horizontalLength: CGFloat,
+        totalLength: CGFloat
+    ) -> WeeklyPaceStepStroke? {
+        let startDistance = min(max(rawStartDistance, 0), totalLength)
+        let endDistance = min(max(rawEndDistance, 0), totalLength)
+        guard endDistance - startDistance > 0.001 else { return nil }
+
+        var points = [point(
+            at: startDistance,
+            start: start,
+            corner: corner,
+            end: end,
+            horizontalLength: horizontalLength
+        )]
+        if startDistance < horizontalLength, endDistance > horizontalLength {
+            points.append(corner)
+        }
+        points.append(point(
+            at: endDistance,
+            start: start,
+            corner: corner,
+            end: end,
+            horizontalLength: horizontalLength
+        ))
+        return WeeklyPaceStepStroke(points: points, isFastMode: isFastMode)
+    }
+
+    private static func point(
+        at distance: CGFloat,
+        start: CGPoint,
+        corner: CGPoint,
+        end: CGPoint,
+        horizontalLength: CGFloat
+    ) -> CGPoint {
+        if distance <= horizontalLength, horizontalLength > 0 {
+            let progress = distance / horizontalLength
+            return CGPoint(
+                x: start.x + (corner.x - start.x) * progress,
+                y: start.y
+            )
+        }
+        let verticalLength = abs(end.y - corner.y)
+        guard verticalLength > 0 else { return corner }
+        let progress = (distance - horizontalLength) / verticalLength
+        return CGPoint(
+            x: corner.x,
+            y: corner.y + (end.y - corner.y) * progress
+        )
+    }
 }
 
 struct WeeklyPaceCompressedTimeline {
@@ -1658,12 +1829,12 @@ struct SettingsView: View {
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = UsageRefreshSchedule.defaultSeconds
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
-    @AppStorage(UsageMonitor.paceLookbackMinutesKey) private var paceLookbackMinutes = 60
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
     @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
-    @AppStorage(EstimatedRuntimeChartPreferences.plotsOnlyUsageChangesKey) private var plotsOnlyUsageChanges = false
-    @AppStorage(EstimatedRuntimeChartPreferences.smoothsSpikesKey) private var smoothsEstimatedRuntimeSpikes = true
+    @AppStorage(EstimatedRuntimeChartPreferences.proratesShortWindowsKey) private var proratesShortWindows = true
+    @AppStorage(EstimatedRuntimeChartPreferences.proratingThresholdMinutesKey) private var proratingThresholdMinutes = EstimatedRuntimeChartPreferences.defaultProratingThresholdMinutes
+    @AppStorage(EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey) private var proratingDistanceMinutes = EstimatedRuntimeChartPreferences.defaultProratingDistanceMinutes
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
@@ -1722,25 +1893,39 @@ struct SettingsView: View {
                     }
                     .help("Include the previous usage window in the hours-per-week chart")
 
-                Stepper {
-                    Text("Pace lookback: \(paceLookbackLabel)")
-                } onIncrement: {
-                    setPaceLookback(nextPaceLookback)
-                } onDecrement: {
-                    setPaceLookback(previousPaceLookback)
+                Toggle("Prorate short usage windows", isOn: $proratesShortWindows)
+                    .onChange(of: proratesShortWindows) { _, value in
+                        monitor.updateProratesShortWindows(value)
+                    }
+                    .help("Use earlier percentage windows when the latest window has too little active runtime")
+
+                Stepper(
+                    value: Binding(
+                        get: { proratingThresholdMinutes },
+                        set: setProratingThreshold
+                    ),
+                    in: 5 ... 60,
+                    step: 5
+                ) {
+                    Text("Prorating threshold: \(proratingThresholdMinutes) min")
                 }
-                .help("Use this much recent activity to estimate the weekly pace")
+                .disabled(!proratesShortWindows)
+                .help("Prorate when the latest percentage change contains less active runtime than this")
+
+                Stepper(
+                    value: Binding(
+                        get: { proratingDistanceMinutes },
+                        set: setProratingDistance
+                    ),
+                    in: max(proratingThresholdMinutes, 5) ... 180,
+                    step: 5
+                ) {
+                    Text("Prorating distance: \(proratingDistanceMinutes) min")
+                }
+                .disabled(!proratesShortWindows)
+                .help("Walk backward until this much active runtime is represented, prorating the oldest partial window")
 
                 Toggle("Reverse estimated runtime chart", isOn: $reversesEstimatedRuntimeChart)
-
-                Toggle("Only plot exact usage updates", isOn: $plotsOnlyUsageChanges)
-                    .help("Add estimated runtime points only when the remaining usage percentage decreases")
-
-                Toggle("Smooth estimated runtime spikes", isOn: $smoothsEstimatedRuntimeSpikes)
-                    .onChange(of: smoothsEstimatedRuntimeSpikes) { _, value in
-                        monitor.updateSmoothsEstimatedRuntimeSpikes(value)
-                    }
-                    .help("Suppress isolated estimated runtime changes larger than 50 percent")
 
                 Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }
@@ -1789,10 +1974,6 @@ struct SettingsView: View {
         UsageRefreshSchedule.choices
     }
 
-    private var paceLookbacks: [Int] {
-        [15, 30, 60, 120, 180]
-    }
-
     private var resetHistoryMessage: String {
         let location = monitor.syncFolderName == nil
             ? "on this Mac"
@@ -1816,23 +1997,22 @@ struct SettingsView: View {
         return "\(refreshIntervalSeconds / 60) min"
     }
 
-    private var nextPaceLookback: Int {
-        paceLookbacks.first(where: { $0 > paceLookbackMinutes }) ?? 180
+    private func setProratingThreshold(_ minutes: Int) {
+        let minutes = EstimatedRuntimeChartPreferences.clampedProratingThreshold(minutes)
+        proratingThresholdMinutes = minutes
+        monitor.updateProratingThreshold(minutes: minutes)
+        if proratingDistanceMinutes < minutes {
+            setProratingDistance(minutes)
+        }
     }
 
-    private var previousPaceLookback: Int {
-        paceLookbacks.last(where: { $0 < paceLookbackMinutes }) ?? 15
-    }
-
-    private var paceLookbackLabel: String {
-        paceLookbackMinutes < 60
-            ? "\(paceLookbackMinutes) min"
-            : "\(paceLookbackMinutes / 60) hr"
-    }
-
-    private func setPaceLookback(_ minutes: Int) {
-        paceLookbackMinutes = minutes
-        monitor.updatePaceLookback(minutes: minutes)
+    private func setProratingDistance(_ minutes: Int) {
+        let minutes = max(
+            EstimatedRuntimeChartPreferences.clampedProratingDistance(minutes),
+            proratingThresholdMinutes
+        )
+        proratingDistanceMinutes = minutes
+        monitor.updateProratingDistance(minutes: minutes)
     }
 
     private func setRefreshInterval(_ seconds: Int) {

@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var usageErrorCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
     private var settingsWindow: NSWindow?
+    private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LoginItem.enableByDefault()
@@ -45,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             monitor: monitor,
             openSettingsAction: { [weak self] in self?.showSettings() }
         )
-        popover.behavior = .transient
+        popover.behavior = .applicationDefined
         popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: content)
 
@@ -72,10 +74,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        removeClickAwayMonitors()
         monitor.shutdown()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        installClickAwayMonitors()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeClickAwayMonitors()
     }
 
     @objc private func togglePopover() {
@@ -112,6 +123,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private func installClickAwayMonitors() {
+        guard localMouseMonitor == nil, globalMouseMonitor == nil else { return }
+
+        let mouseEvents: NSEvent.EventTypeMask = [
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown
+        ]
+
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseEvents) {
+            [weak self] event in
+            guard let self else { return event }
+            if !self.isProtectedClick(event) {
+                self.popover.performClose(nil)
+            }
+            return event
+        }
+
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) {
+            [weak self] _ in
+            self?.popover.performClose(nil)
+        }
+    }
+
+    private func removeClickAwayMonitors() {
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+            self.localMouseMonitor = nil
+        }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+    }
+
+    private func isProtectedClick(_ event: NSEvent) -> Bool {
+        guard let eventWindow = event.window else { return false }
+
+        if eventWindow === popover.contentViewController?.view.window {
+            return true
+        }
+
+        var candidateWindow: NSWindow? = eventWindow
+        while let window = candidateWindow {
+            if window === settingsWindow {
+                return true
+            }
+            candidateWindow = window.sheetParent ?? window.parent
+        }
+
+        guard let button = statusItem?.button, eventWindow === button.window else {
+            return false
+        }
+        let pointInButton = button.convert(event.locationInWindow, from: nil)
+        return button.bounds.contains(pointInButton)
     }
 }
 

@@ -15,8 +15,19 @@ enum UsagePercentageDisplay {
 
 enum EstimatedRuntimeChartPreferences {
     static let reversesYAxisKey = "reverseEstimatedRuntimeChart"
-    static let plotsOnlyUsageChangesKey = "plotEstimatedRuntimeOnlyOnUsageChanges"
-    static let smoothsSpikesKey = "smoothEstimatedRuntimeSpikes"
+    static let proratesShortWindowsKey = "prorateShortUsageWindows"
+    static let proratingThresholdMinutesKey = "proratingThresholdMinutes"
+    static let proratingDistanceMinutesKey = "proratingDistanceMinutes"
+    static let defaultProratingThresholdMinutes = 15
+    static let defaultProratingDistanceMinutes = 30
+
+    static func clampedProratingThreshold(_ minutes: Int) -> Int {
+        min(max(minutes, 1), 60)
+    }
+
+    static func clampedProratingDistance(_ minutes: Int) -> Int {
+        min(max(minutes, 5), 180)
+    }
 }
 
 enum OtherLimitPreferences {
@@ -141,6 +152,20 @@ enum UsageReadingValidation {
         tolerance: TimeInterval = resetTolerance
     ) -> Bool {
         abs(resetsAt.timeIntervalSince(previousReset)) <= tolerance
+    }
+
+    static func samples(
+        _ samples: [UsageSample],
+        matchingReset reset: Date
+    ) -> [UsageSample] {
+        samples
+            .filter {
+                isSameWindow(
+                    resetsAt: $0.resetsAt,
+                    previousReset: reset
+                )
+            }
+            .sorted { $0.observedAt < $1.observedAt }
     }
 }
 

@@ -27,3 +27,47 @@ final class UsagePercentageDisplayTests: XCTestCase {
         )
     }
 }
+
+final class BurnDownHoverSegmentTests: XCTestCase {
+    private let start = Date(timeIntervalSince1970: 1_000)
+    private let end = Date(timeIntervalSince1970: 2_000)
+
+    func testActualUsageSnapsToLastSample() {
+        let hoveredDate = Date(timeIntervalSince1970: 1_750)
+        let value = makeSegment(isStep: true)
+            .hoverValue(at: hoveredDate)
+
+        XCTAssertEqual(value.date, hoveredDate)
+        XCTAssertEqual(value.labelDate, start)
+        XCTAssertEqual(value.percent, 20)
+    }
+
+    func testActualUsageUsesNewSampleAtEndpoint() {
+        let value = makeSegment(isStep: true).hoverValue(at: end)
+
+        XCTAssertEqual(value.date, end)
+        XCTAssertEqual(value.labelDate, end)
+        XCTAssertEqual(value.percent, 40)
+    }
+
+    func testProjectionKeepsEstimatedPointerTime() {
+        let hoveredDate = Date(timeIntervalSince1970: 1_750)
+        let value = makeSegment(isStep: false).hoverValue(at: hoveredDate)
+
+        XCTAssertEqual(value.date, hoveredDate)
+        XCTAssertEqual(value.labelDate, hoveredDate)
+        XCTAssertEqual(value.percent, 35, accuracy: 0.001)
+    }
+
+    private func makeSegment(isStep: Bool) -> BurnDownHoverSegment {
+        BurnDownHoverSegment(
+            startDate: start,
+            endDate: end,
+            startPercent: 20,
+            endPercent: 40,
+            color: .blue,
+            lastValueChangeDate: start,
+            isStep: isStep
+        )
+    }
+}

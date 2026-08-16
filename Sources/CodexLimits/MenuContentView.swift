@@ -1359,6 +1359,7 @@ private struct BurnDownChart: View {
                 id: index,
                 start: segment.start,
                 end: segment.end,
+                lastValueChangeDate: segment.lastValueChangeDate,
                 isFastMode: segment.isFastMode
             )
         }
@@ -1392,6 +1393,7 @@ private struct BurnDownChart: View {
                 startPercent: displayedPercent(segment.start.remaining),
                 endPercent: displayedPercent(segment.end.remaining),
                 color: segment.isFastMode ? .orange : .blue,
+                lastValueChangeDate: segment.lastValueChangeDate,
                 isStep: true
             )
         }
@@ -1402,6 +1404,7 @@ private struct BurnDownChart: View {
                 startPercent: displayedPercent(start.remaining),
                 endPercent: displayedPercent(end.remaining),
                 color: currentColor,
+                lastValueChangeDate: start.date,
                 isStep: false
             )
         }
@@ -1617,6 +1620,7 @@ private struct BurnDownChart: View {
                     date: segmentEnd,
                     remaining: segmentEnd == end.date ? end.remaining : start.remaining
                 ),
+                lastValueChangeDate: start.date,
                 // The final step contains the observed usage drop. Attribute it to
                 // any fast work since the prior sample, including concurrent tasks.
                 isFastMode: isFinalSegment ? usageIntervalContainsFastMode : midpointIsFastMode
@@ -1727,26 +1731,53 @@ private struct BurnDownHoverOverlay: View {
             return
         }
 
-        let percent = segment.percent(at: date)
+        let value = segment.hoverValue(at: date)
         hoveredValue = HoveredBurnDownValue(
-            date: date,
-            percent: percent,
+            date: value.date,
+            labelDate: value.labelDate,
+            percent: value.percent,
             color: segment.color,
-            placesLabelBelow: percent > 80
+            placesLabelBelow: value.percent > 80
         )
     }
 }
 
-private struct BurnDownHoverSegment {
+struct BurnDownHoverSegment {
     let startDate: Date
     let endDate: Date
     let startPercent: Double
     let endPercent: Double
     let color: Color
+    let lastValueChangeDate: Date
     let isStep: Bool
 
     func contains(_ date: Date) -> Bool {
         date >= startDate && date <= endDate
+    }
+
+    func hoverValue(at date: Date) -> BurnDownHoverValue {
+        guard isStep else {
+            return BurnDownHoverValue(
+                date: date,
+                labelDate: date,
+                percent: percent(at: date)
+            )
+        }
+
+        // Keep the crosshair tracking the pointer, but label actual usage with
+        // the last sampled time rather than implying a sample at the pointer.
+        if date >= endDate {
+            return BurnDownHoverValue(
+                date: date,
+                labelDate: endDate,
+                percent: endPercent
+            )
+        }
+        return BurnDownHoverValue(
+            date: date,
+                labelDate: lastValueChangeDate,
+                percent: startPercent
+        )
     }
 
     func percent(at date: Date) -> Double {
@@ -1758,8 +1789,15 @@ private struct BurnDownHoverSegment {
     }
 }
 
+struct BurnDownHoverValue {
+    let date: Date
+    let labelDate: Date
+    let percent: Double
+}
+
 private struct HoveredBurnDownValue {
     let date: Date
+    let labelDate: Date
     let percent: Double
     let color: Color
     let placesLabelBelow: Bool
@@ -1783,7 +1821,7 @@ private struct HoveredBurnDownValue {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = format
-        return formatter.string(from: date)
+        return formatter.string(from: labelDate)
     }
 }
 
@@ -1798,6 +1836,7 @@ private struct BurnSegment: Identifiable {
     let id: Int
     let start: BurnPoint
     let end: BurnPoint
+    let lastValueChangeDate: Date
     let isFastMode: Bool
 
     var points: [BurnPoint] { [start, end] }

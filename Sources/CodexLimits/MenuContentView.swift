@@ -152,18 +152,34 @@ struct MenuContentView: View {
                 HStack(alignment: .top, spacing: 24) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 6) {
-                            Text("Reset in")
+                            Text("Usage remaining")
                                 .foregroundStyle(.secondary)
-                            Spacer(minLength: 0)
-                            Text(countdownText(until: snapshot.mainLimit.window.resetsAt, now: context.date))
                                 .lineLimit(1)
+                            Spacer(minLength: 0)
+                            if let usageRemaining = estimatedUsageRemainingText(
+                                resetsAt: snapshot.mainLimit.window.resetsAt,
+                                now: context.date
+                            ) {
+                                HStack(spacing: 3) {
+                                    Text("~")
+                                    Text(usageRemaining)
+                                }
+                                .monospacedDigit()
+                            } else {
+                                Text("—")
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .help("Estimated active Codex hours at your current daily pace before the next reset")
                         HStack(spacing: 6) {
                             Text("Suggested pace")
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             Spacer(minLength: 0)
-                            Text(paceText(forecast: forecast))
+                            Text(paceText(
+                                resetsAt: snapshot.mainLimit.window.resetsAt,
+                                now: context.date
+                            ))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.75)
                         }
@@ -171,14 +187,6 @@ struct MenuContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 6) {
-                            Text("Banked resets")
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Spacer(minLength: 0)
-                            Text(snapshot.emergencyResetCount, format: .number)
-                                .monospacedDigit()
-                        }
                         HStack(spacing: 6) {
                             Text("Oldest reset expires in")
                                 .foregroundStyle(.secondary)
@@ -191,6 +199,16 @@ struct MenuContentView: View {
                                 Text("—")
                                     .foregroundStyle(.secondary)
                             }
+                        }
+                        HStack(spacing: 6) {
+                            Text("Reset in")
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Text(countdownText(
+                                until: snapshot.mainLimit.window.resetsAt,
+                                now: context.date
+                            ))
+                                .lineLimit(1)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -299,6 +317,17 @@ struct MenuContentView: View {
         return oneDecimal(hoursPerDay)
     }
 
+    private func estimatedUsageRemainingText(resetsAt: Date, now: Date) -> String? {
+        guard let hours = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            hoursPerDay: monitor.dailyRuntimeHours,
+            resetsAt: resetsAt,
+            now: now
+        ) else {
+            return nil
+        }
+        return "\(oneDecimal(hours))h"
+    }
+
     private func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {
         ([snapshot.mainLimit] + snapshot.otherLimits)
             .first { $0.limitId == "codex" && $0.window.durationMinutes == 10_080 }?
@@ -397,11 +426,19 @@ struct MenuContentView: View {
             + Text(" your limit.").foregroundColor(.secondary)
     }
 
-    private func paceText(forecast: Forecast) -> String {
-        guard let weeklyPaceHours = monitor.weeklyPaceHours else {
+    private func paceText(resetsAt: Date, now: Date) -> String {
+        let estimatedHoursRemaining = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            hoursPerDay: monitor.dailyRuntimeHours,
+            resetsAt: resetsAt,
+            now: now
+        )
+        guard let recommendedHoursPerDay = DailyRuntimeCalculator.suggestedDailyUsageHours(
+            estimatedHoursRemaining: estimatedHoursRemaining,
+            resetsAt: resetsAt,
+            now: now
+        ) else {
             return "— hr / day"
         }
-        let recommendedHoursPerDay = weeklyPaceHours * forecast.recommendedPercentPerDay / 100
         if recommendedHoursPerDay < 1 {
             let recommendedMinutesPerDay = Int((recommendedHoursPerDay * 60).rounded())
             return "\(recommendedMinutesPerDay) min / day"

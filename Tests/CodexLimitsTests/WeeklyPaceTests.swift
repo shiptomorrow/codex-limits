@@ -2,6 +2,48 @@ import XCTest
 @testable import CodexLimits
 
 final class WeeklyPaceTests: XCTestCase {
+    func testEstimatedUsageRemainingUsesDailyPaceAndTimeUntilReset() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            hoursPerDay: 3.5,
+            resetsAt: now.addingTimeInterval(2.5 * 86_400),
+            now: now
+        ))
+
+        XCTAssertEqual(hours, 8.75, accuracy: 0.001)
+    }
+
+    func testEstimatedUsageRemainingStopsAtReset() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+
+        let hours = try XCTUnwrap(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            hoursPerDay: 3.5,
+            resetsAt: now.addingTimeInterval(-60),
+            now: now
+        ))
+
+        XCTAssertEqual(hours, 0)
+        XCTAssertNil(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            hoursPerDay: nil,
+            resetsAt: now,
+            now: now
+        ))
+    }
+
+    func testSuggestedPaceUsesEstimatedHoursRemaining() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let resetsAt = now.addingTimeInterval(2.75 * 86_400)
+
+        let hoursPerDay = try XCTUnwrap(DailyRuntimeCalculator.suggestedDailyUsageHours(
+            estimatedHoursRemaining: 22.7,
+            resetsAt: resetsAt,
+            now: now
+        ))
+
+        XCTAssertEqual(hoursPerDay, 22.7 / 2.75, accuracy: 0.001)
+    }
+
     func testActivityCacheReadsOnlyAppendedSessionEvents() async throws {
         let fixture = try ActivityCacheFixture()
         defer { fixture.remove() }

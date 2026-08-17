@@ -52,6 +52,35 @@ enum DailyRuntimeCalculator {
     static let historicalDayCount = 14
     static let minimumIncludedDayHours = 5.0 / 60
 
+    static func estimatedUsageHoursRemaining(
+        hoursPerDay: Double?,
+        resetsAt: Date,
+        now: Date
+    ) -> Double? {
+        guard let hoursPerDay,
+              hoursPerDay.isFinite,
+              hoursPerDay >= 0 else {
+            return nil
+        }
+        let daysRemaining = max(resetsAt.timeIntervalSince(now), 0) / 86_400
+        return hoursPerDay * daysRemaining
+    }
+
+    static func suggestedDailyUsageHours(
+        estimatedHoursRemaining: Double?,
+        resetsAt: Date,
+        now: Date
+    ) -> Double? {
+        guard let estimatedHoursRemaining,
+              estimatedHoursRemaining.isFinite,
+              estimatedHoursRemaining >= 0 else {
+            return nil
+        }
+        let daysRemaining = max(resetsAt.timeIntervalSince(now), 0) / 86_400
+        guard daysRemaining > 0 else { return 0 }
+        return estimatedHoursRemaining / daysRemaining
+    }
+
     static func averageRecentDayHours(
         activity: [ActivityInterval],
         now: Date,

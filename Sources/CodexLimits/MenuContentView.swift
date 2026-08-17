@@ -160,7 +160,7 @@ struct MenuContentView: View {
                                 resetsAt: snapshot.mainLimit.window.resetsAt,
                                 now: context.date
                             ) {
-                                HStack(spacing: 3) {
+                                HStack(spacing: 1.5) {
                                     Text("~")
                                     Text(usageRemaining)
                                 }

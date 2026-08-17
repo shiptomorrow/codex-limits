@@ -1918,6 +1918,7 @@ struct SettingsView: View {
     @AppStorage(EstimatedRuntimeChartPreferences.proratesShortWindowsKey) private var proratesShortWindows = true
     @AppStorage(EstimatedRuntimeChartPreferences.proratingThresholdMinutesKey) private var proratingThresholdMinutes = EstimatedRuntimeChartPreferences.defaultProratingThresholdMinutes
     @AppStorage(EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey) private var proratingDistanceMinutes = EstimatedRuntimeChartPreferences.defaultProratingDistanceMinutes
+    @AppStorage(EstimatedRuntimeChartPreferences.percentagePointLookbackKey) private var percentagePointLookback = EstimatedRuntimeChartPreferences.defaultPercentagePointLookback
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
@@ -1975,6 +1976,17 @@ struct SettingsView: View {
                         monitor.updateShowPreviousWeeklyWindow(value)
                     }
                     .help("Include the previous usage window in the hours-per-week chart")
+
+                Stepper(
+                    value: Binding(
+                        get: { percentagePointLookback },
+                        set: setPercentagePointLookback
+                    ),
+                    in: 1 ... 10
+                ) {
+                    Text("Runtime lookback: \(percentagePointLookback) percentage \(percentagePointLookback == 1 ? "point" : "points")")
+                }
+                .help("Calculate estimated runtime from enough recent usage changes to cover this many percentage points")
 
                 Toggle("Prorate short usage windows", isOn: $proratesShortWindows)
                     .onChange(of: proratesShortWindows) { _, value in
@@ -2096,6 +2108,12 @@ struct SettingsView: View {
         )
         proratingDistanceMinutes = minutes
         monitor.updateProratingDistance(minutes: minutes)
+    }
+
+    private func setPercentagePointLookback(_ points: Int) {
+        let points = EstimatedRuntimeChartPreferences.clampedPercentagePointLookback(points)
+        percentagePointLookback = points
+        monitor.updatePercentagePointLookback(points)
     }
 
     private func setRefreshInterval(_ seconds: Int) {

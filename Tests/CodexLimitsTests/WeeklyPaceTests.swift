@@ -788,6 +788,47 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 4.5, accuracy: 0.01)
     }
 
+    func testEstimateSeriesCanLookBackMultiplePercentagePoints() throws {
+        let start = Date(timeIntervalSince1970: 485_000)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(6 * 60), remainingPercent: 99, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(18 * 60), remainingPercent: 98, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(36 * 60), remainingPercent: 97, resetsAt: reset)
+        ]
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: [ActivityInterval(start: start, end: start.addingTimeInterval(36 * 60))],
+            now: start.addingTimeInterval(36 * 60),
+            factorInPauses: false,
+            proratesShortWindows: false,
+            percentagePointLookback: 3
+        )
+
+        XCTAssertEqual(points.map(\.hoursPerWeek), [10, 15, 20])
+    }
+
+    func testEstimateSeriesPartiallyUsesOldestChangeForPercentageLookback() throws {
+        let start = Date(timeIntervalSince1970: 487_000)
+        let reset = start.addingTimeInterval(7 * 86_400)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(20 * 60), remainingPercent: 98, resetsAt: reset),
+            UsageSample(observedAt: start.addingTimeInterval(30 * 60), remainingPercent: 97, resetsAt: reset)
+        ]
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: samples,
+            activity: [ActivityInterval(start: start, end: start.addingTimeInterval(30 * 60))],
+            now: start.addingTimeInterval(30 * 60),
+            factorInPauses: false,
+            proratesShortWindows: false,
+            percentagePointLookback: 2
+        )
+
+        XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 16.667, accuracy: 0.01)
+    }
+
     func testEstimateSeriesDoesNotProrateAtThreshold() throws {
         let start = Date(timeIntervalSince1970: 490_000)
         let reset = start.addingTimeInterval(7 * 86_400)

@@ -15,7 +15,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Records local samples to show actual usage during the current window.
 - Compares actual usage with a straight target path ending at a configurable safety buffer.
 - Shows an estimated pace chart so you can see how your sustainable weekly usage changes over time.
-- Plots pace only at exact percentage updates, with optional runtime-based prorating for short usage windows or fully raw one-window values.
+- Plots pace only at exact percentage updates, with a configurable percentage-point lookback and optional runtime-based prorating for short usage windows.
 - Projects the current pace and compares it with recent historical usage.
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage changes in versioned daily JSON files, writing only when the fetched percentage changes.

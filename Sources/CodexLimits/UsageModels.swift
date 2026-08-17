@@ -18,8 +18,10 @@ enum EstimatedRuntimeChartPreferences {
     static let proratesShortWindowsKey = "prorateShortUsageWindows"
     static let proratingThresholdMinutesKey = "proratingThresholdMinutes"
     static let proratingDistanceMinutesKey = "proratingDistanceMinutes"
+    static let percentagePointLookbackKey = "estimatedRuntimePercentagePointLookback"
     static let defaultProratingThresholdMinutes = 15
     static let defaultProratingDistanceMinutes = 30
+    static let defaultPercentagePointLookback = 1
 
     static func clampedProratingThreshold(_ minutes: Int) -> Int {
         min(max(minutes, 1), 60)
@@ -27,6 +29,10 @@ enum EstimatedRuntimeChartPreferences {
 
     static func clampedProratingDistance(_ minutes: Int) -> Int {
         min(max(minutes, 5), 180)
+    }
+
+    static func clampedPercentagePointLookback(_ points: Int) -> Int {
+        min(max(points, 1), 10)
     }
 }
 

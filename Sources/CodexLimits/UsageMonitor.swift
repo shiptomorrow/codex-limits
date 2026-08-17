@@ -177,6 +177,17 @@ final class UsageMonitor: ObservableObject {
         scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
+    func updatePercentagePointLookback(_ points: Int) {
+        let points = EstimatedRuntimeChartPreferences.clampedPercentagePointLookback(points)
+        UserDefaults.standard.set(
+            points,
+            forKey: EstimatedRuntimeChartPreferences.percentagePointLookbackKey
+        )
+        lastScheduledActivityWindows = nil
+        guard let snapshot else { return }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
     func updateShowPreviousWeeklyWindow(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.showPreviousWeeklyWindowKey)
         lastScheduledActivityWindows = nil
@@ -535,6 +546,13 @@ final class UsageMonitor: ObservableObject {
             : EstimatedRuntimeChartPreferences.clampedProratingDistance(defaults.integer(
                 forKey: EstimatedRuntimeChartPreferences.proratingDistanceMinutesKey
             ))
+        let percentagePointLookback = defaults.object(
+            forKey: EstimatedRuntimeChartPreferences.percentagePointLookbackKey
+        ) == nil
+            ? EstimatedRuntimeChartPreferences.defaultPercentagePointLookback
+            : EstimatedRuntimeChartPreferences.clampedPercentagePointLookback(defaults.integer(
+                forKey: EstimatedRuntimeChartPreferences.percentagePointLookbackKey
+            ))
         let calculation = await Task.detached(priority: .utility) {
             let points = WeeklyPaceCalculator.estimateSeries(
                 samples: relevantSamples,
@@ -543,7 +561,8 @@ final class UsageMonitor: ObservableObject {
                 factorInPauses: factorInPauses,
                 proratesShortWindows: proratesShortWindows,
                 proratingThreshold: TimeInterval(thresholdMinutes * 60),
-                proratingDistance: TimeInterval(max(distanceMinutes, thresholdMinutes) * 60)
+                proratingDistance: TimeInterval(max(distanceMinutes, thresholdMinutes) * 60),
+                percentagePointLookback: percentagePointLookback
             )
             let current = points.last(where: {
                 abs($0.windowResetsAt.timeIntervalSince(window.resetsAt)) <= 5 * 60

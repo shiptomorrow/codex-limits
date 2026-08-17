@@ -328,7 +328,8 @@ enum WeeklyPaceCalculator {
         factorInPauses: Bool,
         proratesShortWindows: Bool = true,
         proratingThreshold: TimeInterval = 15 * 60,
-        proratingDistance: TimeInterval = 30 * 60
+        proratingDistance: TimeInterval = 30 * 60,
+        percentagePointLookback: Int = 1
     ) -> [WeeklyPacePoint] {
         let samples = rawSamples
             .filter { $0.observedAt <= now }
@@ -348,6 +349,7 @@ enum WeeklyPaceCalculator {
         let activity = merged(activity, joiningGapsUpTo: includedPause)
         let threshold = max(proratingThreshold, 0)
         let distance = max(proratingDistance, threshold)
+        let percentagePointLookback = Double(max(percentagePointLookback, 1))
 
         return windows.flatMap { windowSamples in
             usageChangePoints(
@@ -355,7 +357,8 @@ enum WeeklyPaceCalculator {
                 activity: activity,
                 proratesShortWindows: proratesShortWindows,
                 proratingThreshold: threshold,
-                proratingDistance: distance
+                proratingDistance: distance,
+                percentagePointLookback: percentagePointLookback
             )
         }
         .sorted { $0.date < $1.date }
@@ -374,7 +377,8 @@ enum WeeklyPaceCalculator {
         activity: [ActivityInterval],
         proratesShortWindows: Bool,
         proratingThreshold: TimeInterval,
-        proratingDistance: TimeInterval
+        proratingDistance: TimeInterval,
+        percentagePointLookback: Double
     ) -> [WeeklyPacePoint] {
         let samples = samples.sorted { $0.observedAt < $1.observedAt }
         guard samples.count > 1 else { return [] }
@@ -407,13 +411,33 @@ enum WeeklyPaceCalculator {
             let current = measurements[index]
             var duration = current.activeDuration
             var used = current.percentagePointsUsed
+            var includedFractions = [index: 1.0]
+
+            if used < percentagePointLookback {
+                for priorIndex in measurements.indices[..<index].reversed()
+                    where used < percentagePointLookback {
+                    let prior = measurements[priorIndex]
+                    let includedUsage = min(
+                        prior.percentagePointsUsed,
+                        percentagePointLookback - used
+                    )
+                    let includedFraction = includedUsage / prior.percentagePointsUsed
+                    duration += prior.activeDuration * includedFraction
+                    used += includedUsage
+                    includedFractions[priorIndex] = includedFraction
+                }
+            }
 
             if proratesShortWindows,
                duration < proratingThreshold,
                duration < proratingDistance {
                 var remainingDuration = proratingDistance - duration
-                for prior in measurements[..<index].reversed() where remainingDuration > 0 {
-                    let includedDuration = min(prior.activeDuration, remainingDuration)
+                for priorIndex in measurements.indices[..<index].reversed()
+                    where remainingDuration > 0 {
+                    let prior = measurements[priorIndex]
+                    let availableFraction = 1 - (includedFractions[priorIndex] ?? 0)
+                    let availableDuration = prior.activeDuration * availableFraction
+                    let includedDuration = min(availableDuration, remainingDuration)
                     duration += includedDuration
                     used += prior.percentagePointsUsed
                         * includedDuration / prior.activeDuration

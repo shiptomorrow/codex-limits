@@ -2,46 +2,43 @@ import XCTest
 @testable import CodexLimits
 
 final class WeeklyPaceTests: XCTestCase {
-    func testEstimatedUsageRemainingUsesDailyPaceAndTimeUntilReset() throws {
-        let now = Date(timeIntervalSince1970: 1_000)
-
+    func testEstimatedUsageRemainingUsesWeeklyPaceAndRemainingAllowance() throws {
         let hours = try XCTUnwrap(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
-            hoursPerDay: 3.5,
-            resetsAt: now.addingTimeInterval(2.5 * 86_400),
-            now: now
+            weeklyPaceHours: 26,
+            remainingPercent: 32
         ))
 
-        XCTAssertEqual(hours, 8.75, accuracy: 0.001)
+        XCTAssertEqual(hours, 8.32, accuracy: 0.001)
     }
 
-    func testEstimatedUsageRemainingStopsAtReset() throws {
-        let now = Date(timeIntervalSince1970: 1_000)
-
-        let hours = try XCTUnwrap(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
-            hoursPerDay: 3.5,
-            resetsAt: now.addingTimeInterval(-60),
-            now: now
-        ))
-
-        XCTAssertEqual(hours, 0)
+    func testEstimatedUsageRemainingClampsAllowanceAndRequiresWeeklyPace() throws {
+        XCTAssertEqual(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            weeklyPaceHours: 26,
+            remainingPercent: -1
+        ), 0)
+        XCTAssertEqual(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+            weeklyPaceHours: 26,
+            remainingPercent: 101
+        ), 26)
         XCTAssertNil(DailyRuntimeCalculator.estimatedUsageHoursRemaining(
-            hoursPerDay: nil,
-            resetsAt: now,
-            now: now
+            weeklyPaceHours: nil,
+            remainingPercent: 32
         ))
     }
 
-    func testSuggestedPaceUsesEstimatedHoursRemaining() throws {
+    func testSuggestedPaceSpreadsBufferedWeeklyPaceAllowanceUntilReset() throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let resetsAt = now.addingTimeInterval(2.75 * 86_400)
 
         let hoursPerDay = try XCTUnwrap(DailyRuntimeCalculator.suggestedDailyUsageHours(
-            estimatedHoursRemaining: 22.7,
+            weeklyPaceHours: 26,
+            remainingPercent: 32,
+            safetyBuffer: 3,
             resetsAt: resetsAt,
             now: now
         ))
 
-        XCTAssertEqual(hoursPerDay, 22.7 / 2.75, accuracy: 0.001)
+        XCTAssertEqual(hoursPerDay, 26 * 0.29 / 2.75, accuracy: 0.001)
     }
 
     func testActivityCacheReadsOnlyAppendedSessionEvents() async throws {

@@ -157,8 +157,7 @@ struct MenuContentView: View {
                                 .lineLimit(1)
                             Spacer(minLength: 0)
                             if let usageRemaining = estimatedUsageRemainingText(
-                                resetsAt: snapshot.mainLimit.window.resetsAt,
-                                now: context.date
+                                window: snapshot.mainLimit.window
                             ) {
                                 HStack(spacing: 1.5) {
                                     Text("~")
@@ -170,16 +169,13 @@ struct MenuContentView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .help("Estimated active Codex hours at your current daily pace before the next reset")
+                        .help("Estimated active Codex hours supported by the remaining allowance at the current weekly pace")
                         HStack(spacing: 6) {
                             Text("Suggested pace")
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             Spacer(minLength: 0)
-                            Text(paceText(
-                                resetsAt: snapshot.mainLimit.window.resetsAt,
-                                now: context.date
-                            ))
+                            Text(paceText(window: snapshot.mainLimit.window, now: context.date))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.75)
                         }
@@ -317,11 +313,10 @@ struct MenuContentView: View {
         return oneDecimal(hoursPerDay)
     }
 
-    private func estimatedUsageRemainingText(resetsAt: Date, now: Date) -> String? {
+    private func estimatedUsageRemainingText(window: UsageWindow) -> String? {
         guard let hours = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
-            hoursPerDay: monitor.dailyRuntimeHours,
-            resetsAt: resetsAt,
-            now: now
+            weeklyPaceHours: monitor.weeklyPaceHours,
+            remainingPercent: window.remainingPercent
         ) else {
             return nil
         }
@@ -426,15 +421,12 @@ struct MenuContentView: View {
             + Text(" your limit.").foregroundColor(.secondary)
     }
 
-    private func paceText(resetsAt: Date, now: Date) -> String {
-        let estimatedHoursRemaining = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
-            hoursPerDay: monitor.dailyRuntimeHours,
-            resetsAt: resetsAt,
-            now: now
-        )
+    private func paceText(window: UsageWindow, now: Date) -> String {
         guard let recommendedHoursPerDay = DailyRuntimeCalculator.suggestedDailyUsageHours(
-            estimatedHoursRemaining: estimatedHoursRemaining,
-            resetsAt: resetsAt,
+            weeklyPaceHours: monitor.weeklyPaceHours,
+            remainingPercent: window.remainingPercent,
+            safetyBuffer: safetyBuffer,
+            resetsAt: window.resetsAt,
             now: now
         ) else {
             return "— hr / day"

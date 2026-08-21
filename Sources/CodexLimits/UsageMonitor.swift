@@ -20,6 +20,8 @@ final class UsageMonitor: ObservableObject {
     static let refreshIntervalSecondsKey = "refreshIntervalSeconds"
     static let factorInPausesKey = "factorInPauses"
     static let showPreviousWeeklyWindowKey = "showPreviousWeeklyWindow"
+    static let remoteSessionsEnabledKey = "remoteSessionsEnabled"
+    static let remoteSSHProfilesKey = "remoteSSHProfiles"
 
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var forecast: Forecast?
@@ -32,6 +34,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var activityErrorMessage: String?
+    @Published private(set) var remoteActivityErrorMessage: String?
     @Published private(set) var activityCacheIntegrityFailed = false
     @Published private(set) var usageReadFailed = false
     @Published private(set) var syncFolderName: String?
@@ -60,6 +63,12 @@ final class UsageMonitor: ObservableObject {
     private var lastScheduledActivityWindows: [String: UsageWindow]?
     private var pendingActivitySnapshot: UsageSnapshot?
     private var activityAnalysisTask: Task<Void, Never>?
+    private var cachedRemoteActivity: (
+        profiles: [String],
+        since: Date,
+        now: Date,
+        result: RemoteCodexActivityResult
+    )?
     private static let maintenanceInterval: TimeInterval = 10 * 60
 
     init() {
@@ -195,6 +204,20 @@ final class UsageMonitor: ObservableObject {
         scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
+    var remoteSSHProfiles: [String] {
+        UserDefaults.standard.stringArray(forKey: Self.remoteSSHProfilesKey) ?? []
+    }
+
+    func updateRemoteSessionsEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.remoteSessionsEnabledKey)
+        remoteActivitySettingsChanged()
+    }
+
+    func updateRemoteSSHProfiles(_ profiles: Set<String>) {
+        UserDefaults.standard.set(profiles.sorted(), forKey: Self.remoteSSHProfilesKey)
+        remoteActivitySettingsChanged()
+    }
+
     func refresh() async {
         guard !isRefreshing else { return }
         isRefreshing = true
@@ -259,6 +282,14 @@ final class UsageMonitor: ObservableObject {
         refreshTimerCancellable?.cancel()
         activityAnalysisTask?.cancel()
         client.shutdown()
+    }
+
+    private func remoteActivitySettingsChanged() {
+        cachedRemoteActivity = nil
+        remoteActivityErrorMessage = nil
+        lastScheduledActivityWindows = nil
+        guard let snapshot else { return }
+        scheduleActivityAnalysisIfNeeded(for: snapshot)
     }
 
     private func scheduleRefreshTimer() {
@@ -519,7 +550,7 @@ final class UsageMonitor: ObservableObject {
             return
         }
 
-        let activity = try await CodexActivityReader.loadIntervals(
+        let activity = try await loadActivityIntervals(
             since: firstSample.observedAt,
             now: snapshot.fetchedAt
         )
@@ -601,7 +632,7 @@ final class UsageMonitor: ObservableObject {
             historicalDailyRuntimeHours = nil
             return
         }
-        let activity = try await CodexActivityReader.loadIntervals(
+        let activity = try await loadActivityIntervals(
             since: first.start,
             now: now
         )
@@ -617,6 +648,40 @@ final class UsageMonitor: ObservableObject {
             activity: activity,
             now: now
         )
+    }
+
+    private func loadActivityIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
+        let local = try await CodexActivityReader.loadIntervals(since: since, now: now)
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
+            remoteActivityErrorMessage = nil
+            return local
+        }
+
+        let profiles = remoteSSHProfiles
+        guard !profiles.isEmpty else {
+            remoteActivityErrorMessage = "Choose at least one SSH profile in Settings."
+            return local
+        }
+
+        let remote: RemoteCodexActivityResult
+        if let cachedRemoteActivity,
+           cachedRemoteActivity.profiles == profiles,
+           cachedRemoteActivity.since <= since,
+           cachedRemoteActivity.now == now {
+            remote = cachedRemoteActivity.result
+        } else {
+            remote = await RemoteCodexActivityReader.loadIntervals(
+                profiles: profiles,
+                since: since,
+                now: now
+            )
+            cachedRemoteActivity = (profiles, since, now, remote)
+        }
+        remoteActivityErrorMessage = remote.errors.isEmpty
+            ? nil
+            : "Remote sessions: \(remote.errors.joined(separator: "; "))"
+        return local + remote.intervals.filter { $0.end >= since && $0.start <= now }
     }
 
     private func scheduleActivityAnalysisIfNeeded(for snapshot: UsageSnapshot) {

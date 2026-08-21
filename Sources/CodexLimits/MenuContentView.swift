@@ -234,7 +234,11 @@ struct MenuContentView: View {
             }
 
             ForEach(
-                [monitor.errorMessage, monitor.activityErrorMessage].compactMap { $0 },
+                [
+                    monitor.errorMessage,
+                    monitor.activityErrorMessage,
+                    monitor.remoteActivityErrorMessage
+                ].compactMap { $0 },
                 id: \.self
             ) { error in
                 Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -1915,8 +1919,11 @@ struct SettingsView: View {
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
+    @AppStorage(UsageMonitor.remoteSessionsEnabledKey) private var remoteSessionsEnabled = false
     @State private var loginItemError: String?
     @State private var isResetHistoryConfirmationPresented = false
+    @State private var availableSSHProfiles: [String] = []
+    @State private var selectedSSHProfiles: Set<String> = []
 
     var body: some View {
         Form {
@@ -2017,6 +2024,39 @@ struct SettingsView: View {
                 Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }
 
+            Section("Remote Codex sessions") {
+                Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
+                    .onChange(of: remoteSessionsEnabled) { _, enabled in
+                        monitor.updateRemoteSessionsEnabled(enabled)
+                    }
+
+                Text("Uses SSH hosts from ~/.ssh/config and adds their Codex session activity to runtime and weekly pace estimates.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if remoteSessionsEnabled {
+                    if availableSSHProfiles.isEmpty {
+                        Text("No named SSH hosts were found.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(availableSSHProfiles, id: \.self) { profile in
+                            Toggle(profile, isOn: Binding(
+                                get: { selectedSSHProfiles.contains(profile) },
+                                set: { selectProfile(profile, enabled: $0) }
+                            ))
+                        }
+                    }
+
+                    Button("Reload SSH Profiles", action: loadSSHProfiles)
+
+                    if let remoteError = monitor.remoteActivityErrorMessage {
+                        Label(remoteError, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Section("History sync") {
                 Text("Keep usage history in a folder available on your other Macs.")
                     .foregroundStyle(.secondary)
@@ -2043,7 +2083,8 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 380, height: 600)
+        .frame(width: 400, height: 700)
+        .onAppear(perform: loadSSHProfiles)
         .alert(
             "Delete usage history?",
             isPresented: $isResetHistoryConfirmationPresented
@@ -2111,6 +2152,22 @@ struct SettingsView: View {
     private func setRefreshInterval(_ seconds: Int) {
         refreshIntervalSeconds = seconds
         monitor.updateRefreshInterval(seconds: seconds)
+    }
+
+    private func loadSSHProfiles() {
+        selectedSSHProfiles = Set(monitor.remoteSSHProfiles)
+        availableSSHProfiles = Array(
+            Set(SystemSSHProfiles.load()).union(selectedSSHProfiles)
+        ).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private func selectProfile(_ profile: String, enabled: Bool) {
+        if enabled {
+            selectedSSHProfiles.insert(profile)
+        } else {
+            selectedSSHProfiles.remove(profile)
+        }
+        monitor.updateRemoteSSHProfiles(selectedSSHProfiles)
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {

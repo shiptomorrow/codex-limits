@@ -1434,7 +1434,7 @@ private struct BurnDownChart: View {
                 endPercent: displayedPercent(segment.end.remaining),
                 color: segment.isFastMode ? .orange : .blue,
                 lastValueChangeDate: segment.lastValueChangeDate,
-                isStep: true
+                isStep: false
             )
         }
         let projected = zip(currentProjection, currentProjection.dropFirst()).map { start, end in
@@ -1485,8 +1485,8 @@ private struct BurnDownChart: View {
                             series: .value("Actual segment", segment.id)
                         )
                         .foregroundStyle(segment.isFastMode ? Color.orange : Color.blue)
-                        .lineStyle(StrokeStyle(lineWidth: 2))
-                        .interpolationMethod(.stepEnd)
+                        .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                        .interpolationMethod(.linear)
                     }
                 }
 

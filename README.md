@@ -35,12 +35,12 @@ Codex Limits is local-first:
 - It does not copy or store Codex credentials.
 - It starts the user-managed Codex CLI and reads usage through its local app-server interface.
 - For the weekly-hours estimate, it reads only task timestamps, task boundaries, and token-count metadata from local Codex session files. It does not use prompt or response text.
-- If remote sessions are enabled, it connects with the system `ssh` command in batch mode, temporarily transfers recent `~/.codex` session files from the selected hosts, retains only the same timing metadata in a per-host cache, and deletes each raw transfer after parsing.
+- If remote sessions are enabled, it connects with the system `ssh` command in batch mode. A Python helper maintains an incremental timing cache under `~/.codex/codex-limits` on each selected host and returns only calculated activity intervals. Raw session files never leave the host.
 - It keeps a local incremental cache of that timing metadata and session file sizes so unchanged JSONL content does not need to be parsed again.
 - It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
 - Weekly-limit samples used by the activity estimate remain local and are not copied to a sync folder.
 - If history sync is enabled, it replicates only those samples to the selected folder. Preferences, credentials, and raw Codex responses remain local.
-- Failed Codex app-server responses and CLI errors are written to the rotating local diagnostic log at `~/Library/Logs/Codex Limits/codex-client.log`.
+- Failed Codex app-server responses, CLI errors, and remote SSH errors are written to the rotating local diagnostic log at `~/Library/Logs/Codex Limits/codex-client.log`.
 - Synced history is readable JSON and contains observation times, remaining percentages, and reset times. Choose a private folder that is not shared with other people.
 - It has no telemetry, analytics, notifications, or direct network client.
 - The Codex CLI may contact the Codex service as part of its normal operation.

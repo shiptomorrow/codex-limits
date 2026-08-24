@@ -2,6 +2,12 @@ import XCTest
 @testable import CodexLimits
 
 final class SystemSSHProfilesTests: XCTestCase {
+    func testRemoteSSHPolicyTimeoutsAndRetryDelay() {
+        XCTAssertEqual(RemoteSSHPolicy.connectTimeoutSeconds, 15)
+        XCTAssertEqual(RemoteSSHPolicy.operationTimeout, 300)
+        XCTAssertEqual(RemoteSSHPolicy.retryDelay, 300)
+    }
+
     func testLoadsConcreteHostsAndIncludedConfigs() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexLimitsSSHProfiles-\(UUID().uuidString)", isDirectory: true)

@@ -1,6 +1,12 @@
 import Darwin
 import Foundation
 
+enum RemoteSSHPolicy {
+    static let connectTimeoutSeconds = 15
+    static let operationTimeout: TimeInterval = 5 * 60
+    static let retryDelay: TimeInterval = 5 * 60
+}
+
 enum SystemSSHProfiles {
     static func load(from configURL: URL? = nil) -> [String] {
         let configURL = configURL ?? FileManager.default.homeDirectoryForCurrentUser
@@ -116,6 +122,17 @@ struct RemoteCodexActivityResult: Sendable {
 }
 
 enum RemoteCodexActivityReader {
+    private struct IntervalPayload: Decodable {
+        let version: Int
+        let intervals: [RemoteInterval]
+    }
+
+    private struct RemoteInterval: Decodable {
+        let start: TimeInterval
+        let end: TimeInterval
+        let isFastMode: Bool
+    }
+
     private struct ProfileResult: Sendable {
         let profile: String
         let intervals: [ActivityInterval]
@@ -175,143 +192,155 @@ enum RemoteCodexActivityReader {
             )
         }
         return try await Task.detached(priority: .utility) {
-            let snapshotRoot = FileManager.default.temporaryDirectory
+            let workDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("CodexLimitsRemote-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(
-                at: snapshotRoot,
+                at: workDirectory,
                 withIntermediateDirectories: true
             )
-            defer { try? FileManager.default.removeItem(at: snapshotRoot) }
+            defer { try? FileManager.default.removeItem(at: workDirectory) }
 
-            try downloadSnapshot(
+            return try loadRemoteIntervals(
                 profile: profile,
                 since: since,
                 now: now,
-                to: snapshotRoot
+                in: workDirectory
             )
-
-            let codexRoot = snapshotRoot.appendingPathComponent(".codex", isDirectory: true)
-            let cacheURL = applicationSupportDirectory()
-                .appendingPathComponent("RemoteActivityCache", isDirectory: true)
-                .appendingPathComponent(safeIdentifier(profile), isDirectory: true)
-                .appendingPathComponent("events-v2.json")
-            return try CodexActivityCache(
-                sessionsRoot: codexRoot.appendingPathComponent("sessions", isDirectory: true),
-                archivedSessionsRoot: codexRoot.appendingPathComponent(
-                    "archived_sessions",
-                    isDirectory: true
-                ),
-                cacheURL: cacheURL
-            ).loadIntervals(since: since, now: now)
         }.value
     }
 
-    private static func downloadSnapshot(
+    private static func loadRemoteIntervals(
         profile: String,
         since: Date,
         now: Date,
-        to destination: URL
-    ) throws {
-        let days = max(1, Int(ceil(now.timeIntervalSince(since) / 86_400)) + 2)
-        let remoteCommand = """
-        set -eu
-        cd "$HOME"
-        list=$(mktemp)
-        trap 'rm -f "$list"' EXIT HUP INT TERM
-        find .codex/sessions .codex/archived_sessions -type f -name '*.jsonl' -mtime -\(days) -print 2>/dev/null >"$list" || true
-        tar -cf - -T "$list"
-        """
+        in workDirectory: URL
+    ) throws -> [ActivityInterval] {
+        guard let scriptURL = remoteActivityScriptURL() else {
+            throw NSError(
+                domain: "CodexLimits.RemoteActivity",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Remote activity helper is missing"]
+            )
+        }
+        let outputURL = workDirectory.appendingPathComponent("intervals.json")
+        let errorURL = workDirectory.appendingPathComponent("ssh-error.log")
+        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        _ = FileManager.default.createFile(atPath: errorURL.path, contents: nil)
 
-        let transfer = Pipe()
-        let sshError = Pipe()
-        let tarError = Pipe()
+        let scriptInput = try FileHandle(forReadingFrom: scriptURL)
+        let output = try FileHandle(forWritingTo: outputURL)
+        let sshError = try FileHandle(forWritingTo: errorURL)
+        defer {
+            try? scriptInput.close()
+            try? output.close()
+            try? sshError.close()
+        }
+
         let ssh = Process()
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         ssh.arguments = [
-            "-n", "-T",
+            "-T",
             "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
+            "-o", "ConnectTimeout=\(RemoteSSHPolicy.connectTimeoutSeconds)",
             "-o", "ConnectionAttempts=1",
             profile,
-            remoteCommand
+            "python3 - \(since.timeIntervalSince1970) \(now.timeIntervalSince1970)"
         ]
-        ssh.standardInput = FileHandle.nullDevice
-        ssh.standardOutput = transfer
+        ssh.standardInput = scriptInput
+        ssh.standardOutput = output
         ssh.standardError = sshError
 
-        let tar = Process()
-        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tar.arguments = ["-xf", "-", "-C", destination.path]
-        tar.standardInput = transfer
-        tar.standardOutput = FileHandle.nullDevice
-        tar.standardError = tarError
-
         do {
-            try tar.run()
             try ssh.run()
         } catch {
             if ssh.isRunning { ssh.terminate() }
-            if tar.isRunning { tar.terminate() }
+            CodexDiagnostics.record(
+                "Remote SSH launch failed for profile \(profile)",
+                details: error.localizedDescription
+            )
             throw error
         }
-        try? transfer.fileHandleForReading.close()
-        try? transfer.fileHandleForWriting.close()
 
-        let deadline = Date().addingTimeInterval(15)
-        while ssh.isRunning, Date() < deadline {
+        let sshDeadline = Date().addingTimeInterval(RemoteSSHPolicy.operationTimeout)
+        while ssh.isRunning, Date() < sshDeadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
         if ssh.isRunning {
             ssh.terminate()
-            tar.terminate()
-            throw NSError(
+            let error = NSError(
                 domain: "CodexLimits.RemoteActivity",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "SSH session timed out"]
             )
+            CodexDiagnostics.record(
+                "Remote SSH timed out for profile \(profile)",
+                details: "The remote activity request exceeded \(Int(RemoteSSHPolicy.operationTimeout)) seconds."
+            )
+            throw error
         }
         ssh.waitUntilExit()
-
-        while tar.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if tar.isRunning { tar.terminate() }
-        tar.waitUntilExit()
+        try? output.close()
+        try? sshError.close()
 
         if ssh.terminationStatus != 0 {
-            let detail = String(
-                decoding: sshError.fileHandleForReading.readDataToEndOfFile(),
-                as: UTF8.self
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = ((try? String(contentsOf: errorURL, encoding: .utf8)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            CodexDiagnostics.record(
+                "Remote SSH failed for profile \(profile) with exit code \(ssh.terminationStatus)",
+                details: detail.isEmpty ? "SSH produced no error output." : detail
+            )
             throw NSError(
                 domain: "CodexLimits.RemoteActivity",
                 code: Int(ssh.terminationStatus),
                 userInfo: [NSLocalizedDescriptionKey: detail.isEmpty ? "SSH connection failed" : detail]
             )
         }
-        if tar.terminationStatus != 0 {
-            let detail = String(
-                decoding: tarError.fileHandleForReading.readDataToEndOfFile(),
-                as: UTF8.self
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        do {
+            let payload = try JSONDecoder().decode(
+                IntervalPayload.self,
+                from: Data(contentsOf: outputURL)
+            )
+            guard payload.version == 1 else {
+                throw NSError(
+                    domain: "CodexLimits.RemoteActivity",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Unsupported remote activity response"]
+                )
+            }
+            return payload.intervals.map {
+                ActivityInterval(
+                    start: Date(timeIntervalSince1970: $0.start),
+                    end: Date(timeIntervalSince1970: $0.end),
+                    isFastMode: $0.isFastMode
+                )
+            }
+        } catch {
+            let response = ((try? String(contentsOf: outputURL, encoding: .utf8)) ?? "")
+            CodexDiagnostics.record(
+                "Remote activity response could not be decoded for profile \(profile)",
+                details: "\(error.localizedDescription)\n\(response)"
+            )
             throw NSError(
                 domain: "CodexLimits.RemoteActivity",
-                code: Int(tar.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: detail.isEmpty ? "Couldn’t read remote sessions" : detail]
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Couldn’t read remote activity response: \(error.localizedDescription)"]
             )
         }
     }
 
-    private static func applicationSupportDirectory() -> URL {
-        (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory)
-            .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
-    }
-
-    private static func safeIdentifier(_ profile: String) -> String {
-        Data(profile.utf8).base64EncodedString()
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "=", with: "")
+    private static func remoteActivityScriptURL() -> URL? {
+        if let bundled = Bundle.main.url(
+            forResource: "remote-activity",
+            withExtension: "py"
+        ) {
+            return bundled
+        }
+        let sourceTree = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/remote-activity.py")
+        return FileManager.default.fileExists(atPath: sourceTree.path) ? sourceTree : nil
     }
 }

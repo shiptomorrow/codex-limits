@@ -63,6 +63,7 @@ final class UsageMonitor: ObservableObject {
     private var lastScheduledActivityWindows: [String: UsageWindow]?
     private var pendingActivitySnapshot: UsageSnapshot?
     private var activityAnalysisTask: Task<Void, Never>?
+    private var remoteActivityRetryTask: Task<Void, Never>?
     private var cachedRemoteActivity: (
         profiles: [String],
         since: Date,
@@ -281,10 +282,13 @@ final class UsageMonitor: ObservableObject {
     func shutdown() {
         refreshTimerCancellable?.cancel()
         activityAnalysisTask?.cancel()
+        remoteActivityRetryTask?.cancel()
         client.shutdown()
     }
 
     private func remoteActivitySettingsChanged() {
+        remoteActivityRetryTask?.cancel()
+        remoteActivityRetryTask = nil
         cachedRemoteActivity = nil
         remoteActivityErrorMessage = nil
         lastScheduledActivityWindows = nil
@@ -681,7 +685,37 @@ final class UsageMonitor: ObservableObject {
         remoteActivityErrorMessage = remote.errors.isEmpty
             ? nil
             : "Remote sessions: \(remote.errors.joined(separator: "; "))"
+        if remote.errors.isEmpty {
+            remoteActivityRetryTask?.cancel()
+            remoteActivityRetryTask = nil
+        } else {
+            scheduleRemoteActivityRetryIfNeeded()
+        }
         return local + remote.intervals.filter { $0.end >= since && $0.start <= now }
+    }
+
+    private func scheduleRemoteActivityRetryIfNeeded() {
+        guard remoteActivityRetryTask == nil else { return }
+        logger.info(
+            "Scheduling remote SSH retry in \(Int(RemoteSSHPolicy.retryDelay), privacy: .public) seconds"
+        )
+        remoteActivityRetryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(RemoteSSHPolicy.retryDelay))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.remoteActivityRetryTask = nil
+            guard UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
+                  !self.remoteSSHProfiles.isEmpty,
+                  let snapshot = self.snapshot else { return }
+
+            self.logger.info("Retrying remote SSH activity after an earlier failure")
+            self.cachedRemoteActivity = nil
+            self.lastScheduledActivityWindows = nil
+            self.scheduleActivityAnalysisIfNeeded(for: snapshot)
+        }
     }
 
     private func scheduleActivityAnalysisIfNeeded(for snapshot: UsageSnapshot) {

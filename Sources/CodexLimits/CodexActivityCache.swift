@@ -39,12 +39,16 @@ struct CodexActivityCache {
         var completions: [TaskCompletion] = []
         var tokenTimes: [Date] = []
         var modeChanges: [ModeChange] = []
+        var isSubagent: Bool?
 
         mutating func append(_ other: Events) {
             starts += other.starts
             completions += other.completions
             tokenTimes += other.tokenTimes
             modeChanges += other.modeChanges
+            if let isSubagent = other.isSubagent {
+                self.isSubagent = isSubagent
+            }
         }
     }
 
@@ -69,7 +73,7 @@ struct CodexActivityCache {
         case event(Events)
     }
 
-    private static let formatVersion = 2
+    private static let formatVersion = 3
     private static let guardLength = 4_096
     private static let maximumSessionFileSize = 50_000_000
 
@@ -199,9 +203,23 @@ struct CodexActivityCache {
     }
 
     private func parseLine(_ line: Data) -> ParsedLine {
-        guard line.range(of: Data("\"event_msg\"".utf8)) != nil else {
+        let isSessionMetadata = line.range(of: Data("\"session_meta\"".utf8)) != nil
+        guard isSessionMetadata || line.range(of: Data("\"event_msg\"".utf8)) != nil else {
             return .irrelevant
         }
+        if isSessionMetadata {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  object["type"] as? String == "session_meta",
+                  let payload = object["payload"] as? [String: Any] else {
+                return .irrelevant
+            }
+            var events = Events()
+            let source = payload["source"] as? [String: Any]
+            events.isSubagent = payload["thread_source"] as? String == "subagent"
+                || source?["subagent"] != nil
+            return .event(events)
+        }
+
         let markers = [
             "\"task_started\"",
             "\"task_complete\"",
@@ -259,6 +277,7 @@ struct CodexActivityCache {
     }
 
     private func intervals(from entries: [Entry], since: Date, now: Date) -> [ActivityInterval] {
+        let entries = entries.filter { $0.events.isSubagent != true }
         var starts: [String: (date: Date, entry: Int)] = [:]
         var completedIDs: Set<String> = []
         var completed: [(interval: ActivityInterval, entry: Int)] = []

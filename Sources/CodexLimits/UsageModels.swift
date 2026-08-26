@@ -100,6 +100,12 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+struct HistoricalUsageWindow: Equatable, Sendable {
+    let window: UsageWindow
+    let samples: [UsageSample]
+    let fetchedAt: Date
+}
+
 enum UsageReadingValidation {
     static let resetTolerance: TimeInterval = 5 * 60
     static let confirmationMaximumDecrease = 2.0
@@ -172,6 +178,60 @@ enum UsageReadingValidation {
                 )
             }
             .sorted { $0.observedAt < $1.observedAt }
+    }
+
+    static func historicalWindows(
+        in samples: [UsageSample],
+        before currentWindow: UsageWindow
+    ) -> [HistoricalUsageWindow] {
+        let groups = samples
+            .sorted { $0.observedAt < $1.observedAt }
+            .reduce(into: [[UsageSample]]()) { groups, sample in
+                guard let reset = groups.last?.last?.resetsAt,
+                      isSameWindow(resetsAt: sample.resetsAt, previousReset: reset) else {
+                    groups.append([sample])
+                    return
+                }
+                groups[groups.count - 1].append(sample)
+            }
+        let currentGroupIndex = groups.lastIndex { group in
+            guard let reset = group.last?.resetsAt else { return false }
+            return isSameWindow(
+                resetsAt: reset,
+                previousReset: currentWindow.resetsAt
+            )
+        }
+        let historicalIndices = groups.indices.filter { index in
+            currentGroupIndex.map { index < $0 } ?? true
+        }
+
+        let windows: [HistoricalUsageWindow] = historicalIndices.compactMap {
+            index -> HistoricalUsageWindow? in
+            guard let lastSample = groups[index].last else { return nil }
+
+            let scheduledReset = lastSample.resetsAt
+            let plannedStart = scheduledReset.addingTimeInterval(
+                -Double(currentWindow.durationMinutes) * 60
+            )
+            let nextWindowStartedAt = groups.indices.contains(index + 1)
+                ? groups[index + 1].first?.observedAt
+                : nil
+            let endedAt = min(nextWindowStartedAt ?? scheduledReset, scheduledReset)
+            guard endedAt > plannedStart else { return nil }
+            let windowSamples = groups[index].filter { $0.observedAt <= endedAt }
+            guard let endingSample = windowSamples.last else { return nil }
+
+            return HistoricalUsageWindow(
+                window: UsageWindow(
+                    remainingPercent: endingSample.remainingPercent,
+                    resetsAt: scheduledReset,
+                    durationMinutes: currentWindow.durationMinutes
+                ),
+                samples: windowSamples,
+                fetchedAt: endedAt
+            )
+        }
+        return Array(windows.reversed())
     }
 }
 

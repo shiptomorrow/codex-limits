@@ -619,8 +619,8 @@ enum CodexActivityReader {
         ).first?
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
             .appendingPathComponent("ActivityCache", isDirectory: true)
-            .appendingPathComponent("events-v2.json")
-            ?? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limits-events-v2.json")
+            .appendingPathComponent("events-v3.json")
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limits-events-v3.json")
         return try await loadIntervals(
             since: since,
             now: now,

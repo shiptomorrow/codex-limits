@@ -67,6 +67,29 @@ final class WeeklyPaceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cacheURL.path))
     }
 
+    func testActivityCacheCountsOnlyMainThreadSessions() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        try fixture.write([
+            fixture.sessionMetadata(threadSource: "user"),
+            fixture.taskStarted(turnID: "main-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(120))
+        ])
+        try fixture.write([
+            fixture.sessionMetadata(threadSource: "subagent", hasSubagentSource: true),
+            fixture.taskStarted(turnID: "subagent-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(540))
+        ], to: fixture.subagentSessionURL)
+
+        let intervals = try await fixture.load()
+
+        XCTAssertEqual(intervals, [ActivityInterval(
+            start: start,
+            end: start.addingTimeInterval(120)
+        )])
+    }
+
     func testActivityCachePoisonsItselfWhenCachedPrefixChanges() async throws {
         let fixture = try ActivityCacheFixture()
         defer { fixture.remove() }
@@ -1024,6 +1047,7 @@ private struct ActivityCacheFixture {
     let archivedSessionsRoot: URL
     let cacheURL: URL
     let sessionURL: URL
+    let subagentSessionURL: URL
     let archivedSessionURL: URL
     let now = Date(timeIntervalSince1970: 1_776_427_200) // 2026-04-17 12:00:00 UTC
 
@@ -1050,6 +1074,9 @@ private struct ActivityCacheFixture {
         )
         let sessionName = "rollout-\(dayName)T12-00-00-test.jsonl"
         sessionURL = day.appendingPathComponent(sessionName)
+        subagentSessionURL = day.appendingPathComponent(
+            "rollout-\(dayName)T12-00-01-subagent.jsonl"
+        )
         try FileManager.default.createDirectory(
             at: archivedSessionsRoot,
             withIntermediateDirectories: true
@@ -1081,6 +1108,11 @@ private struct ActivityCacheFixture {
 
     func taskStarted(turnID: String, at date: Date) -> String {
         #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"\#(turnID)","started_at":\#(date.timeIntervalSince1970)}}"#
+    }
+
+    func sessionMetadata(threadSource: String, hasSubagentSource: Bool = false) -> String {
+        let source = hasSubagentSource ? #"{"subagent":{"thread_spawn":{}}}"# : #""vscode""#
+        return #"{"type":"session_meta","payload":{"thread_source":"\#(threadSource)","source":\#(source)}}"#
     }
 
     func tokenCount(at date: Date) -> String {

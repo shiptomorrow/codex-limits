@@ -14,6 +14,7 @@ struct MenuContentView: View {
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
     @State private var chartMode: ChartMode = .usage
+    @State private var usageWindowOffset = 0
 
     var body: some View {
         Group {
@@ -34,6 +35,11 @@ struct MenuContentView: View {
             from: snapshot.otherLimits,
             hideCodex53Spark: hideCodex53Spark
         )
+        let historicalWindows = monitor.historicalUsageWindows
+        let selectedHistoricalWindow = usageWindowOffset > 0
+            && historicalWindows.indices.contains(usageWindowOffset - 1)
+            ? historicalWindows[usageWindowOffset - 1]
+            : nil
 
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -108,34 +114,83 @@ struct MenuContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Spacer()
-                    Button {
-                        chartMode = chartMode == .usage ? .weeklyPace : .usage
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(
-                                systemName: chartMode == .usage
-                                    ? "clock.arrow.trianglehead.counterclockwise.rotate.90"
-                                    : "percent"
+                    if chartMode == .usage {
+                        Button {
+                            usageWindowOffset = min(
+                                usageWindowOffset + 1,
+                                historicalWindows.count
                             )
-                            Text(chartMode == .usage ? "Hours / week" : "Usage")
+                        } label: {
+                            Image(systemName: "arrow.left")
                         }
+                        .controlSize(.small)
+                        .disabled(usageWindowOffset >= historicalWindows.count)
+                        .help("Show older usage window")
+                        .accessibilityLabel("Show older usage window")
                     }
-                    .controlSize(.small)
-                    .help(chartMode == .usage ? "Show estimated hours per week pace" : "Show usage forecast")
-                    .accessibilityLabel(chartMode == .usage ? "Show hours per week pace graph" : "Show usage forecast graph")
+                    if chartMode == .usage, usageWindowOffset > 0 {
+                        Button {
+                            usageWindowOffset = max(usageWindowOffset - 1, 0)
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text("Back")
+                                Image(systemName: "arrow.right")
+                            }
+                        }
+                        .controlSize(.small)
+                        .help("Show newer usage window")
+                        .accessibilityLabel("Show newer usage window")
+                    } else {
+                        Button {
+                            chartMode = chartMode == .usage ? .weeklyPace : .usage
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(
+                                    systemName: chartMode == .usage
+                                        ? "clock.arrow.trianglehead.counterclockwise.rotate.90"
+                                        : "percent"
+                                )
+                                Text(chartMode == .usage ? "Hours / week" : "Usage")
+                            }
+                        }
+                        .controlSize(.small)
+                        .help(
+                            chartMode == .usage
+                                ? "Show estimated hours per week pace"
+                                : "Show usage forecast"
+                        )
+                        .accessibilityLabel(
+                            chartMode == .usage
+                                ? "Show hours per week pace graph"
+                                : "Show usage forecast graph"
+                        )
+                    }
                 }
 
                 if chartMode == .usage {
-                    BurnDownChart(
-                        window: snapshot.mainLimit.window,
-                        samples: monitor.currentWindowSamples,
-                        tokenHistory: snapshot.tokenHistory,
-                        fetchedAt: snapshot.fetchedAt,
-                        forecast: forecast,
-                        safetyBuffer: safetyBuffer,
-                        showsUsedPercentage: showsUsedPercentage,
-                        activity: monitor.activityIntervals
-                    )
+                    if let previous = selectedHistoricalWindow {
+                        BurnDownChart(
+                            window: previous.window,
+                            samples: previous.samples,
+                            tokenHistory: snapshot.tokenHistory,
+                            fetchedAt: previous.fetchedAt,
+                            forecast: nil,
+                            safetyBuffer: safetyBuffer,
+                            showsUsedPercentage: showsUsedPercentage,
+                            activity: monitor.activityIntervals
+                        )
+                    } else {
+                        BurnDownChart(
+                            window: snapshot.mainLimit.window,
+                            samples: monitor.currentWindowSamples,
+                            tokenHistory: snapshot.tokenHistory,
+                            fetchedAt: snapshot.fetchedAt,
+                            forecast: forecast,
+                            safetyBuffer: safetyBuffer,
+                            showsUsedPercentage: showsUsedPercentage,
+                            activity: monitor.activityIntervals
+                        )
+                    }
                 } else if let weeklyWindow = weeklyWindow(in: snapshot) {
                     WeeklyPaceChart(
                         window: weeklyWindow,
@@ -1341,7 +1396,7 @@ private struct BurnDownChart: View {
     let samples: [UsageSample]
     let tokenHistory: [TokenDay]
     let fetchedAt: Date
-    let forecast: Forecast
+    let forecast: Forecast?
     let safetyBuffer: Double
     let showsUsedPercentage: Bool
     let activity: [ActivityInterval]
@@ -1381,7 +1436,8 @@ private struct BurnDownChart: View {
     }
 
     private var currentColor: Color {
-        forecast.currentPercentPerDay > forecast.historicalPercentPerDay ? .red : .blue
+        guard let forecast else { return .blue }
+        return forecast.currentPercentPerDay > forecast.historicalPercentPerDay ? .red : .blue
     }
 
     private var observedEndpointColor: Color {
@@ -1406,11 +1462,19 @@ private struct BurnDownChart: View {
     }
 
     private var currentProjection: [BurnPoint] {
-        projection(rate: forecast.currentPercentPerDay, remainingAtReset: forecast.expectedRemainingAtReset)
+        guard let forecast else { return [] }
+        return projection(
+            rate: forecast.currentPercentPerDay,
+            remainingAtReset: forecast.expectedRemainingAtReset
+        )
     }
 
     private var historicalProjection: [BurnPoint] {
-        projection(rate: forecast.historicalPercentPerDay, remainingAtReset: forecast.historicalRemainingAtReset)
+        guard let forecast else { return [] }
+        return projection(
+            rate: forecast.historicalPercentPerDay,
+            remainingAtReset: forecast.historicalRemainingAtReset
+        )
     }
 
     private var xAxisDates: [Date] {
@@ -1423,6 +1487,10 @@ private struct BurnDownChart: View {
         }
         dates.append(window.resetsAt)
         return dates
+    }
+
+    private var targetRemainingAtEnd: Double {
+        forecast == nil ? 0 : safetyBuffer
     }
 
     private var hoverSegments: [BurnDownHoverSegment] {
@@ -1459,14 +1527,16 @@ private struct BurnDownChart: View {
                 if observedSegments.contains(where: \.isFastMode) {
                     ChartLegendItem(label: "Fast (2×)", color: .orange)
                 }
-                ChartLegendItem(label: "Current", color: currentColor, dash: [7, 3])
-                ChartLegendItem(label: "Historical", color: .secondary, dash: [2, 3])
+                if forecast != nil {
+                    ChartLegendItem(label: "Current", color: currentColor, dash: [7, 3])
+                    ChartLegendItem(label: "Historical", color: .secondary, dash: [2, 3])
+                }
             }
 
             Chart {
                 ForEach([
                     BurnPoint(date: window.startsAt, remaining: 100),
-                    BurnPoint(date: window.resetsAt, remaining: safetyBuffer)
+                    BurnPoint(date: window.resetsAt, remaining: targetRemainingAtEnd)
                 ]) { point in
                     LineMark(
                         x: .value("Time", point.date),
@@ -1510,31 +1580,33 @@ private struct BurnDownChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [7, 3]))
                 }
 
-                RuleMark(x: .value("Now", fetchedAt))
-                    .foregroundStyle(Color.secondary.opacity(0.35))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                if forecast != nil {
+                    RuleMark(x: .value("Now", fetchedAt))
+                        .foregroundStyle(Color.secondary.opacity(0.35))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
 
-                PointMark(
-                    x: .value("Now", fetchedAt),
-                    y: .value("Usage now", displayedPercent(window.remainingPercent))
-                )
-                .foregroundStyle(observedEndpointColor)
-                .symbolSize(18)
-                .annotation(position: .trailing, spacing: 5) {
-                    Text("Now")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background {
-                            Capsule()
-                                .fill(.regularMaterial)
-                                .opacity(0.7)
+                    PointMark(
+                        x: .value("Now", fetchedAt),
+                        y: .value("Usage now", displayedPercent(window.remainingPercent))
+                    )
+                    .foregroundStyle(observedEndpointColor)
+                    .symbolSize(18)
+                    .annotation(position: .trailing, spacing: 5) {
+                        Text("Now")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background {
+                                Capsule()
+                                    .fill(.regularMaterial)
+                                    .opacity(0.7)
+                            }
                         }
-                }
+                    }
 
                 PointMark(
                     x: .value("Reset", window.resetsAt),
-                    y: .value("Target", displayedPercent(safetyBuffer))
+                    y: .value("Target", displayedPercent(targetRemainingAtEnd))
                 )
                 .foregroundStyle(Color.green)
                 .symbolSize(38)
@@ -1593,12 +1665,15 @@ private struct BurnDownChart: View {
             }
             .frame(height: 190)
             .padding(.horizontal, 8)
-            .accessibilityLabel("Usage forecast")
+            .accessibilityLabel(forecast == nil ? "Previous usage window" : "Usage forecast")
             .accessibilityValue(accessibilityValue)
         }
     }
 
     private var accessibilityValue: String {
+        guard let forecast else {
+            return "The window ended with \(Int(displayedPercent(window.remainingPercent).rounded())) percent \(showsUsedPercentage ? "used" : "remaining")."
+        }
         if showsUsedPercentage {
             return "Now has \(Int(displayedPercent(window.remainingPercent).rounded())) percent used. At reset, the current pace reaches \(Int(displayedPercent(forecast.expectedRemainingAtReset).rounded())) percent used and the historical pace reaches \(Int(displayedPercent(forecast.historicalRemainingAtReset).rounded())) percent used."
         }

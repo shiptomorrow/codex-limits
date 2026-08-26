@@ -119,6 +119,11 @@ final class UsageMonitor: ObservableObject {
         return UsageReadingValidation.samples(samples, matchingReset: reset)
     }
 
+    var historicalUsageWindows: [HistoricalUsageWindow] {
+        guard let currentWindow = snapshot?.mainLimit.window else { return [] }
+        return UsageReadingValidation.historicalWindows(in: samples, before: currentWindow)
+    }
+
     var lastUsageChangeAt: Date? {
         currentWindowSamples.last?.observedAt ?? snapshot?.fetchedAt
     }

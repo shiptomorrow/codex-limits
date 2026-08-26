@@ -8,18 +8,26 @@ import sys
 import traceback
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 GUARD_LENGTH = 4096
 MAXIMUM_SESSION_FILE_SIZE = 50_000_000
 
 
 def empty_events():
-    return {"starts": [], "completions": [], "token_times": [], "mode_changes": []}
+    return {
+        "starts": [],
+        "completions": [],
+        "token_times": [],
+        "mode_changes": [],
+        "is_subagent": None,
+    }
 
 
 def append_events(destination, source):
-    for key in destination:
+    for key in ("starts", "completions", "token_times", "mode_changes"):
         destination[key].extend(source[key])
+    if source["is_subagent"] is not None:
+        destination["is_subagent"] = source["is_subagent"]
 
 
 def timestamp_seconds(value):
@@ -32,8 +40,24 @@ def timestamp_seconds(value):
 
 
 def parse_line(line):
-    if b'"event_msg"' not in line:
+    is_session_metadata = b'"session_meta"' in line
+    if not is_session_metadata and b'"event_msg"' not in line:
         return None
+    if is_session_metadata:
+        try:
+            obj = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        payload = obj.get("payload")
+        if obj.get("type") != "session_meta" or not isinstance(payload, dict):
+            return None
+        events = empty_events()
+        source = payload.get("source")
+        events["is_subagent"] = payload.get("thread_source") == "subagent" or (
+            isinstance(source, dict) and "subagent" in source
+        )
+        return events
+
     markers = (
         b'"task_started"',
         b'"task_complete"',
@@ -49,8 +73,8 @@ def parse_line(line):
     payload = obj.get("payload")
     if not isinstance(payload, dict):
         return None
-    event_type = payload.get("type")
     events = empty_events()
+    event_type = payload.get("type")
 
     if event_type == "thread_settings_applied":
         settings = payload.get("thread_settings")
@@ -176,7 +200,7 @@ def poison(cache_path, store, detail):
     save_cache(cache_path, store)
     raise RuntimeError(
         f"Codex changed previously parsed session data ({detail}). "
-        "Delete ~/.codex/codex-limits/remote-events-v1.json to rebuild the remote cache."
+        "Delete ~/.codex/codex-limits/remote-events-v2.json to rebuild the remote cache."
     )
 
 
@@ -193,7 +217,7 @@ def update_cache(cache_path, files):
         raise RuntimeError(
             "Remote activity cache is marked corrupt: "
             + store["corruption_message"]
-            + ". Delete ~/.codex/codex-limits/remote-events-v1.json to rebuild it."
+            + ". Delete ~/.codex/codex-limits/remote-events-v2.json to rebuild it."
         )
 
     changed = False
@@ -260,6 +284,7 @@ def split_interval(start, end, changes, inherited_changes):
 
 
 def intervals(entries, since, now):
+    entries = [entry for entry in entries if entry["events"].get("is_subagent") is not True]
     starts = {}
     completed_ids = set()
     completed = []
@@ -310,8 +335,8 @@ def main():
     home = pathlib.Path.home()
     cache_directory = home / ".codex" / "codex-limits"
     cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cache_path = cache_directory / "remote-events-v1.json"
-    lock_path = cache_directory / "remote-events-v1.lock"
+    cache_path = cache_directory / "remote-events-v2.json"
+    lock_path = cache_directory / "remote-events-v2.lock"
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         files = selected_files(since, now, home)

@@ -5,6 +5,10 @@ enum CodexClientError: LocalizedError, Equatable {
     case invalidResponse
     case mainLimitMissing
     case timedOut
+    case authenticationFailed
+    case connectionFailed
+    case serviceUnavailable
+    case rpcError
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +20,14 @@ enum CodexClientError: LocalizedError, Equatable {
             "Codex did not return a usable limit. Make sure Codex CLI is signed in."
         case .timedOut:
             "Codex took too long to respond. Try refreshing again."
+        case .authenticationFailed:
+            "Codex CLI sign-in expired. Sign in again and try refreshing."
+        case .connectionFailed:
+            "Codex couldn’t reach the usage service. Check your internet connection and try refreshing."
+        case .serviceUnavailable:
+            "Codex usage service is temporarily unavailable. Try refreshing again shortly."
+        case .rpcError:
+            "Codex usage service returned an error. Try refreshing again."
         }
     }
 }
@@ -362,10 +374,37 @@ final class CodexClient {
                 "Codex app-server returned an RPC error",
                 details: String(decoding: data, as: UTF8.self)
             )
-            pending.continuation.resume(throwing: CodexClientError.invalidResponse)
+            let message = (object["error"] as? [String: Any])?["message"] as? String
+            pending.continuation.resume(throwing: Self.error(forRPCMessage: message))
         } else {
             pending.continuation.resume(returning: data)
         }
+    }
+
+    nonisolated static func error(forRPCMessage message: String?) -> CodexClientError {
+        guard let message else { return .rpcError }
+        let normalized = message.lowercased()
+
+        if normalized.contains("401 unauthorized")
+            || normalized.contains("token_expired")
+            || normalized.contains("token is expired") {
+            return .authenticationFailed
+        }
+        if normalized.contains("error sending request")
+            || normalized.contains("connection failed")
+            || normalized.contains("connection refused") {
+            return .connectionFailed
+        }
+        if normalized.contains("500 internal server error")
+            || normalized.contains("502 bad gateway")
+            || normalized.contains("503 service unavailable")
+            || normalized.contains("504 gateway timeout") {
+            return .serviceUnavailable
+        }
+        if normalized.contains("timed out") || normalized.contains("timeout") {
+            return .timedOut
+        }
+        return .rpcError
     }
 
     private func cancelRequest(_ id: Int) {

@@ -127,9 +127,34 @@ final class CodexClientTests: XCTestCase {
             _ = try await client.fetch()
             XCTFail("Expected the server error to be reported")
         } catch let error as CodexClientError {
-            XCTAssertEqual(error, .invalidResponse)
+            XCTAssertEqual(error, .rpcError)
         }
         XCTAssertEqual(try fixture.launchCount(), 1)
+    }
+
+    func testClassifiesRPCFailuresSeparatelyFromInvalidResponses() {
+        XCTAssertEqual(
+            CodexClient.error(forRPCMessage: "Provided authentication token is expired."),
+            .authenticationFailed
+        )
+        XCTAssertEqual(
+            CodexClient.error(
+                forRPCMessage: "failed to fetch codex rate limits: error sending request for url"
+            ),
+            .connectionFailed
+        )
+        XCTAssertEqual(
+            CodexClient.error(forRPCMessage: "GET failed: 503 Service Unavailable"),
+            .serviceUnavailable
+        )
+        XCTAssertEqual(
+            CodexClient.error(forRPCMessage: "token usage profile fetch timed out"),
+            .timedOut
+        )
+        XCTAssertEqual(
+            CodexClient.error(forRPCMessage: "unexpected server failure"),
+            .rpcError
+        )
     }
 
     private func makeServerFixture(

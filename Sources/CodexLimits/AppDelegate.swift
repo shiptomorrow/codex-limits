@@ -21,13 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         LoginItem.enableByDefault()
 
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        guard let button = statusItem.button else { return }
-
-        button.target = self
-        button.action = #selector(togglePopover)
-        button.sendAction(on: [.leftMouseUp])
-        button.title = ""
-        button.image = nil
 
         let image = NSImage(
             systemSymbolName: "gauge.with.dots.needle.50percent",
@@ -35,13 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         image?.isTemplate = true
 
-        let statusContentView = StatusItemContentView(image: image)
-        statusContentView.translatesAutoresizingMaskIntoConstraints = false
-        button.addSubview(statusContentView)
-        NSLayoutConstraint.activate([
-            statusContentView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
-            statusContentView.centerYAnchor.constraint(equalTo: button.centerYAnchor, constant: -0.5)
-        ])
+        let statusContentView = StatusItemContentView(image: image, statusItem: statusItem)
+        statusContentView.target = self
+        statusContentView.action = #selector(togglePopover)
+        statusItem.view = statusContentView
 
         let content = MenuContentView(
             monitor: monitor,
@@ -60,17 +50,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .sink { [weak self] _ in self?.updateStatusItem() }
 
         activityErrorCancellable = monitor.$activityErrorMessage
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusItem() }
 
         usageErrorCancellable = monitor.$usageReadFailed
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusItem() }
 
+        let initialPresentation = StatusItemPresentation.current
         preferencesCancellable = NotificationCenter.default
             .publisher(for: UserDefaults.didChangeNotification)
+            .map { _ in StatusItemPresentation.current }
+            .prepend(initialPresentation)
+            .removeDuplicates()
+            .dropFirst()
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.updateStatusItem() }
+            .sink { [weak self] presentation in
+                self?.updateStatusItem(presentation: presentation)
+            }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -82,31 +81,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidShow(_ notification: Notification) {
+        statusContentView?.isHighlighted = true
         installClickAwayMonitors()
     }
 
     func popoverDidClose(_ notification: Notification) {
+        statusContentView?.isHighlighted = false
         removeClickAwayMonitors()
     }
 
     @objc private func togglePopover() {
-        guard let button = statusItem?.button else { return }
+        guard let statusContentView else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.show(
+                relativeTo: statusContentView.bounds,
+                of: statusContentView,
+                preferredEdge: .minY
+            )
             popover.contentViewController?.view.window?.makeKey()
         }
     }
 
-    private func updateStatusItem() {
+    private func updateStatusItem(
+        presentation: StatusItemPresentation = .current
+    ) {
         guard let statusItem, let statusContentView else { return }
-
-        statusContentView.title = monitor.menuBarText
-        statusContentView.spacing = StatusItemPreferences.spacing
-        statusContentView.showsIcon = StatusItemPreferences.showsIcon
-        statusContentView.layoutSubtreeIfNeeded()
-        statusItem.length = ceil(statusContentView.fittingSize.width)
+        let width = statusContentView.update(
+            title: monitor.menuBarText,
+            spacing: presentation.spacing,
+            showsIcon: presentation.showsIcon
+        )
+        statusItem.length = width
     }
 
     private func showSettings() {
@@ -175,47 +182,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             candidateWindow = window.sheetParent ?? window.parent
         }
 
-        guard let button = statusItem?.button, eventWindow === button.window else {
+        guard let statusContentView, eventWindow === statusContentView.window else {
             return false
         }
-        let pointInButton = button.convert(event.locationInWindow, from: nil)
-        return button.bounds.contains(pointInButton)
+        let pointInStatusItem = statusContentView.convert(event.locationInWindow, from: nil)
+        return statusContentView.bounds.contains(pointInStatusItem)
+    }
+}
+
+enum StatusItemPreferences {
+    static let spacingKey = "menuBarIconTextSpacing"
+    static let showsIconKey = "menuBarShowsIcon"
+
+    static var spacing: CGFloat {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: spacingKey) != nil else { return 4 }
+        return CGFloat(min(max(defaults.double(forKey: spacingKey), 0), 12))
+    }
+
+    static var showsIcon: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: showsIconKey) != nil else { return true }
+        return defaults.bool(forKey: showsIconKey)
+    }
+}
+
+private struct StatusItemPresentation: Equatable {
+    let spacing: CGFloat
+    let showsIcon: Bool
+    let showsUsedPercentage: Bool
+
+    static var current: Self {
+        Self(
+            spacing: StatusItemPreferences.spacing,
+            showsIcon: StatusItemPreferences.showsIcon,
+            showsUsedPercentage: UsagePercentageDisplay.showsUsed
+        )
     }
 }
 
 @MainActor
-private final class StatusItemContentView: NSView {
+private final class StatusItemContentView: NSControl {
     private let imageView: NSImageView
     private let titleField = NSTextField(labelWithString: "")
     private let stackView = NSStackView()
+    private weak var statusItem: NSStatusItem?
 
-    var title: String {
-        get { titleField.stringValue }
+    override var isHighlighted: Bool {
+        get { super.isHighlighted }
         set {
-            titleField.stringValue = newValue
-            invalidateIntrinsicContentSize()
+            if super.isHighlighted != newValue {
+                super.isHighlighted = newValue
+                let foregroundColor: NSColor = newValue ? .selectedMenuItemTextColor : .labelColor
+                imageView.contentTintColor = foregroundColor
+                titleField.textColor = foregroundColor
+                needsDisplay = true
+            }
         }
     }
 
-    var spacing: CGFloat {
-        get { stackView.spacing }
-        set {
-            stackView.spacing = newValue
-            invalidateIntrinsicContentSize()
-        }
-    }
-
-    var showsIcon: Bool {
-        get { !imageView.isHidden }
-        set {
-            imageView.isHidden = !newValue
-            invalidateIntrinsicContentSize()
-        }
-    }
-
-    init(image: NSImage?) {
+    init(image: NSImage?, statusItem: NSStatusItem) {
         imageView = NSImageView(image: image ?? NSImage())
-        super.init(frame: .zero)
+        self.statusItem = statusItem
+        super.init(frame: NSRect(
+            x: 0,
+            y: 0,
+            width: 0,
+            height: NSStatusBar.system.thickness
+        ))
 
         imageView.imageScaling = .scaleProportionallyDown
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -242,10 +276,8 @@ private final class StatusItemContentView: NSView {
         addSubview(stackView)
 
         NSLayoutConstraint.activate([
-            stackView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stackView.topAnchor.constraint(equalTo: topAnchor),
-            stackView.bottomAnchor.constraint(equalTo: bottomAnchor)
+            stackView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stackView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -0.5)
         ])
     }
 
@@ -254,29 +286,38 @@ private final class StatusItemContentView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var intrinsicContentSize: NSSize {
-        stackView.fittingSize
+    func update(title: String, spacing: CGFloat, showsIcon: Bool) -> CGFloat {
+        if titleField.stringValue != title {
+            titleField.stringValue = title
+        }
+        if stackView.spacing != spacing {
+            stackView.spacing = spacing
+        }
+        if imageView.isHidden == showsIcon {
+            imageView.isHidden = !showsIcon
+        }
+
+        layoutSubtreeIfNeeded()
+        let width = ceil(stackView.fittingSize.width)
+        if frame.width != width {
+            frame.size.width = width
+        }
+        return width
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        statusItem?.drawStatusBarBackground(in: bounds, withHighlight: isHighlighted)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isHighlighted = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        sendAction(action, to: target)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
-    }
-}
-
-enum StatusItemPreferences {
-    static let spacingKey = "menuBarIconTextSpacing"
-    static let showsIconKey = "menuBarShowsIcon"
-
-    static var spacing: CGFloat {
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: spacingKey) != nil else { return 4 }
-        return CGFloat(min(max(defaults.double(forKey: spacingKey), 0), 12))
-    }
-
-
-    static var showsIcon: Bool {
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: showsIconKey) != nil else { return true }
-        return defaults.bool(forKey: showsIconKey)
+        bounds.contains(point) ? self : nil
     }
 }

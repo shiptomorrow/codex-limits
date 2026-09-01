@@ -14,13 +14,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var usageErrorCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
     private var settingsWindow: NSWindow?
-    private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
+    private var isPopoverOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LoginItem.enableByDefault()
 
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        guard let button = statusItem.button else { return }
+
+        button.target = self
+        button.action = #selector(togglePopover)
+        button.sendAction(on: [.leftMouseUp])
+        button.title = ""
+        button.image = nil
 
         let image = NSImage(
             systemSymbolName: "gauge.with.dots.needle.50percent",
@@ -28,10 +35,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         image?.isTemplate = true
 
-        let statusContentView = StatusItemContentView(image: image, statusItem: statusItem)
-        statusContentView.target = self
-        statusContentView.action = #selector(togglePopover)
-        statusItem.view = statusContentView
+        let statusContentView = StatusItemContentView(image: image)
+        statusContentView.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(statusContentView)
+        NSLayoutConstraint.activate([
+            statusContentView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            statusContentView.centerYAnchor.constraint(equalTo: button.centerYAnchor, constant: -0.5)
+        ])
 
         let content = MenuContentView(
             monitor: monitor,
@@ -73,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        removeClickAwayMonitors()
+        removeClickAwayMonitor()
         monitor.shutdown()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
@@ -81,23 +91,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidShow(_ notification: Notification) {
-        statusContentView?.isHighlighted = true
-        installClickAwayMonitors()
+        installClickAwayMonitor()
     }
 
     func popoverDidClose(_ notification: Notification) {
-        statusContentView?.isHighlighted = false
-        removeClickAwayMonitors()
+        isPopoverOpen = false
+        removeClickAwayMonitor()
     }
 
     @objc private func togglePopover() {
-        guard let statusContentView else { return }
-        if popover.isShown {
-            popover.performClose(nil)
+        guard let button = statusItem?.button else { return }
+        if isPopoverOpen {
+            closePopover()
         } else {
+            isPopoverOpen = true
             popover.show(
-                relativeTo: statusContentView.bounds,
-                of: statusContentView,
+                relativeTo: button.bounds,
+                of: button,
                 preferredEdge: .minY
             )
             popover.contentViewController?.view.window?.makeKey()
@@ -132,8 +142,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
-    private func installClickAwayMonitors() {
-        guard localMouseMonitor == nil, globalMouseMonitor == nil else { return }
+    private func installClickAwayMonitor() {
+        guard globalMouseMonitor == nil else { return }
 
         let mouseEvents: NSEvent.EventTypeMask = [
             .leftMouseDown,
@@ -141,52 +151,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .otherMouseDown
         ]
 
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseEvents) {
-            [weak self] event in
-            guard let self else { return event }
-            if !self.isProtectedClick(event) {
-                self.popover.performClose(nil)
-            }
-            return event
-        }
-
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) {
             [weak self] _ in
-            self?.popover.performClose(nil)
+            guard let self, !self.isStatusItemClick else { return }
+            self.closePopover()
         }
     }
 
-    private func removeClickAwayMonitors() {
-        if let localMouseMonitor {
-            NSEvent.removeMonitor(localMouseMonitor)
-            self.localMouseMonitor = nil
-        }
+    private var isStatusItemClick: Bool {
+        guard let button = statusItem?.button, let window = button.window else { return false }
+        let buttonFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return buttonFrame.contains(NSEvent.mouseLocation)
+    }
+
+    private func closePopover() {
+        isPopoverOpen = false
+        popover.close()
+    }
+
+    private func removeClickAwayMonitor() {
         if let globalMouseMonitor {
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
         }
-    }
-
-    private func isProtectedClick(_ event: NSEvent) -> Bool {
-        guard let eventWindow = event.window else { return false }
-
-        if eventWindow === popover.contentViewController?.view.window {
-            return true
-        }
-
-        var candidateWindow: NSWindow? = eventWindow
-        while let window = candidateWindow {
-            if window === settingsWindow {
-                return true
-            }
-            candidateWindow = window.sheetParent ?? window.parent
-        }
-
-        guard let statusContentView, eventWindow === statusContentView.window else {
-            return false
-        }
-        let pointInStatusItem = statusContentView.convert(event.locationInWindow, from: nil)
-        return statusContentView.bounds.contains(pointInStatusItem)
     }
 }
 
@@ -222,34 +209,14 @@ private struct StatusItemPresentation: Equatable {
 }
 
 @MainActor
-private final class StatusItemContentView: NSControl {
+private final class StatusItemContentView: NSView {
     private let imageView: NSImageView
     private let titleField = NSTextField(labelWithString: "")
     private let stackView = NSStackView()
-    private weak var statusItem: NSStatusItem?
 
-    override var isHighlighted: Bool {
-        get { super.isHighlighted }
-        set {
-            if super.isHighlighted != newValue {
-                super.isHighlighted = newValue
-                let foregroundColor: NSColor = newValue ? .selectedMenuItemTextColor : .labelColor
-                imageView.contentTintColor = foregroundColor
-                titleField.textColor = foregroundColor
-                needsDisplay = true
-            }
-        }
-    }
-
-    init(image: NSImage?, statusItem: NSStatusItem) {
+    init(image: NSImage?) {
         imageView = NSImageView(image: image ?? NSImage())
-        self.statusItem = statusItem
-        super.init(frame: NSRect(
-            x: 0,
-            y: 0,
-            width: 0,
-            height: NSStatusBar.system.thickness
-        ))
+        super.init(frame: .zero)
 
         imageView.imageScaling = .scaleProportionallyDown
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -276,14 +243,20 @@ private final class StatusItemContentView: NSControl {
         addSubview(stackView)
 
         NSLayoutConstraint.activate([
-            stackView.centerXAnchor.constraint(equalTo: centerXAnchor),
-            stackView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -0.5)
+            stackView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stackView.topAnchor.constraint(equalTo: topAnchor),
+            stackView.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        stackView.fittingSize
     }
 
     func update(title: String, spacing: CGFloat, showsIcon: Bool) -> CGFloat {
@@ -299,25 +272,11 @@ private final class StatusItemContentView: NSControl {
 
         layoutSubtreeIfNeeded()
         let width = ceil(stackView.fittingSize.width)
-        if frame.width != width {
-            frame.size.width = width
-        }
+        invalidateIntrinsicContentSize()
         return width
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        statusItem?.drawStatusBarBackground(in: bounds, withHighlight: isHighlighted)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        isHighlighted = true
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        sendAction(action, to: target)
-    }
-
     override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(point) ? self : nil
+        nil
     }
 }

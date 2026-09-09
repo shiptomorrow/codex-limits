@@ -35,7 +35,6 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var activityErrorMessage: String?
     @Published private(set) var remoteActivityErrorMessage: String?
-    @Published private(set) var activityCacheIntegrityFailed = false
     @Published private(set) var usageReadFailed = false
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
@@ -105,7 +104,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     var menuBarText: String {
-        if activityCacheIntegrityFailed || usageReadFailed { return "-%" }
+        if usageReadFailed { return "-%" }
         guard let remaining = snapshot?.mainLimit.window.remainingPercent else { return "—" }
         let displayed = UsagePercentageDisplay.value(
             remainingPercent: remaining,
@@ -744,14 +743,12 @@ final class UsageMonitor: ObservableObject {
             do {
                 try await self.updateDailyRuntime(now: snapshot.fetchedAt)
                 try await self.updateWeeklyPace(from: snapshot)
-                self.activityCacheIntegrityFailed = false
                 self.activityErrorMessage = nil
             } catch {
                 self.weeklyPaceHours = nil
                 self.weeklyPacePoints = []
                 self.dailyRuntimeHours = nil
                 self.historicalDailyRuntimeHours = nil
-                self.activityCacheIntegrityFailed = error is CodexActivityReaderError
                 self.activityErrorMessage = error.localizedDescription
                 self.logger.error("Activity analysis failed: \(error.localizedDescription, privacy: .public)")
             }

@@ -1,16 +1,5 @@
 import Foundation
 
-enum CodexActivityReaderError: LocalizedError, Equatable {
-    case cacheIntegrity(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .cacheIntegrity(detail):
-            "Codex changed previously parsed session data (\(detail)). Pace analysis is paused; the activity cache can no longer trust Codex's append-only session format."
-        }
-    }
-}
-
 struct CodexActivityCache {
     private struct SessionFile {
         let url: URL
@@ -83,12 +72,13 @@ struct CodexActivityCache {
 
     func loadIntervals(since: Date, now: Date) throws -> [ActivityInterval] {
         var store = loadStore()
-        if let corruptionMessage = store.corruptionMessage {
-            throw CodexActivityReaderError.cacheIntegrity(corruptionMessage)
+        var changed = store.corruptionMessage != nil
+        if changed {
+            // Older versions persisted a failure after any session rewrite.
+            store = Store(version: Self.formatVersion, corruptionMessage: nil, files: [:])
         }
 
         let files = sessionFiles(since: since, now: now)
-        var changed = false
 
         for file in files {
             let key = file.cacheKey
@@ -99,26 +89,19 @@ struct CodexActivityCache {
             let size = Int64(values.fileSize ?? 0)
             let modificationTime = values.contentModificationDate?.timeIntervalSince1970
 
-            if var entry = store.files[key] {
-                if size < entry.observedSize {
-                    try poison(&store, detail: "\(file.url.lastPathComponent) became smaller")
-                }
-                if size == entry.observedSize {
-                    if modificationTime != entry.modificationTime {
-                        try poison(
-                            &store,
-                            detail: "\(file.url.lastPathComponent) changed without growing"
-                        )
-                    }
+            var cached = store.files[key]
+            if let entry = cached {
+                if size == entry.observedSize && modificationTime == entry.modificationTime {
                     continue
                 }
-
-                guard try guardsMatch(entry, file: file.url) else {
-                    try poison(
-                        &store,
-                        detail: "\(file.url.lastPathComponent) rewrote its cached prefix"
-                    )
+                let canAppend = try size > entry.observedSize && guardsMatch(entry, file: file.url)
+                if !canAppend {
+                    // Reparse rewritten files instead of appending to stale events.
+                    cached = nil
                 }
+            }
+
+            if var entry = cached {
                 let update = try parse(file: file.url, from: entry.parsedOffset)
                 entry.events.append(update.events)
                 entry.parsedOffset += update.consumedBytes
@@ -168,12 +151,6 @@ struct CodexActivityCache {
             withIntermediateDirectories: true
         )
         try JSONEncoder().encode(store).write(to: cacheURL, options: .atomic)
-    }
-
-    private func poison(_ store: inout Store, detail: String) throws -> Never {
-        store.corruptionMessage = detail
-        try save(store)
-        throw CodexActivityReaderError.cacheIntegrity(detail)
     }
 
     private func parse(file: URL, from offset: Int64) throws -> (events: Events, consumedBytes: Int64) {

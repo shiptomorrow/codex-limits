@@ -90,40 +90,84 @@ final class WeeklyPaceTests: XCTestCase {
         )])
     }
 
-    func testActivityCachePoisonsItselfWhenCachedPrefixChanges() async throws {
-        let fixture = try ActivityCacheFixture()
-        defer { fixture.remove() }
-        let start = fixture.now.addingTimeInterval(-600)
-        let original = fixture.taskStarted(turnID: "turn-1", at: start)
-        try fixture.write([
-            original,
-            fixture.tokenCount(at: start.addingTimeInterval(60))
-        ])
-        _ = try await fixture.load()
-
-        let rewritten = original.replacingOccurrences(of: "turn-1", with: "turn-2")
-        try fixture.write([
-            rewritten,
-            fixture.tokenCount(at: start.addingTimeInterval(60)),
-            fixture.tokenCount(at: start.addingTimeInterval(120))
-        ])
-
-        do {
+    func testActivityCacheReplacesEventsWhenSessionIsRewritten() async throws {
+        let scenarios = [
+            (name: "smaller", prefix: "", oldTail: String(repeating: " ", count: 1_000), newTail: ""),
+            (name: "same size", prefix: "", oldTail: "", newTail: ""),
+            (name: "changed prefix", prefix: "", oldTail: "", newTail: String(repeating: " ", count: 1_000)),
+            (name: "changed suffix", prefix: String(repeating: " ", count: 9_000), oldTail: "", newTail: String(repeating: " ", count: 1_000))
+        ]
+        for scenario in scenarios {
+            let fixture = try ActivityCacheFixture()
+            defer { fixture.remove() }
+            let oldStart = fixture.now.addingTimeInterval(-600)
+            let newStart = fixture.now.addingTimeInterval(-300)
+            try fixture.write([
+                scenario.prefix,
+                fixture.taskStarted(turnID: "turn-1", at: oldStart),
+                fixture.tokenCount(at: oldStart.addingTimeInterval(60)),
+                scenario.oldTail
+            ])
+            try FileManager.default.setAttributes(
+                [.modificationDate: fixture.now], ofItemAtPath: fixture.sessionURL.path
+            )
             _ = try await fixture.load()
-            XCTFail("Expected a cached-prefix integrity error")
-        } catch let error as CodexActivityReaderError {
-            guard case .cacheIntegrity = error else {
-                return XCTFail("Unexpected activity error: \(error)")
-            }
+
+            try fixture.write([
+                scenario.prefix,
+                fixture.taskStarted(turnID: "turn-2", at: newStart),
+                fixture.tokenCount(at: newStart.addingTimeInterval(120)),
+                scenario.newTail
+            ])
+            let rebuilt = try await fixture.load()
+            let reread = try await fixture.load()
+            XCTAssertEqual(rebuilt, [ActivityInterval(
+                start: newStart, end: newStart.addingTimeInterval(120)
+            )], scenario.name)
+            XCTAssertEqual(reread, rebuilt, scenario.name)
+
+            try fixture.append(fixture.tokenCount(at: newStart.addingTimeInterval(180)))
+            let appended = try await fixture.load()
+            XCTAssertEqual(appended, [ActivityInterval(
+                start: newStart, end: newStart.addingTimeInterval(180)
+            )], scenario.name)
         }
+    }
 
-        do {
+    func testActivityCacheRebuildsPersistedCorruption() async throws {
+        for keepSession in [true, false] {
+            let fixture = try ActivityCacheFixture()
+            defer { fixture.remove() }
+            let start = fixture.now.addingTimeInterval(-600)
+            try fixture.write([
+                fixture.taskStarted(turnID: "turn-1", at: start),
+                fixture.tokenCount(at: start.addingTimeInterval(60))
+            ])
             _ = try await fixture.load()
-            XCTFail("Expected the persisted integrity error")
-        } catch let error as CodexActivityReaderError {
-            guard case .cacheIntegrity = error else {
-                return XCTFail("Unexpected persisted activity error: \(error)")
+            var store = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: fixture.cacheURL)
+            ) as? [String: Any])
+            store["corruptionMessage"] = "session became smaller"
+            try JSONSerialization.data(withJSONObject: store).write(to: fixture.cacheURL)
+            if keepSession {
+                try fixture.write([
+                    fixture.taskStarted(turnID: "turn-2", at: start),
+                    fixture.tokenCount(at: start.addingTimeInterval(120))
+                ])
+            } else {
+                try FileManager.default.removeItem(at: fixture.sessionURL)
             }
+
+            let rebuilt = try await fixture.load()
+            XCTAssertEqual(rebuilt, keepSession ? [ActivityInterval(
+                start: start, end: start.addingTimeInterval(120)
+            )] : [])
+            let saved = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: fixture.cacheURL)
+            ) as? [String: Any])
+            XCTAssertNil(saved["corruptionMessage"])
+            let reread = try await fixture.load()
+            XCTAssertEqual(reread, rebuilt)
         }
     }
 

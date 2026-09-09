@@ -195,15 +195,6 @@ def save_cache(cache_path, store):
     os.replace(temporary, cache_path)
 
 
-def poison(cache_path, store, detail):
-    store["corruption_message"] = detail
-    save_cache(cache_path, store)
-    raise RuntimeError(
-        f"Codex changed previously parsed session data ({detail}). "
-        "Delete ~/.codex/codex-limits/remote-events-v2.json to rebuild the remote cache."
-    )
-
-
 def update_cache(cache_path, files):
     try:
         with cache_path.open("r", encoding="utf-8") as handle:
@@ -213,32 +204,30 @@ def update_cache(cache_path, files):
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         store = {"version": CACHE_VERSION, "corruption_message": None, "files": {}}
 
-    if store.get("corruption_message"):
-        raise RuntimeError(
-            "Remote activity cache is marked corrupt: "
-            + store["corruption_message"]
-            + ". Delete ~/.codex/codex-limits/remote-events-v2.json to rebuild it."
-        )
+    changed = store.get("corruption_message") is not None
+    if changed:
+        # Older versions persisted a failure after any session rewrite.
+        store = {"version": CACHE_VERSION, "corruption_message": None, "files": {}}
 
-    changed = False
     for key, path in files:
         stat = path.stat()
         size = stat.st_size
         modification_time = stat.st_mtime_ns
         entry = store["files"].get(key)
         if entry is not None:
-            if size < entry["observed_size"]:
-                poison(cache_path, store, f"{path.name} became smaller")
-            if size == entry["observed_size"]:
-                if modification_time != entry["modification_time"]:
-                    poison(cache_path, store, f"{path.name} changed without growing")
+            if size == entry["observed_size"] and modification_time == entry["modification_time"]:
                 continue
             parsed_offset = entry["parsed_offset"]
             if (
-                prefix_guard(path, parsed_offset) != entry["prefix_guard"]
+                size <= entry["observed_size"]
+                or prefix_guard(path, parsed_offset) != entry["prefix_guard"]
                 or suffix_guard(path, parsed_offset) != entry["suffix_guard"]
             ):
-                poison(cache_path, store, f"{path.name} rewrote its cached prefix")
+                # Replace this file's events so removed turns are not counted.
+                entry = None
+
+        if entry is not None:
+            parsed_offset = entry["parsed_offset"]
             events, consumed = parse_file(path, parsed_offset)
             append_events(entry["events"], events)
             entry["parsed_offset"] += consumed

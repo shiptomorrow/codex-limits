@@ -13,6 +13,10 @@ enum UsagePercentageDisplay {
     }
 }
 
+enum UsageChartPreferences {
+    static let showsTargetHoverLabelKey = "showTargetHoverLabel"
+}
+
 enum EstimatedRuntimeChartPreferences {
     static let reversesYAxisKey = "reverseEstimatedRuntimeChart"
     static let proratesShortWindowsKey = "prorateShortUsageWindows"

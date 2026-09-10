@@ -1660,7 +1660,16 @@ private struct BurnDownChart: View {
             .chartOverlay { proxy in
                 BurnDownHoverOverlay(
                     proxy: proxy,
-                    segments: hoverSegments
+                    segments: hoverSegments,
+                    target: BurnDownHoverSegment(
+                        startDate: window.startsAt,
+                        endDate: window.resetsAt,
+                        startPercent: displayedPercent(100),
+                        endPercent: displayedPercent(targetRemainingAtEnd),
+                        color: .green,
+                        lastValueChangeDate: window.startsAt,
+                        isStep: false
+                    )
                 )
             }
             .frame(height: 190)
@@ -1747,7 +1756,15 @@ private struct BurnDownChart: View {
 private struct BurnDownHoverOverlay: View {
     let proxy: ChartProxy
     let segments: [BurnDownHoverSegment]
+    let target: BurnDownHoverSegment
+    @AppStorage(UsageChartPreferences.showsTargetHoverLabelKey) private var showsTargetHoverLabel = false
     @State private var hoveredValue: HoveredBurnDownValue?
+
+    private var hoveredTargetPercent: Double? {
+        guard showsTargetHoverLabel, let hoveredValue else { return nil }
+        let percent = target.percent(at: hoveredValue.date)
+        return abs(percent - hoveredValue.percent) > 10 ? percent : nil
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -1764,6 +1781,9 @@ private struct BurnDownHoverOverlay: View {
                         y: plotRect.minY + plotY
                     )
                     let guideStyle = StrokeStyle(lineWidth: 1, dash: [3, 3])
+                    let targetPercent = hoveredTargetPercent
+                    let placesUsageLabelBelow = targetPercent.map { $0 > hoveredValue.percent }
+                        ?? hoveredValue.placesLabelBelow
 
                     Path { path in
                         path.move(to: CGPoint(x: point.x, y: plotRect.minY))
@@ -1792,8 +1812,34 @@ private struct BurnDownHoverOverlay: View {
                         .fixedSize()
                         .position(
                             x: min(max(point.x, plotRect.minX + 28), plotRect.maxX - 28),
-                            y: point.y + (hoveredValue.placesLabelBelow ? 25 : -25)
+                            y: min(max(
+                                point.y + (placesUsageLabelBelow ? 25 : -25),
+                                plotRect.minY + 12
+                            ), plotRect.maxY - 12)
                         )
+
+                    if let targetPercent, let targetY = proxy.position(forY: targetPercent) {
+                        let targetPoint = CGPoint(x: point.x, y: plotRect.minY + targetY)
+
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 6, height: 6)
+                            .position(targetPoint)
+
+                        Text("\(targetPercent.formatted(.number.precision(.fractionLength(targetPercent < 10 ? 1 : 0))))%")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.green)
+                            .weeklyPacePill()
+                            .fixedSize()
+                            .position(
+                                x: min(max(point.x, plotRect.minX + 48), plotRect.maxX - 48),
+                                y: min(max(
+                                    targetPoint.y + (placesUsageLabelBelow ? -25 : 25),
+                                    plotRect.minY + 12
+                                ), plotRect.maxY - 12)
+                            )
+                    }
 
                     HStack(alignment: .firstTextBaseline, spacing: 2) {
                         Text(hoveredValue.formattedDateAndTime)
@@ -1980,6 +2026,7 @@ private struct ChartLegendItem: View {
 
 struct SettingsView: View {
     @ObservedObject var monitor: UsageMonitor
+    @AppStorage(UsageChartPreferences.showsTargetHoverLabelKey) private var showsTargetHoverLabel = false
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = UsageRefreshSchedule.defaultSeconds
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
@@ -2095,6 +2142,9 @@ struct SettingsView: View {
                 .help("Walk backward until this much active runtime is represented, prorating the oldest partial window")
 
                 Toggle("Reverse estimated runtime chart", isOn: $reversesEstimatedRuntimeChart)
+
+                Toggle("Show green target label on hover", isOn: $showsTargetHoverLabel)
+                    .help("Show the target percentage at the cursor when the usage and target lines differ by more than 10 percentage points")
 
                 Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
             }

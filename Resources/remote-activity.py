@@ -4,11 +4,13 @@ import fcntl
 import json
 import os
 import pathlib
+import re
 import sys
 import traceback
 
 
-CACHE_VERSION = 2
+# Reparse older caches, which omitted interruptions and approval timing.
+CACHE_VERSION = 4
 GUARD_LENGTH = 4096
 MAXIMUM_SESSION_FILE_SIZE = 50_000_000
 
@@ -19,12 +21,14 @@ def empty_events():
         "completions": [],
         "token_times": [],
         "mode_changes": [],
+        "approval_calls": [],
+        "tool_results": [],
         "is_subagent": None,
     }
 
 
 def append_events(destination, source):
-    for key in ("starts", "completions", "token_times", "mode_changes"):
+    for key in ("starts", "completions", "token_times", "mode_changes", "approval_calls", "tool_results"):
         destination[key].extend(source[key])
     if source["is_subagent"] is not None:
         destination["is_subagent"] = source["is_subagent"]
@@ -40,6 +44,13 @@ def timestamp_seconds(value):
 
 
 def parse_line(line):
+    if b'"response_item"' in line:
+        try:
+            obj = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if obj.get("type") == "response_item":
+            return parse_tool_timing(obj)
     is_session_metadata = b'"session_meta"' in line
     if not is_session_metadata and b'"event_msg"' not in line:
         return None
@@ -61,6 +72,7 @@ def parse_line(line):
     markers = (
         b'"task_started"',
         b'"task_complete"',
+        b'"turn_aborted"',
         b'"token_count"',
         b'"thread_settings_applied"',
     )
@@ -92,7 +104,7 @@ def parse_line(line):
         if not isinstance(turn_id, str) or not isinstance(started_at, (int, float)):
             return None
         events["starts"].append([turn_id, float(started_at)])
-    elif event_type == "task_complete":
+    elif event_type in ("task_complete", "turn_aborted"):
         turn_id = payload.get("turn_id")
         started_at = payload.get("started_at")
         completed_at = payload.get("completed_at")
@@ -113,6 +125,64 @@ def parse_line(line):
     else:
         return None
     return events
+
+
+def parse_tool_timing(obj):
+    payload = obj.get("payload")
+    date = timestamp_seconds(obj.get("timestamp"))
+    if not isinstance(payload, dict) or date is None:
+        return None
+    call_id = payload.get("call_id")
+    if not isinstance(call_id, str):
+        return None
+    events = empty_events()
+    kind = payload.get("type")
+    if kind in ("custom_tool_call", "function_call"):
+        text = payload.get("input", payload.get("arguments", ""))
+        if not isinstance(text, str) or not re.search(
+            r'''["']?sandbox_permissions["']?\s*:\s*["']require_escalated["']''', text
+        ):
+            return None
+        events["approval_calls"].append([call_id, date])
+    elif kind in ("custom_tool_call_output", "function_call_output"):
+        output = payload.get("output")
+        if not isinstance(output, str):
+            return None
+        # Only trust the outer tool runner's timing, not text inside tool output.
+        match = re.match(r"^Script (?:completed|running[^\n]*)\nWall time ([0-9.]+) seconds\n", output)
+        if match is None:
+            return None
+        try:
+            duration = float(match.group(1))
+        except ValueError:
+            return None
+        events["tool_results"].append([call_id, date, duration])
+    else:
+        return None
+    return events
+
+
+def excluding_approval_waits(start, end, events):
+    result = [(start, end)]
+    for call_id, called_at in events["approval_calls"]:
+        output = next((item for item in events["tool_results"] if item[0] == call_id), None)
+        if output is None:
+            continue
+        resumed_at = output[1] - output[2]
+        # Keep measured execution time and ordinary long-running tools intact.
+        if resumed_at - called_at <= 15 * 60:
+            continue
+        pieces = []
+        for left, right in result:
+            if called_at >= right or resumed_at <= left:
+                pieces.append((left, right))
+                continue
+            if left < called_at:
+                pieces.append((left, called_at))
+            if right > resumed_at:
+                pieces.append((resumed_at, right))
+        result = pieces
+    return result
 
 
 def parse_file(path, offset):
@@ -289,14 +359,13 @@ def intervals(entries, since, now):
 
     result = []
     for start, end, index in completed:
-        result.extend(
-            split_interval(
-                start,
-                end,
+        for left, right in excluding_approval_waits(start, end, entries[index]["events"]):
+            result.extend(split_interval(
+                left,
+                right,
                 entries[index]["events"]["mode_changes"],
                 all_mode_changes,
-            )
-        )
+            ))
     for turn_id, (start, index) in starts.items():
         if turn_id in completed_ids:
             continue
@@ -307,14 +376,13 @@ def intervals(entries, since, now):
         ]
         end = max(token_times) if token_times else start
         if end > start:
-            result.extend(
-                split_interval(
-                    start,
-                    end,
+            for left, right in excluding_approval_waits(start, end, entries[index]["events"]):
+                result.extend(split_interval(
+                    left,
+                    right,
                     entries[index]["events"]["mode_changes"],
                     all_mode_changes,
-                )
-            )
+                ))
     return [item for item in result if item["end"] >= since and item["start"] <= now]
 
 

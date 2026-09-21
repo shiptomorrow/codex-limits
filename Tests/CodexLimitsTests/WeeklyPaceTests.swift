@@ -90,6 +90,99 @@ final class WeeklyPaceTests: XCTestCase {
         )])
     }
 
+    func testInterruptedTurnStopsBeforeLaterActivityInSameSession() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-18_000)
+        let resumed = start.addingTimeInterval(14_400)
+        try fixture.write([
+            fixture.taskStarted(turnID: "interrupted", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(60))
+        ])
+        let cache = CodexActivityCache(
+            sessionsRoot: fixture.sessionsRoot,
+            archivedSessionsRoot: nil,
+            cacheURL: fixture.cacheURL
+        )
+        _ = try cache.loadIntervals(since: start, now: fixture.now)
+        try fixture.append(fixture.taskEnded(
+            turnID: "interrupted", start: start,
+            end: start.addingTimeInterval(120), type: "turn_aborted"
+        ))
+        try fixture.append(fixture.taskStarted(turnID: "resumed", at: resumed))
+        try fixture.append(fixture.tokenCount(at: resumed.addingTimeInterval(60)))
+
+        let intervals = try cache.loadIntervals(since: start, now: fixture.now)
+        let expected = [
+            ActivityInterval(start: start, end: start.addingTimeInterval(120)),
+            ActivityInterval(start: resumed, end: resumed.addingTimeInterval(60))
+        ]
+        XCTAssertEqual(intervals.sorted { $0.start < $1.start }, expected)
+
+        // Simulate a fully parsed old cache that silently dropped the abort.
+        var store = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: fixture.cacheURL)
+        ) as? [String: Any])
+        store["version"] = 3
+        var files = try XCTUnwrap(store["files"] as? [String: [String: Any]])
+        for key in Array(files.keys) {
+            var events = try XCTUnwrap(files[key]?["events"] as? [String: Any])
+            events["completions"] = []
+            files[key]?["events"] = events
+        }
+        store["files"] = files
+        try JSONSerialization.data(withJSONObject: store).write(to: fixture.cacheURL)
+        let rebuilt = try cache.loadIntervals(since: start, now: fixture.now)
+        XCTAssertEqual(rebuilt.sorted { $0.start < $1.start }, expected)
+
+        let reset = fixture.now.addingTimeInterval(86_400)
+        let points = WeeklyPaceCalculator.estimateSeries(
+            samples: [
+                UsageSample(observedAt: start, remainingPercent: 58, resetsAt: reset),
+                UsageSample(observedAt: resumed.addingTimeInterval(60), remainingPercent: 57, resetsAt: reset)
+            ],
+            activity: rebuilt, now: fixture.now, factorInPauses: false,
+            proratesShortWindows: false
+        )
+        XCTAssertEqual(try XCTUnwrap(points.first).hoursPerWeek, 5, accuracy: 0.001)
+    }
+
+    func testActivityCacheExcludesOnlyMeasuredApprovalWaits() async throws {
+        for (requiresApproval, output, removesWait) in [
+            (true, "Script running with cell ID 2\nWall time 31.0 seconds\nOutput:\n", true),
+            (false, "Script running with cell ID 2\nWall time 31.0 seconds\nOutput:\n", false),
+            (true, "Unknown execution time", false),
+            (true, "Script completed\nWall time 14840.0 seconds\nOutput:\n", false)
+        ] {
+            let fixture = try ActivityCacheFixture()
+            defer { fixture.remove() }
+            let start = fixture.now.addingTimeInterval(-15_000)
+            let calledAt = start.addingTimeInterval(10)
+            let returnedAt = start.addingTimeInterval(14_850)
+            let end = start.addingTimeInterval(14_900)
+            let input = requiresApproval
+                ? #"text(await tools.exec_command({sandbox_permissions:"require_escalated"}));"#
+                : #"text(await tools.exec_command({cmd:"build"}));"#
+            try fixture.write([
+                fixture.taskStarted(turnID: "turn", at: start),
+                try fixture.responseItem(at: calledAt, payload: [
+                    "type": "custom_tool_call", "call_id": "call", "input": input
+                ]),
+                try fixture.responseItem(at: returnedAt, payload: [
+                    "type": "custom_tool_call_output", "call_id": "call", "output": output
+                ]),
+                fixture.taskEnded(turnID: "turn", start: start, end: end, type: "task_complete")
+            ])
+            let cache = CodexActivityCache(sessionsRoot: fixture.sessionsRoot, archivedSessionsRoot: nil, cacheURL: fixture.cacheURL)
+            let intervals = try cache.loadIntervals(since: start, now: fixture.now)
+            XCTAssertEqual(intervals, removesWait ? [
+                ActivityInterval(start: start, end: calledAt),
+                ActivityInterval(start: returnedAt.addingTimeInterval(-31), end: end)
+            ] : [ActivityInterval(start: start, end: end)])
+            XCTAssertEqual(try cache.loadIntervals(since: start, now: fixture.now), intervals)
+        }
+    }
+
     func testActivityCacheReplacesEventsWhenSessionIsRewritten() async throws {
         let scenarios = [
             (name: "smaller", prefix: "", oldTail: String(repeating: " ", count: 1_000), newTail: ""),
@@ -1152,6 +1245,17 @@ private struct ActivityCacheFixture {
 
     func taskStarted(turnID: String, at date: Date) -> String {
         #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"\#(turnID)","started_at":\#(date.timeIntervalSince1970)}}"#
+    }
+
+    func taskEnded(turnID: String, start: Date, end: Date, type: String) -> String {
+        #"{"type":"event_msg","payload":{"type":"\#(type)","turn_id":"\#(turnID)","started_at":\#(start.timeIntervalSince1970),"completed_at":\#(end.timeIntervalSince1970)}}"#
+    }
+
+    func responseItem(at date: Date, payload: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "type": "response_item", "timestamp": timestamp(date), "payload": payload
+        ])
+        return String(decoding: data, as: UTF8.self)
     }
 
     func sessionMetadata(threadSource: String, hasSubagentSource: Bool = false) -> String {

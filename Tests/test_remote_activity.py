@@ -110,6 +110,68 @@ class RemoteActivityCacheTests(unittest.TestCase):
         os.utime(self.session, ns=(1_000_000_000, 1_000_000_000))
         self.assertEqual(self.read(), self.expected((100, 200)))
 
+    def test_interrupted_turn_stops_before_later_activity(self):
+        def started(turn_id, date):
+            return json.dumps({
+                "type": "event_msg", "payload": {
+                    "type": "task_started", "turn_id": turn_id, "started_at": date,
+                },
+            }).encode() + b"\n"
+
+        def token(timestamp):
+            return json.dumps({
+                "timestamp": timestamp, "type": "event_msg",
+                "payload": {"type": "token_count"},
+            }).encode() + b"\n"
+
+        self.session.write_bytes(started("interrupted", 100))
+        self.read()
+        with self.session.open("ab") as handle:
+            handle.write(completion("interrupted", 100, 200).replace(
+                b'task_complete', b'turn_aborted'
+            ))
+            handle.write(started("resumed", 700))
+            handle.write(token("1970-01-01T00:13:20Z"))
+        expected = self.expected((100, 200), (700, 800))
+        self.assertEqual(self.read(), expected)
+
+        self.assertEqual(self.read(), expected)
+
+        # A cache with unchanged source files must still recover the lost abort.
+        store = json.loads(self.cache.read_text())
+        store["version"] = 2
+        store["files"]["session"]["events"]["completions"] = []
+        self.cache.write_text(json.dumps(store))
+        self.assertEqual(self.read(), expected)
+
+    def test_removes_only_approval_wait_and_preserves_execution_time(self):
+        for requires_approval, output, expected in [
+            (True, "Script running with cell ID 2\nWall time 31.0 seconds\nOutput:\n", [(100, 110), (14919, 15000)]),
+            (False, "Script running with cell ID 2\nWall time 31.0 seconds\nOutput:\n", [(100, 15000)]),
+            (True, "Unknown execution time", [(100, 15000)]),
+            (True, "Script completed\nWall time 14840.0 seconds\nOutput:\n", [(100, 15000)]),
+        ]:
+            # Use a four-hour approval gap, while retaining a 31-second execution.
+            end = 15_000
+            events = activity.empty_events()
+            events["completions"] = [["turn", 100, end]]
+            call = {
+                "type": "response_item", "timestamp": "1970-01-01T00:01:50Z",
+                "payload": {"type": "custom_tool_call", "call_id": "call", "input":
+                    'text(await tools.exec_command({sandbox_permissions:"require_escalated"}));'
+                    if requires_approval else 'text(await tools.exec_command({cmd:"build"}));'},
+            }
+            result = {
+                "type": "response_item", "timestamp": "1970-01-01T04:09:10Z",
+                "payload": {"type": "custom_tool_call_output", "call_id": "call", "output": output},
+            }
+            for obj in (call, result):
+                parsed = activity.parse_line(json.dumps(obj).encode())
+                if parsed:
+                    activity.append_events(events, parsed)
+            actual = activity.intervals([{"events": events}], 0, 20_000)
+            self.assertEqual([(i["start"], i["end"]) for i in actual], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

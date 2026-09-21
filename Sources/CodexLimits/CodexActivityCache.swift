@@ -28,6 +28,8 @@ struct CodexActivityCache {
         var completions: [TaskCompletion] = []
         var tokenTimes: [Date] = []
         var modeChanges: [ModeChange] = []
+        var approvalCalls: [ApprovalCall] = []
+        var toolResults: [ToolResult] = []
         var isSubagent: Bool?
 
         mutating func append(_ other: Events) {
@@ -35,6 +37,8 @@ struct CodexActivityCache {
             completions += other.completions
             tokenTimes += other.tokenTimes
             modeChanges += other.modeChanges
+            approvalCalls += other.approvalCalls
+            toolResults += other.toolResults
             if let isSubagent = other.isSubagent {
                 self.isSubagent = isSubagent
             }
@@ -57,12 +61,24 @@ struct CodexActivityCache {
         let isFastMode: Bool
     }
 
+    private struct ApprovalCall: Codable {
+        let callID: String
+        let date: Date
+    }
+
+    private struct ToolResult: Codable {
+        let callID: String
+        let date: Date
+        let executionDuration: TimeInterval
+    }
+
     private enum ParsedLine {
         case irrelevant
         case event(Events)
     }
 
-    private static let formatVersion = 3
+    // Reparse older caches, which omitted interruptions and approval timing.
+    private static let formatVersion = 5
     private static let guardLength = 4_096
     private static let maximumSessionFileSize = 50_000_000
 
@@ -180,6 +196,11 @@ struct CodexActivityCache {
     }
 
     private func parseLine(_ line: Data) -> ParsedLine {
+        if line.range(of: Data("\"response_item\"".utf8)) != nil,
+           let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+           object["type"] as? String == "response_item" {
+            return parseToolTiming(object)
+        }
         let isSessionMetadata = line.range(of: Data("\"session_meta\"".utf8)) != nil
         guard isSessionMetadata || line.range(of: Data("\"event_msg\"".utf8)) != nil else {
             return .irrelevant
@@ -200,6 +221,7 @@ struct CodexActivityCache {
         let markers = [
             "\"task_started\"",
             "\"task_complete\"",
+            "\"turn_aborted\"",
             "\"token_count\"",
             "\"thread_settings_applied\""
         ]
@@ -232,7 +254,7 @@ struct CodexActivityCache {
                 turnID: turnID,
                 date: Date(timeIntervalSince1970: startedAt)
             ))
-        case "task_complete":
+        case "task_complete", "turn_aborted":
             guard let turnID = payload["turn_id"] as? String,
                   let startedAt = Self.seconds(payload["started_at"]),
                   let completedAt = Self.seconds(payload["completed_at"]) else {
@@ -251,6 +273,67 @@ struct CodexActivityCache {
             return .irrelevant
         }
         return .event(events)
+    }
+
+    private func parseToolTiming(_ object: [String: Any]) -> ParsedLine {
+        guard let payload = object["payload"] as? [String: Any],
+              let type = payload["type"] as? String,
+              let callID = payload["call_id"] as? String,
+              let timestamp = object["timestamp"] as? String,
+              let date = Self.timestampDate(timestamp) else { return .irrelevant }
+        var events = Events()
+        if type == "custom_tool_call" || type == "function_call" {
+            let input = payload["input"] as? String ?? payload["arguments"] as? String ?? ""
+            guard input.range(
+                of: #"["']?sandbox_permissions["']?\s*:\s*["']require_escalated["']"#,
+                options: .regularExpression
+            ) != nil else { return .irrelevant }
+            events.approvalCalls.append(ApprovalCall(callID: callID, date: date))
+        } else if type == "custom_tool_call_output" || type == "function_call_output" {
+            guard let output = payload["output"] as? String,
+                  let duration = Self.scriptExecutionDuration(output) else { return .irrelevant }
+            events.toolResults.append(ToolResult(
+                callID: callID, date: date, executionDuration: duration
+            ))
+        } else {
+            return .irrelevant
+        }
+        return .event(events)
+    }
+
+    private static func scriptExecutionDuration(_ output: String) -> TimeInterval? {
+        // Only trust the outer tool runner's timing, never numbers inside tool output.
+        let pattern = #"^Script (?:completed|running[^\n]*)\nWall time ([0-9.]+) seconds\n"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let range = Range(match.range(at: 1), in: output),
+              let seconds = Double(output[range]), seconds.isFinite, seconds >= 0 else { return nil }
+        return seconds
+    }
+
+    private func excludingApprovalWaits(
+        _ interval: ActivityInterval, events: Events
+    ) -> [ActivityInterval] {
+        var result = [interval]
+        for call in events.approvalCalls {
+            guard let output = events.toolResults.first(where: { $0.callID == call.callID }) else { continue }
+            let resumedAt = output.date.addingTimeInterval(-output.executionDuration)
+            // Preserve reported execution time. Only remove long, unaccounted waits
+            // on calls that explicitly requested approval; long running work stays intact.
+            guard resumedAt.timeIntervalSince(call.date) > WeeklyPaceCalculator.idleGap else { continue }
+            result = result.flatMap { segment in
+                guard call.date < segment.end, resumedAt > segment.start else { return [segment] }
+                var pieces: [ActivityInterval] = []
+                if segment.start < call.date {
+                    pieces.append(ActivityInterval(start: segment.start, end: call.date))
+                }
+                if segment.end > resumedAt {
+                    pieces.append(ActivityInterval(start: resumedAt, end: segment.end))
+                }
+                return pieces
+            }
+        }
+        return result
     }
 
     private func intervals(from entries: [Entry], since: Date, now: Date) -> [ActivityInterval] {
@@ -274,11 +357,15 @@ struct CodexActivityCache {
         }
 
         var intervals = completed.flatMap { completion in
-            CodexActivityReader.split(
-                completion.interval,
-                at: entries[completion.entry].events.modeChanges.map { ($0.date, $0.isFastMode) },
-                inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
-            )
+            excludingApprovalWaits(
+                completion.interval, events: entries[completion.entry].events
+            ).flatMap {
+                CodexActivityReader.split(
+                    $0,
+                    at: entries[completion.entry].events.modeChanges.map { ($0.date, $0.isFastMode) },
+                    inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
+                )
+            }
         }
         for (turnID, start) in starts where !completedIDs.contains(turnID) {
             let entry = entries[start.entry]
@@ -286,11 +373,15 @@ struct CodexActivityCache {
                 .filter { $0 >= start.date && $0 <= now }
                 .max() ?? start.date
             if end > start.date {
-                intervals += CodexActivityReader.split(
-                    ActivityInterval(start: start.date, end: end),
-                    at: entry.events.modeChanges.map { ($0.date, $0.isFastMode) },
-                    inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
-                )
+                intervals += excludingApprovalWaits(
+                    ActivityInterval(start: start.date, end: end), events: entry.events
+                ).flatMap {
+                    CodexActivityReader.split(
+                        $0,
+                        at: entry.events.modeChanges.map { ($0.date, $0.isFastMode) },
+                        inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
+                    )
+                }
             }
         }
         return intervals.filter { $0.end >= since && $0.start <= now }

@@ -17,6 +17,8 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Shows an estimated pace chart so you can see how your sustainable weekly usage changes over time.
 - Plots pace only at exact percentage updates, with a configurable percentage-point lookback and optional runtime-based prorating for short usage windows.
 - Projects the current pace and compares it with recent historical usage.
+- Optionally includes subagent runtime in local and remote pace estimates, off by default. Each subagent adds its runtime, including time spent running alongside its parent.
+- Starts in the menu bar without opening Settings.
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage changes in versioned daily JSON files, writing only when the fetched percentage changes.
 - Can optionally replicate usage history through a private folder selected by the user.

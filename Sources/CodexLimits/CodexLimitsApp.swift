@@ -1,12 +1,16 @@
-import SwiftUI
+import AppKit
 
 @main
-struct CodexLimitsApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        Settings {
-            SettingsView(monitor: appDelegate.monitor)
+@MainActor
+enum CodexLimitsApp {
+    static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.setActivationPolicy(.accessory)
+        application.delegate = delegate
+        // Settings are opened explicitly by the menu bar action.
+        withExtendedLifetime(delegate) {
+            application.run()
         }
     }
 }

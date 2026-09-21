@@ -31,6 +31,7 @@ struct CodexActivityCache {
         var approvalCalls: [ApprovalCall] = []
         var toolResults: [ToolResult] = []
         var isSubagent: Bool?
+        var sessionCreatedAt: Date?
 
         mutating func append(_ other: Events) {
             starts += other.starts
@@ -39,9 +40,18 @@ struct CodexActivityCache {
             modeChanges += other.modeChanges
             approvalCalls += other.approvalCalls
             toolResults += other.toolResults
-            if let isSubagent = other.isSubagent {
+            // Forked sessions copy the parent's metadata after their own header.
+            // The first header identifies the file, including across cache appends.
+            if isSubagent == nil, let isSubagent = other.isSubagent {
                 self.isSubagent = isSubagent
+                sessionCreatedAt = other.sessionCreatedAt
             }
+        }
+
+        func ownsTurn(startingAt date: Date) -> Bool {
+            guard isSubagent == true, let sessionCreatedAt else { return true }
+            // Turn timestamps have whole-second precision; metadata has milliseconds.
+            return date.timeIntervalSince1970 >= floor(sessionCreatedAt.timeIntervalSince1970)
         }
     }
 
@@ -77,8 +87,8 @@ struct CodexActivityCache {
         case event(Events)
     }
 
-    // Reparse older caches, which omitted interruptions and approval timing.
-    private static let formatVersion = 5
+    // Reparse caches that let inherited parent metadata overwrite subagent identity.
+    private static let formatVersion = 6
     private static let guardLength = 4_096
     private static let maximumSessionFileSize = 50_000_000
 
@@ -86,7 +96,7 @@ struct CodexActivityCache {
     let archivedSessionsRoot: URL?
     let cacheURL: URL
 
-    func loadIntervals(since: Date, now: Date) throws -> [ActivityInterval] {
+    func loadIntervals(since: Date, now: Date, includesSubagents: Bool = false) throws -> [ActivityInterval] {
         var store = loadStore()
         var changed = store.corruptionMessage != nil
         if changed {
@@ -146,7 +156,11 @@ struct CodexActivityCache {
             try save(store)
         }
         return intervals(
-            from: files.compactMap { store.files[$0.cacheKey] },
+            from: files.compactMap { file in
+                guard let entry = store.files[file.cacheKey],
+                      includesSubagents || entry.events.isSubagent != true else { return nil }
+                return (id: file.identity, entry: entry)
+            },
             since: since,
             now: now
         )
@@ -215,6 +229,9 @@ struct CodexActivityCache {
             let source = payload["source"] as? [String: Any]
             events.isSubagent = payload["thread_source"] as? String == "subagent"
                 || source?["subagent"] != nil
+            if let timestamp = payload["timestamp"] as? String ?? object["timestamp"] as? String {
+                events.sessionCreatedAt = Self.timestampDate(timestamp)
+            }
             return .event(events)
         }
 
@@ -336,18 +353,30 @@ struct CodexActivityCache {
         return result
     }
 
-    private func intervals(from entries: [Entry], since: Date, now: Date) -> [ActivityInterval] {
-        let entries = entries.filter { $0.events.isSubagent != true }
+    private func intervals(
+        from sessions: [(id: String, entry: Entry)], since: Date, now: Date
+    ) -> [ActivityInterval] {
+        let entries = sessions.map(\.entry)
+        func identified(_ intervals: [ActivityInterval], entry index: Int) -> [ActivityInterval] {
+            intervals.map { interval in
+                var interval = interval
+                if entries[index].events.isSubagent == true {
+                    interval.subagentID = "local:" + sessions[index].id
+                }
+                return interval
+            }
+        }
         var starts: [String: (date: Date, entry: Int)] = [:]
         var completedIDs: Set<String> = []
         var completed: [(interval: ActivityInterval, entry: Int)] = []
         let allModeChanges = entries.flatMap(\.events.modeChanges)
 
         for (entryIndex, entry) in entries.enumerated() {
-            for start in entry.events.starts {
+            for start in entry.events.starts where entry.events.ownsTurn(startingAt: start.date) {
                 starts[start.turnID] = (start.date, entryIndex)
             }
-            for completion in entry.events.completions {
+            for completion in entry.events.completions
+                where entry.events.ownsTurn(startingAt: completion.start) {
                 completedIDs.insert(completion.turnID)
                 completed.append((
                     ActivityInterval(start: completion.start, end: completion.end),
@@ -357,7 +386,7 @@ struct CodexActivityCache {
         }
 
         var intervals = completed.flatMap { completion in
-            excludingApprovalWaits(
+            identified(excludingApprovalWaits(
                 completion.interval, events: entries[completion.entry].events
             ).flatMap {
                 CodexActivityReader.split(
@@ -365,7 +394,7 @@ struct CodexActivityCache {
                     at: entries[completion.entry].events.modeChanges.map { ($0.date, $0.isFastMode) },
                     inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
                 )
-            }
+            }, entry: completion.entry)
         }
         for (turnID, start) in starts where !completedIDs.contains(turnID) {
             let entry = entries[start.entry]
@@ -373,7 +402,7 @@ struct CodexActivityCache {
                 .filter { $0 >= start.date && $0 <= now }
                 .max() ?? start.date
             if end > start.date {
-                intervals += excludingApprovalWaits(
+                intervals += identified(excludingApprovalWaits(
                     ActivityInterval(start: start.date, end: end), events: entry.events
                 ).flatMap {
                     CodexActivityReader.split(
@@ -381,7 +410,7 @@ struct CodexActivityCache {
                         at: entry.events.modeChanges.map { ($0.date, $0.isFastMode) },
                         inheriting: allModeChanges.map { ($0.date, $0.isFastMode) }
                     )
-                }
+                }, entry: start.entry)
             }
         }
         return intervals.filter { $0.end >= since && $0.start <= now }

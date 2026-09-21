@@ -4,6 +4,7 @@ struct ActivityInterval: Equatable, Sendable {
     let start: Date
     let end: Date
     var isFastMode = false
+    var subagentID: String? = nil
 
     var duration: TimeInterval { max(end.timeIntervalSince(start), 0) }
 }
@@ -220,7 +221,7 @@ enum DailyRuntimeCalculator {
             let start = max(interval.start, windowStart)
             let end = min(interval.end, windowEnd)
             guard end > start else { return nil }
-            return ActivityInterval(start: start, end: end)
+            return ActivityInterval(start: start, end: end, subagentID: interval.subagentID)
         }
         let merged = WeeklyPaceCalculator.merged(clipped, joiningGapsUpTo: 0)
         return merged.reduce(0) { $0 + $1.duration } / 3_600
@@ -260,7 +261,8 @@ enum WeeklyPaceCalculator {
             blocks[blocks.count - 1] = ActivityInterval(
                 start: last.start,
                 end: now,
-                isFastMode: last.isFastMode
+                isFastMode: last.isFastMode,
+                subagentID: last.subagentID
             )
         }
 
@@ -464,6 +466,21 @@ enum WeeklyPaceCalculator {
         _ intervals: [ActivityInterval],
         joiningGapsUpTo allowedGap: TimeInterval
     ) -> [ActivityInterval] {
+        // Merge repeated/overlapping records within each agent, but add the runtime
+        // of separate subagents even when they work alongside their parent.
+        Dictionary(grouping: intervals, by: \.subagentID).values.flatMap {
+            mergedAgentIntervals($0, joiningGapsUpTo: allowedGap)
+        }.sorted {
+            if $0.start != $1.start { return $0.start < $1.start }
+            if $0.end != $1.end { return $0.end < $1.end }
+            return ($0.subagentID ?? "") < ($1.subagentID ?? "")
+        }
+    }
+
+    private static func mergedAgentIntervals(
+        _ intervals: [ActivityInterval],
+        joiningGapsUpTo allowedGap: TimeInterval
+    ) -> [ActivityInterval] {
         let intervals = intervals.filter { $0.end > $0.start }
         let boundaries = Set(intervals.flatMap { [$0.start, $0.end] }).sorted()
         let slices = boundaries.indices.dropLast().compactMap { index -> ActivityInterval? in
@@ -474,7 +491,8 @@ enum WeeklyPaceCalculator {
             return ActivityInterval(
                 start: start,
                 end: end,
-                isFastMode: active.contains(where: \.isFastMode)
+                isFastMode: active.contains(where: \.isFastMode),
+                subagentID: active.first?.subagentID
             )
         }
 
@@ -488,7 +506,8 @@ enum WeeklyPaceCalculator {
                 result[result.count - 1] = ActivityInterval(
                     start: last.start,
                     end: max(last.end, interval.end),
-                    isFastMode: last.isFastMode
+                    isFastMode: last.isFastMode,
+                    subagentID: last.subagentID
                 )
             } else {
                 result.append(interval)
@@ -509,7 +528,8 @@ enum WeeklyPaceCalculator {
             result.append(ActivityInterval(
                 start: block.end.addingTimeInterval(-included),
                 end: block.end,
-                isFastMode: block.isFastMode
+                isFastMode: block.isFastMode,
+                subagentID: block.subagentID
             ))
             remaining -= included
         }
@@ -526,7 +546,8 @@ enum WeeklyPaceCalculator {
         return ActivityInterval(
             start: start,
             end: end,
-            isFastMode: interval.isFastMode
+            isFastMode: interval.isFastMode,
+            subagentID: interval.subagentID
         )
     }
 
@@ -605,7 +626,9 @@ enum WeeklyPaceCalculator {
 }
 
 enum CodexActivityReader {
-    static func loadIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
+    static func loadIntervals(
+        since: Date, now: Date, includesSubagents: Bool = false
+    ) async throws -> [ActivityInterval] {
         let codexRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex", isDirectory: true)
         let sessionsRoot = codexRoot.appendingPathComponent("sessions", isDirectory: true)
@@ -626,7 +649,8 @@ enum CodexActivityReader {
             now: now,
             sessionsRoot: sessionsRoot,
             archivedSessionsRoot: archivedSessionsRoot,
-            cacheURL: cache
+            cacheURL: cache,
+            includesSubagents: includesSubagents
         )
     }
 
@@ -635,7 +659,8 @@ enum CodexActivityReader {
         now: Date,
         sessionsRoot: URL,
         archivedSessionsRoot: URL? = nil,
-        cacheURL: URL
+        cacheURL: URL,
+        includesSubagents: Bool = false
     ) async throws -> [ActivityInterval] {
         try await Task.detached(priority: .utility) {
             try CodexActivityCache(
@@ -643,7 +668,7 @@ enum CodexActivityReader {
                 archivedSessionsRoot: archivedSessionsRoot,
                 cacheURL: cacheURL
             )
-                .loadIntervals(since: since, now: now)
+                .loadIntervals(since: since, now: now, includesSubagents: includesSubagents)
         }.value
     }
 
@@ -667,7 +692,8 @@ enum CodexActivityReader {
             result.append(ActivityInterval(
                 start: start,
                 end: change.date,
-                isFastMode: isFastMode
+                isFastMode: isFastMode,
+                subagentID: interval.subagentID
             ))
             start = change.date
             isFastMode = change.isFastMode
@@ -675,7 +701,8 @@ enum CodexActivityReader {
         result.append(ActivityInterval(
             start: start,
             end: interval.end,
-            isFastMode: isFastMode
+            isFastMode: isFastMode,
+            subagentID: interval.subagentID
         ))
         return result
     }

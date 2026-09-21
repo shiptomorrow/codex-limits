@@ -90,7 +90,7 @@ struct MenuContentView: View {
                 Button {
                     Task { await monitor.refresh() }
                 } label: {
-                    if monitor.isRefreshing {
+                    if monitor.isProcessing {
                         ProgressView()
                             .controlSize(.small)
                     } else {
@@ -98,8 +98,9 @@ struct MenuContentView: View {
                     }
                 }
                 .buttonStyle(.borderless)
-                .help("Refresh")
-                .accessibilityLabel("Refresh usage")
+                .disabled(monitor.isProcessing)
+                .help(monitor.isAnalyzingActivity ? "Recalculating pace…" : "Refresh usage")
+                .accessibilityLabel(monitor.isAnalyzingActivity ? "Recalculating pace" : "Refresh usage")
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -390,9 +391,9 @@ struct MenuContentView: View {
 
     private var emptyState: some View {
         VStack(spacing: 12) {
-            if monitor.isRefreshing {
+            if monitor.isProcessing {
                 ProgressView()
-                Text("Reading Codex usage…")
+                Text(monitor.isAnalyzingActivity ? "Recalculating pace…" : "Reading Codex usage…")
                     .foregroundStyle(.secondary)
             } else {
                 Image(systemName: "exclamationmark.triangle")
@@ -2029,6 +2030,7 @@ struct SettingsView: View {
     @AppStorage(UsageChartPreferences.showsTargetHoverLabelKey) private var showsTargetHoverLabel = false
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @AppStorage(UsageMonitor.refreshIntervalSecondsKey) private var refreshIntervalSeconds = UsageRefreshSchedule.defaultSeconds
+    @AppStorage(UsageMonitor.includeSubagentRuntimeKey) private var includeSubagentRuntime = false
     @AppStorage(UsageMonitor.factorInPausesKey) private var factorInPauses = false
     @AppStorage(UsageMonitor.showPreviousWeeklyWindowKey) private var showPreviousWeeklyWindow = true
     @AppStorage(UsagePercentageDisplay.showsUsedKey) private var showsUsedPercentage = false
@@ -2084,6 +2086,22 @@ struct SettingsView: View {
                 }
                 .onChange(of: safetyBuffer) { _, value in
                     monitor.updateSafetyBuffer(value)
+                }
+
+                Toggle("Include subagent runtime", isOn: $includeSubagentRuntime)
+                    .onChange(of: includeSubagentRuntime) { _, value in
+                        monitor.updateIncludeSubagentRuntime(value)
+                    }
+                    .help("Include local and remote subagent activity in pace and runtime estimates. Each subagent adds its runtime, including time spent running alongside its parent.")
+
+                if monitor.isAnalyzingActivity {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Recalculating pace…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Toggle("Factor in pauses", isOn: $factorInPauses)

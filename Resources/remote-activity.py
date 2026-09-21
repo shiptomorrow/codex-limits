@@ -9,8 +9,8 @@ import sys
 import traceback
 
 
-# Reparse older caches, which omitted interruptions and approval timing.
-CACHE_VERSION = 4
+# Reparse caches that let inherited parent metadata overwrite subagent identity.
+CACHE_VERSION = 5
 GUARD_LENGTH = 4096
 MAXIMUM_SESSION_FILE_SIZE = 50_000_000
 
@@ -24,14 +24,17 @@ def empty_events():
         "approval_calls": [],
         "tool_results": [],
         "is_subagent": None,
+        "session_created_at": None,
     }
 
 
 def append_events(destination, source):
     for key in ("starts", "completions", "token_times", "mode_changes", "approval_calls", "tool_results"):
         destination[key].extend(source[key])
-    if source["is_subagent"] is not None:
+    # The first header belongs to this file; later headers can be copied parent history.
+    if destination["is_subagent"] is None and source["is_subagent"] is not None:
         destination["is_subagent"] = source["is_subagent"]
+        destination["session_created_at"] = source["session_created_at"]
 
 
 def timestamp_seconds(value):
@@ -67,6 +70,7 @@ def parse_line(line):
         events["is_subagent"] = payload.get("thread_source") == "subagent" or (
             isinstance(source, dict) and "subagent" in source
         )
+        events["session_created_at"] = timestamp_seconds(payload.get("timestamp") or obj.get("timestamp"))
         return events
 
     markers = (
@@ -320,7 +324,7 @@ def update_cache(cache_path, files):
 
     if changed:
         save_cache(cache_path, store)
-    return [store["files"][key] for key, _ in files]
+    return [{**store["files"][key], "session_id": key} for key, _ in files]
 
 
 def split_interval(start, end, changes, inherited_changes):
@@ -342,8 +346,11 @@ def split_interval(start, end, changes, inherited_changes):
     return result
 
 
-def intervals(entries, since, now):
-    entries = [entry for entry in entries if entry["events"].get("is_subagent") is not True]
+def intervals(entries, since, now, includes_subagents=False):
+    entries = [
+        entry for entry in entries
+        if includes_subagents or entry["events"].get("is_subagent") is not True
+    ]
     starts = {}
     completed_ids = set()
     completed = []
@@ -351,21 +358,31 @@ def intervals(entries, since, now):
     for index, entry in enumerate(entries):
         events = entry["events"]
         all_mode_changes.extend(events["mode_changes"])
+        created_at = events.get("session_created_at")
+        # Turn timestamps use whole seconds, while the metadata includes milliseconds.
+        earliest_turn = int(created_at) if events.get("is_subagent") and created_at is not None else float("-inf")
         for turn_id, date in events["starts"]:
+            if date < earliest_turn:
+                continue
             starts[turn_id] = (date, index)
         for turn_id, start, end in events["completions"]:
+            if start < earliest_turn:
+                continue
             completed_ids.add(turn_id)
             completed.append((start, end, index))
+
+    def identified_segments(start, end, index):
+        entry = entries[index]
+        segments = split_interval(start, end, entry["events"]["mode_changes"], all_mode_changes)
+        if entry["events"].get("is_subagent") is True:
+            for segment in segments:
+                segment["subagentID"] = entry.get("session_id", str(index))
+        return segments
 
     result = []
     for start, end, index in completed:
         for left, right in excluding_approval_waits(start, end, entries[index]["events"]):
-            result.extend(split_interval(
-                left,
-                right,
-                entries[index]["events"]["mode_changes"],
-                all_mode_changes,
-            ))
+            result.extend(identified_segments(left, right, index))
     for turn_id, (start, index) in starts.items():
         if turn_id in completed_ids:
             continue
@@ -377,18 +394,14 @@ def intervals(entries, since, now):
         end = max(token_times) if token_times else start
         if end > start:
             for left, right in excluding_approval_waits(start, end, entries[index]["events"]):
-                result.extend(split_interval(
-                    left,
-                    right,
-                    entries[index]["events"]["mode_changes"],
-                    all_mode_changes,
-                ))
+                result.extend(identified_segments(left, right, index))
     return [item for item in result if item["end"] >= since and item["start"] <= now]
 
 
 def main():
     since = float(sys.argv[1])
     now = float(sys.argv[2])
+    includes_subagents = len(sys.argv) > 3 and sys.argv[3] == "1"
     home = pathlib.Path.home()
     cache_directory = home / ".codex" / "codex-limits"
     cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -399,7 +412,7 @@ def main():
         files = selected_files(since, now, home)
         entries = update_cache(cache_path, files)
         json.dump(
-            {"version": 1, "intervals": intervals(entries, since, now)},
+            {"version": 1, "intervals": intervals(entries, since, now, includes_subagents)},
             sys.stdout,
             separators=(",", ":"),
         )

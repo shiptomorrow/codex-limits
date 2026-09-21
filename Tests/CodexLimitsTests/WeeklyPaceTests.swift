@@ -90,6 +90,97 @@ final class WeeklyPaceTests: XCTestCase {
         )])
     }
 
+    func testSubagentSettingAddsConcurrentRuntimeAndRecalculatesCachedPace() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let start = fixture.now.addingTimeInterval(-600)
+        try fixture.write([
+            fixture.sessionMetadata(threadSource: "user"),
+            fixture.taskStarted(turnID: "main-turn", at: start),
+            fixture.tokenCount(at: start.addingTimeInterval(120))
+        ])
+        try fixture.write([
+            fixture.sessionMetadata(threadSource: "subagent", hasSubagentSource: true),
+            fixture.taskEnded(
+                turnID: "subagent-turn", start: start,
+                end: start.addingTimeInterval(540), type: "task_complete"
+            )
+        ], to: fixture.subagentSessionURL)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: fixture.now),
+            UsageSample(observedAt: fixture.now, remainingPercent: 95, resetsAt: fixture.now)
+        ]
+
+        // Reuse the same cache while switching in both directions.
+        for includesSubagents in [false, true, false] {
+            let activity = try await fixture.load(includesSubagents: includesSubagents)
+            let merged = WeeklyPaceCalculator.merged(activity, joiningGapsUpTo: 0)
+            let duration = includesSubagents ? 660.0 : 120.0
+            XCTAssertEqual(merged.reduce(0) { $0 + $1.duration }, duration)
+            let points = WeeklyPaceCalculator.estimateSeries(
+                samples: samples, activity: activity, now: fixture.now,
+                factorInPauses: false, proratesShortWindows: false
+            )
+            XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, duration / 3_600 * 20,
+                           accuracy: 0.001)
+        }
+    }
+
+    func testConcurrentSubagentsAddRuntimeButRepeatedRecordsDoNot() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let end = start.addingTimeInterval(3_600)
+        let main = ActivityInterval(start: start, end: end)
+        let first = ActivityInterval(start: start, end: end, subagentID: "first")
+        let second = ActivityInterval(start: start, end: end, subagentID: "second")
+        let activity = [main, first, first, second]
+        let merged = WeeklyPaceCalculator.merged(activity, joiningGapsUpTo: 0)
+        XCTAssertEqual(merged.reduce(0) { $0 + $1.duration }, 3 * 3_600)
+        let samples = [
+            UsageSample(observedAt: start, remainingPercent: 100, resetsAt: end),
+            UsageSample(observedAt: end, remainingPercent: 90, resetsAt: end)
+        ]
+        for factorInPauses in [false, true] {
+            let points = WeeklyPaceCalculator.estimateSeries(
+                samples: samples, activity: activity, now: end,
+                factorInPauses: factorInPauses, proratesShortWindows: false
+            )
+            XCTAssertEqual(try XCTUnwrap(points.last).hoursPerWeek, 30, accuracy: 0.001)
+        }
+    }
+
+    func testSubagentHeaderSurvivesInheritedParentHistoryAndCacheAppends() async throws {
+        let fixture = try ActivityCacheFixture()
+        defer { fixture.remove() }
+        let parentStart = fixture.now.addingTimeInterval(-600)
+        let childStart = fixture.now.addingTimeInterval(-300)
+        let parentTurn = fixture.taskEnded(
+            turnID: "parent", start: parentStart,
+            end: fixture.now.addingTimeInterval(-100), type: "task_complete"
+        )
+        let childTurn = fixture.taskEnded(
+            turnID: "child", start: childStart,
+            end: fixture.now.addingTimeInterval(-60), type: "task_complete"
+        )
+        try fixture.write([fixture.sessionMetadata(threadSource: "user"), parentTurn])
+        try fixture.write([
+            fixture.sessionMetadata(threadSource: "subagent", createdAt: childStart.addingTimeInterval(0.9)),
+            fixture.sessionMetadata(threadSource: "user", createdAt: parentStart),
+            fixture.taskStarted(turnID: "parent", at: parentStart),
+            parentTurn, childTurn
+        ], to: fixture.subagentSessionURL)
+        for _ in 0 ..< 2 {
+            let excluded = try await fixture.load(includesSubagents: false)
+            let included = try await fixture.load(includesSubagents: true)
+            XCTAssertEqual(excluded.reduce(0) { $0 + $1.duration }, 500)
+            XCTAssertEqual(included.reduce(0) { $0 + $1.duration }, 740)
+            XCTAssertEqual(included.filter { $0.subagentID != nil }.count, 1)
+            let handle = try FileHandle(forWritingTo: fixture.subagentSessionURL)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data((fixture.sessionMetadata(threadSource: "user") + "\n").utf8))
+            try handle.close()
+        }
+    }
+
     func testInterruptedTurnStopsBeforeLaterActivityInSameSession() async throws {
         let fixture = try ActivityCacheFixture()
         defer { fixture.remove() }
@@ -1221,13 +1312,14 @@ private struct ActivityCacheFixture {
         archivedSessionURL = archivedSessionsRoot.appendingPathComponent(sessionName)
     }
 
-    func load() async throws -> [ActivityInterval] {
+    func load(includesSubagents: Bool = false) async throws -> [ActivityInterval] {
         try await CodexActivityReader.loadIntervals(
             since: now.addingTimeInterval(-3_600),
             now: now,
             sessionsRoot: sessionsRoot,
             archivedSessionsRoot: archivedSessionsRoot,
-            cacheURL: cacheURL
+            cacheURL: cacheURL,
+            includesSubagents: includesSubagents
         )
     }
 
@@ -1258,9 +1350,10 @@ private struct ActivityCacheFixture {
         return String(decoding: data, as: UTF8.self)
     }
 
-    func sessionMetadata(threadSource: String, hasSubagentSource: Bool = false) -> String {
+    func sessionMetadata(threadSource: String, hasSubagentSource: Bool = false, createdAt: Date? = nil) -> String {
         let source = hasSubagentSource ? #"{"subagent":{"thread_spawn":{}}}"# : #""vscode""#
-        return #"{"type":"session_meta","payload":{"thread_source":"\#(threadSource)","source":\#(source)}}"#
+        let dateField = createdAt.map { #", "timestamp":"\#(timestamp($0))""# } ?? ""
+        return #"{"type":"session_meta","payload":{"thread_source":"\#(threadSource)","source":\#(source)\#(dateField)}}"#
     }
 
     func tokenCount(at date: Date) -> String {

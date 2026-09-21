@@ -131,6 +131,7 @@ enum RemoteCodexActivityReader {
         let start: TimeInterval
         let end: TimeInterval
         let isFastMode: Bool
+        let subagentID: String?
     }
 
     private struct ProfileResult: Sendable {
@@ -142,7 +143,8 @@ enum RemoteCodexActivityReader {
     static func loadIntervals(
         profiles: [String],
         since: Date,
-        now: Date
+        now: Date,
+        includesSubagents: Bool = false
     ) async -> RemoteCodexActivityResult {
         let results = await withTaskGroup(of: ProfileResult.self) { group in
             for profile in profiles {
@@ -153,7 +155,8 @@ enum RemoteCodexActivityReader {
                             intervals: try await loadIntervals(
                                 profile: profile,
                                 since: since,
-                                now: now
+                                now: now,
+                                includesSubagents: includesSubagents
                             ),
                             error: nil
                         )
@@ -182,7 +185,8 @@ enum RemoteCodexActivityReader {
     private static func loadIntervals(
         profile: String,
         since: Date,
-        now: Date
+        now: Date,
+        includesSubagents: Bool = false
     ) async throws -> [ActivityInterval] {
         guard SystemSSHProfiles.isConcreteAlias(profile) else {
             throw NSError(
@@ -204,6 +208,7 @@ enum RemoteCodexActivityReader {
                 profile: profile,
                 since: since,
                 now: now,
+                includesSubagents: includesSubagents,
                 in: workDirectory
             )
         }.value
@@ -213,6 +218,7 @@ enum RemoteCodexActivityReader {
         profile: String,
         since: Date,
         now: Date,
+        includesSubagents: Bool,
         in workDirectory: URL
     ) throws -> [ActivityInterval] {
         guard let scriptURL = remoteActivityScriptURL() else {
@@ -244,7 +250,7 @@ enum RemoteCodexActivityReader {
             "-o", "ConnectTimeout=\(RemoteSSHPolicy.connectTimeoutSeconds)",
             "-o", "ConnectionAttempts=1",
             profile,
-            "python3 - \(since.timeIntervalSince1970) \(now.timeIntervalSince1970)"
+            "python3 - \(since.timeIntervalSince1970) \(now.timeIntervalSince1970) \(includesSubagents ? 1 : 0)"
         ]
         ssh.standardInput = scriptInput
         ssh.standardOutput = output
@@ -312,7 +318,8 @@ enum RemoteCodexActivityReader {
                 ActivityInterval(
                     start: Date(timeIntervalSince1970: $0.start),
                     end: Date(timeIntervalSince1970: $0.end),
-                    isFastMode: $0.isFastMode
+                    isFastMode: $0.isFastMode,
+                    subagentID: $0.subagentID.map { "remote:\(profile):\($0)" }
                 )
             }
         } catch {

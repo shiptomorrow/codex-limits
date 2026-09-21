@@ -47,6 +47,51 @@ class RemoteActivityCacheTests(unittest.TestCase):
             for start, end in sorted((*pairs, (500, 600)))
         ]
 
+    def test_subagent_setting_filters_cached_completed_and_active_turns(self):
+        metadata = json.dumps({
+            "type": "session_meta",
+            "payload": {"thread_source": "subagent"},
+        }).encode() + b"\n"
+        self.session.write_bytes(metadata + self.old + b'\n'.join([
+            json.dumps({"type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "active", "started_at": 700,
+            }}).encode(),
+            json.dumps({"type": "event_msg", "timestamp": "1970-01-01T00:13:20Z",
+                        "payload": {"type": "token_count"}}).encode(),
+            b"",
+        ]))
+        for includes_subagents in (False, True, False):
+            entries = activity.update_cache(self.cache, self.files)
+            actual = sorted(activity.intervals(
+                entries, 0, 1000, includes_subagents=includes_subagents,
+            ), key=lambda item: item["start"])
+            expected = self.expected((100, 200), (700, 800)) if includes_subagents else self.expected()
+            if includes_subagents:
+                for interval in expected:
+                    if interval["start"] in (100, 700):
+                        interval["subagentID"] = "session"
+            self.assertEqual(actual, expected)
+
+    def test_first_header_excludes_inherited_parent_turns_after_cache_appends(self):
+        def metadata(source, timestamp):
+            return json.dumps({"type": "session_meta", "payload": {
+                "thread_source": source, "timestamp": timestamp,
+            }}).encode() + b"\n"
+        child_header = metadata("subagent", "1970-01-01T00:05:00.900Z")
+        parent_header = metadata("user", "1970-01-01T00:01:00Z")
+        # The copied parent turn overlaps the child's creation, but belongs to the parent.
+        self.session.write_bytes(child_header + parent_header + completion("parent", 100, 350)
+                                 + completion("child", 300, 400))
+        for _ in range(2):
+            entries = activity.update_cache(self.cache, self.files)
+            self.assertEqual(activity.intervals(entries, 0, 1000), self.expected())
+            included = activity.intervals(entries, 0, 1000, includes_subagents=True)
+            child = [item for item in included if item.get("subagentID")]
+            self.assertEqual(child, [{"start": 300, "end": 400, "isFastMode": False,
+                                      "subagentID": "session"}])
+            with self.session.open("ab") as handle:
+                handle.write(parent_header)
+
     def test_rewrites_replace_old_events_and_preserve_other_files(self):
         scenarios = {
             "truncated": (b"", b" " * 1000 + b"\n", b""),

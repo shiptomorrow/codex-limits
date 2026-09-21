@@ -18,6 +18,7 @@ enum UsageRefreshSchedule {
 final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
     static let refreshIntervalSecondsKey = "refreshIntervalSeconds"
+    static let includeSubagentRuntimeKey = "includeSubagentRuntime"
     static let factorInPausesKey = "factorInPauses"
     static let showPreviousWeeklyWindowKey = "showPreviousWeeklyWindow"
     static let remoteSessionsEnabledKey = "remoteSessionsEnabled"
@@ -32,6 +33,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var weeklyPacePoints: [WeeklyPacePoint] = []
     @Published private(set) var activityIntervals: [ActivityInterval] = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isAnalyzingActivity = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var activityErrorMessage: String?
     @Published private(set) var remoteActivityErrorMessage: String?
@@ -65,6 +67,7 @@ final class UsageMonitor: ObservableObject {
     private var remoteActivityRetryTask: Task<Void, Never>?
     private var cachedRemoteActivity: (
         profiles: [String],
+        includesSubagents: Bool,
         since: Date,
         now: Date,
         result: RemoteCodexActivityResult
@@ -102,6 +105,8 @@ final class UsageMonitor: ObservableObject {
             await self?.start()
         }
     }
+
+    var isProcessing: Bool { isRefreshing || isAnalyzingActivity }
 
     var menuBarText: String {
         if usageReadFailed { return "-%" }
@@ -157,6 +162,12 @@ final class UsageMonitor: ObservableObject {
         lastScheduledActivityWindows = nil
         guard let snapshot else { return }
         scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
+    func updateIncludeSubagentRuntime(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.includeSubagentRuntimeKey)
+        activityIntervals = []
+        remoteActivitySettingsChanged()
     }
 
     func updateProratesShortWindows(_ enabled: Bool) {
@@ -659,8 +670,11 @@ final class UsageMonitor: ObservableObject {
     }
 
     private func loadActivityIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
-        let local = try await CodexActivityReader.loadIntervals(since: since, now: now)
         let defaults = UserDefaults.standard
+        let includesSubagents = defaults.bool(forKey: Self.includeSubagentRuntimeKey)
+        let local = try await CodexActivityReader.loadIntervals(
+            since: since, now: now, includesSubagents: includesSubagents
+        )
         guard defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
             remoteActivityErrorMessage = nil
             return local
@@ -675,6 +689,7 @@ final class UsageMonitor: ObservableObject {
         let remote: RemoteCodexActivityResult
         if let cachedRemoteActivity,
            cachedRemoteActivity.profiles == profiles,
+           cachedRemoteActivity.includesSubagents == includesSubagents,
            cachedRemoteActivity.since <= since,
            cachedRemoteActivity.now == now {
             remote = cachedRemoteActivity.result
@@ -682,9 +697,10 @@ final class UsageMonitor: ObservableObject {
             remote = await RemoteCodexActivityReader.loadIntervals(
                 profiles: profiles,
                 since: since,
-                now: now
+                now: now,
+                includesSubagents: includesSubagents
             )
-            cachedRemoteActivity = (profiles, since, now, remote)
+            cachedRemoteActivity = (profiles, includesSubagents, since, now, remote)
         }
         remoteActivityErrorMessage = remote.errors.isEmpty
             ? nil
@@ -730,6 +746,7 @@ final class UsageMonitor: ObservableObject {
 
         lastScheduledActivityWindows = windows
         pendingActivitySnapshot = snapshot
+        isAnalyzingActivity = true
         startPendingActivityAnalysis()
     }
 
@@ -753,6 +770,7 @@ final class UsageMonitor: ObservableObject {
                 self.logger.error("Activity analysis failed: \(error.localizedDescription, privacy: .public)")
             }
             self.activityAnalysisTask = nil
+            self.isAnalyzingActivity = self.pendingActivitySnapshot != nil
             self.startPendingActivityAnalysis()
         }
     }

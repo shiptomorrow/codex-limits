@@ -59,6 +59,92 @@ enum OtherLimitPreferences {
     }
 }
 
+enum UsageLimitWindow: String, CaseIterable, Identifiable, Sendable {
+    case fiveHour
+    case weekly
+
+    static let preferenceKey = "selectedUsageLimitWindow"
+
+    static var current: UsageLimitWindow {
+        UserDefaults.standard.string(forKey: preferenceKey)
+            .flatMap(UsageLimitWindow.init(rawValue:)) ?? .fiveHour
+    }
+
+    var id: String { rawValue }
+
+    var durationMinutes: Int {
+        switch self {
+        case .fiveHour: 300
+        case .weekly: 10_080
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .fiveHour: "5h"
+        case .weekly: "Weekly"
+        }
+    }
+
+    /// Older history mixed both windows. A 5-hour sample always resets within
+    /// five hours of being observed.
+    static func isFiveHourSample(_ sample: UsageSample) -> Bool {
+        sample.resetsAt.timeIntervalSince(sample.observedAt)
+            <= 5 * 3_600 + UsageReadingValidation.resetTolerance
+    }
+
+    static func available(in snapshot: UsageSnapshot) -> [UsageLimitWindow] {
+        allCases.filter { $0.reading(in: snapshot) != nil }
+    }
+
+    func reading(in snapshot: UsageSnapshot) -> LimitReading? {
+        ([snapshot.mainLimit] + snapshot.otherLimits).first {
+            $0.limitId == snapshot.mainLimit.limitId
+                && $0.window.durationMinutes == durationMinutes
+        }
+    }
+
+    /// Makes this window the main limit, falling back to the other window
+    /// when the service does not report this one.
+    func applied(to snapshot: UsageSnapshot) -> UsageSnapshot {
+        guard let chosen = reading(in: snapshot)
+                ?? Self.allCases.lazy.compactMap({ $0.reading(in: snapshot) }).first,
+              chosen != snapshot.mainLimit else { return snapshot }
+
+        let mainID = snapshot.mainLimit.limitId
+        let others = ([snapshot.mainLimit] + snapshot.otherLimits)
+            .filter { $0 != chosen }
+            .map { limit in
+                guard limit.limitId == mainID else { return limit }
+                return LimitReading(
+                    limitId: mainID,
+                    name: Self.windowName(limit.window.durationMinutes),
+                    window: limit.window
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: mainID,
+                name: snapshot.mainLimit.name,
+                window: chosen.window
+            ),
+            otherLimits: others,
+            tokenHistory: snapshot.tokenHistory,
+            emergencyResetCount: snapshot.emergencyResetCount,
+            nextEmergencyResetExpiration: snapshot.nextEmergencyResetExpiration,
+            fetchedAt: snapshot.fetchedAt,
+            planType: snapshot.planType
+        )
+    }
+
+    private static func windowName(_ minutes: Int) -> String {
+        if minutes == 10_080 { return "Weekly window" }
+        if minutes.isMultiple(of: 60) { return "\(minutes / 60)-hour window" }
+        return "Additional window"
+    }
+}
+
 struct UsageWindow: Codable, Equatable, Sendable {
     let remainingPercent: Double
     let resetsAt: Date
@@ -272,6 +358,13 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
         case "self_serve_business_usage_based", "business": "Codex Business"
         case "enterprise_cbp_usage_based", "enterprise": "Codex Enterprise"
         case "edu": "Codex Edu"
+        case "claude_free": "Claude Free"
+        case "claude_pro": "Claude Pro"
+        case "claude_max": "Claude Max"
+        case "claude_max_5x": "Claude Max 5×"
+        case "claude_max_20x": "Claude Max 20×"
+        case "claude_team": "Claude Team"
+        case "claude_enterprise": "Claude Enterprise"
         default: nil
         }
     }

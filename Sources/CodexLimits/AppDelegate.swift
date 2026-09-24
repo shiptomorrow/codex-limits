@@ -4,7 +4,7 @@ import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
-    let monitor = UsageMonitor()
+    private(set) var monitor = UsageMonitor()
 
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
@@ -13,8 +13,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var activityErrorCancellable: AnyCancellable?
     private var usageErrorCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
+    private var providerCancellable: AnyCancellable?
     private var settingsWindow: NSWindow?
     private var globalMouseMonitor: Any?
+    private var localReleaseMonitor: Any?
+    private var globalReleaseMonitor: Any?
+    private var openingPressTimestamp: TimeInterval?
     private var isPopoverOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -24,29 +28,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
 
         button.target = self
-        button.action = #selector(togglePopover)
-        button.sendAction(on: [.leftMouseUp])
+        button.action = #selector(handleStatusItemAction)
+        button.sendAction(on: [.leftMouseDown])
         button.title = ""
         button.imagePosition = .imageOnly
         button.imageScaling = .scaleNone
 
         let image = NSImage(
             systemSymbolName: "gauge.with.dots.needle.50percent",
-            accessibilityDescription: "Codex usage"
+            accessibilityDescription: "Usage"
         )
         image?.isTemplate = true
 
-        let content = MenuContentView(
-            monitor: monitor,
-            openSettingsAction: { [weak self] in self?.showSettings() }
-        )
         popover.behavior = .applicationDefined
         popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: content)
 
         self.statusItem = statusItem
         statusIcon = image
-        updateStatusItem()
+        attachMonitor()
+
+        providerCancellable = NotificationCenter.default
+            .publisher(for: UserDefaults.didChangeNotification)
+            .map { _ in UsageProvider.current }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] provider in self?.switchProvider(to: provider) }
+
+        let initialPresentation = StatusItemPresentation.current
+        preferencesCancellable = NotificationCenter.default
+            .publisher(for: UserDefaults.didChangeNotification)
+            .map { _ in StatusItemPresentation.current }
+            .prepend(initialPresentation)
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] presentation in
+                self?.updateStatusItem(presentation: presentation)
+            }
+    }
+
+    private func switchProvider(to provider: UsageProvider) {
+        guard provider != monitor.provider else { return }
+        monitor.shutdown()
+        monitor = UsageMonitor(provider: provider)
+        attachMonitor()
+    }
+
+    /// Points the popover, settings window and menu bar item at the current monitor.
+    private func attachMonitor() {
+        popover.contentViewController = NSHostingController(rootView: MenuContentView(
+            monitor: monitor,
+            openSettingsAction: { [weak self] in self?.showSettings() }
+        ))
+        (settingsWindow?.contentViewController as? NSHostingController<SettingsView>)?
+            .rootView = SettingsView(monitor: monitor)
+        settingsWindow?.title = "\(monitor.provider.displayName) Limits Settings"
 
         snapshotCancellable = monitor.$snapshot
             .receive(on: RunLoop.main)
@@ -62,20 +98,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusItem() }
 
-        let initialPresentation = StatusItemPresentation.current
-        preferencesCancellable = NotificationCenter.default
-            .publisher(for: UserDefaults.didChangeNotification)
-            .map { _ in StatusItemPresentation.current }
-            .prepend(initialPresentation)
-            .removeDuplicates()
-            .dropFirst()
-            .receive(on: RunLoop.main)
-            .sink { [weak self] presentation in
-                self?.updateStatusItem(presentation: presentation)
-            }
+        updateStatusItem()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        endOpeningPress()
         removeClickAwayMonitor()
         monitor.shutdown()
         if let statusItem {
@@ -89,10 +116,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         isPopoverOpen = false
+        endOpeningPress()
         removeClickAwayMonitor()
     }
 
-    @objc private func togglePopover() {
+    @objc private func handleStatusItemAction() {
+        switch NSApp.currentEvent?.type {
+        case .leftMouseDown:
+            if !isPopoverOpen, let timestamp = NSApp.currentEvent?.timestamp {
+                beginOpeningPress(at: timestamp)
+            }
+            togglePopover()
+        case .leftMouseUp:
+            // Showing the popover can end the button's tracking with a synthetic
+            // mouse-up action while the mouse is still held. Only the event
+            // monitors below may finish the opening press.
+            break
+        default:
+            togglePopover()
+        }
+    }
+
+    private func beginOpeningPress(at timestamp: TimeInterval) {
+        endOpeningPress()
+        openingPressTimestamp = timestamp
+        // Watch releases outside the button too, including in other apps.
+        localReleaseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) {
+            [weak self] event in
+            self?.finishOpeningPress(with: event)
+            return event
+        }
+        globalReleaseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) {
+            [weak self] event in
+            self?.finishOpeningPress(with: event)
+        }
+    }
+
+    private func finishOpeningPress(with event: NSEvent) {
+        guard let timestamp = openingPressTimestamp else { return }
+        endOpeningPress()
+        if event.timestamp - timestamp >= 0.5 {
+            closePopover()
+        }
+    }
+
+    private func endOpeningPress() {
+        openingPressTimestamp = nil
+        if let localReleaseMonitor {
+            NSEvent.removeMonitor(localReleaseMonitor)
+            self.localReleaseMonitor = nil
+        }
+        if let globalReleaseMonitor {
+            NSEvent.removeMonitor(globalReleaseMonitor)
+            self.globalReleaseMonitor = nil
+        }
+    }
+
+    private func togglePopover() {
         guard let button = statusItem?.button else { return }
         if isPopoverOpen {
             closePopover()
@@ -122,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if settingsWindow == nil {
             let controller = NSHostingController(rootView: SettingsView(monitor: monitor))
             let window = NSWindow(contentViewController: controller)
-            window.title = "Codex Limits Settings"
+            window.title = "\(monitor.provider.displayName) Limits Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.setContentSize(NSSize(width: 380, height: 600))
@@ -153,10 +233,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var isStatusItemClick: Bool {
         guard let button = statusItem?.button, let window = button.window else { return false }
         let buttonFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
-        return buttonFrame.contains(NSEvent.mouseLocation)
+        // The menu bar also routes clicks in the status window's padding to
+        // the button, so include its full frame on every side.
+        let statusFrame = buttonFrame.union(window.frame)
+        // Leave those clicks to togglePopover, including the exact screen edge,
+        // so mouse-down cannot close the popover before mouse-up reopens it.
+        let topEdge = max(statusFrame.maxY, window.screen?.frame.maxY ?? statusFrame.maxY)
+        let location = NSEvent.mouseLocation
+        return location.x >= statusFrame.minX && location.x < statusFrame.maxX
+            && location.y >= statusFrame.minY && location.y <= topEdge
     }
 
     private func closePopover() {
+        endOpeningPress()
         isPopoverOpen = false
         popover.close()
     }
@@ -242,7 +331,7 @@ private enum StatusItemImage {
             return true
         }
         result.isTemplate = true
-        result.accessibilityDescription = "Codex usage \(title)"
+        result.accessibilityDescription = "Usage \(title)"
         return result
     }
 }

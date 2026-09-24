@@ -3,6 +3,10 @@ import Charts
 import ServiceManagement
 import SwiftUI
 
+// The macOS 27 SDK turns `@State` into a macro whose plugin ships only with Xcode.
+// Referring to the property wrapper through a typealias keeps Command Line Tools builds working.
+typealias ViewState<Value> = SwiftUI.State<Value>
+
 struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     var openSettingsAction: (() -> Void)?
@@ -13,8 +17,8 @@ struct MenuContentView: View {
     @AppStorage(EstimatedRuntimeChartPreferences.reversesYAxisKey) private var reversesEstimatedRuntimeChart = true
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @Environment(\.openSettings) private var openSettings
-    @State private var chartMode: ChartMode = .usage
-    @State private var usageWindowOffset = 0
+    @ViewState private var chartMode: ChartMode = .usage
+    @ViewState private var usageWindowOffset = 0
 
     var body: some View {
         Group {
@@ -113,6 +117,28 @@ struct MenuContentView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
+                if monitor.availableLimitWindows.count > 1 {
+                    HStack {
+                        Spacer()
+                        Picker("Limit", selection: Binding(
+                            get: { monitor.selectedLimitWindow },
+                            set: { window in
+                                usageWindowOffset = 0
+                                monitor.selectLimitWindow(window)
+                            }
+                        )) {
+                            ForEach(monitor.availableLimitWindows) { window in
+                                Text(window.label).tag(window)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help("Choose which usage limit to show")
+                        .accessibilityLabel("Usage limit")
+                    }
+                }
                 HStack {
                     Spacer()
                     if chartMode == .usage {
@@ -199,7 +225,8 @@ struct MenuContentView: View {
                         fetchedAt: snapshot.fetchedAt,
                         factorInPauses: factorInPauses,
                         showsPreviousWindow: showPreviousWeeklyWindow,
-                        reversesYAxis: reversesEstimatedRuntimeChart
+                        reversesYAxis: reversesEstimatedRuntimeChart,
+                        providerName: monitor.provider.displayName
                     )
                 }
             }
@@ -225,7 +252,7 @@ struct MenuContentView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .help("Estimated active Codex hours supported by the remaining allowance at the current weekly pace")
+                        .help("Estimated active \(monitor.provider.displayName) hours supported by the remaining allowance at the current weekly pace")
                         HStack(spacing: 6) {
                             Text("Suggested pace")
                                 .foregroundStyle(.secondary)
@@ -330,7 +357,7 @@ struct MenuContentView: View {
                                 .stroke(.secondary.opacity(0.4), lineWidth: 1)
                         }
                         .fixedSize()
-                        .help("Codex subscription")
+                        .help("\(monitor.provider.displayName) subscription")
                         .padding(.trailing, 1.5)
                 }
                 Button {
@@ -385,7 +412,9 @@ struct MenuContentView: View {
 
     private func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {
         ([snapshot.mainLimit] + snapshot.otherLimits)
-            .first { $0.limitId == "codex" && $0.window.durationMinutes == 10_080 }?
+            .first {
+                $0.limitId == snapshot.mainLimit.limitId && $0.window.durationMinutes == 10_080
+            }?
             .window
     }
 
@@ -393,12 +422,12 @@ struct MenuContentView: View {
         VStack(spacing: 12) {
             if monitor.isProcessing {
                 ProgressView()
-                Text(monitor.isAnalyzingActivity ? "Recalculating pace…" : "Reading Codex usage…")
+                Text(monitor.isAnalyzingActivity ? "Recalculating pace…" : "Reading \(monitor.provider.displayName) usage…")
                     .foregroundStyle(.secondary)
             } else {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.title2)
-                Text(monitor.errorMessage ?? "Codex usage is not available.")
+                Text(monitor.errorMessage ?? "\(monitor.provider.displayName) usage is not available.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                 Button("Try Again") {
@@ -564,6 +593,7 @@ private struct WeeklyPaceChart: View {
     let factorInPauses: Bool
     let showsPreviousWindow: Bool
     let reversesYAxis: Bool
+    let providerName: String
 
     private var displayedPoints: [WeeklyPacePoint] {
         points
@@ -687,7 +717,7 @@ private struct WeeklyPaceChart: View {
                 ContentUnavailableView(
                     "Not enough pace data",
                     systemImage: "chart.xyaxis.line",
-                    description: Text("Use Codex while this app records weekly usage history.")
+                    description: Text("Use \(providerName) while this app records weekly usage history.")
                 )
                 .frame(height: 190)
             } else {
@@ -793,7 +823,7 @@ private struct WeeklyPaceHoverOverlay: View {
     let maximumHours: Double
     let resetPosition: Double?
     let latestValue: LatestWeeklyPaceValue?
-    @State private var hoveredPace: HoveredWeeklyPace?
+    @ViewState private var hoveredPace: HoveredWeeklyPace?
 
     var body: some View {
         GeometryReader { geometry in
@@ -1759,7 +1789,7 @@ private struct BurnDownHoverOverlay: View {
     let segments: [BurnDownHoverSegment]
     let target: BurnDownHoverSegment
     @AppStorage(UsageChartPreferences.showsTargetHoverLabelKey) private var showsTargetHoverLabel = false
-    @State private var hoveredValue: HoveredBurnDownValue?
+    @ViewState private var hoveredValue: HoveredBurnDownValue?
 
     private var hoveredTargetPercent: Double? {
         guard showsTargetHoverLabel, let hoveredValue else { return nil }
@@ -2044,13 +2074,21 @@ struct SettingsView: View {
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
     @AppStorage(UsageMonitor.remoteSessionsEnabledKey) private var remoteSessionsEnabled = false
-    @State private var loginItemError: String?
-    @State private var isResetHistoryConfirmationPresented = false
-    @State private var availableSSHProfiles: [String] = []
-    @State private var selectedSSHProfiles: Set<String> = []
+    @AppStorage(UsageProvider.preferenceKey) private var provider = UsageProvider.codex
+    @ViewState private var loginItemError: String?
+    @ViewState private var isResetHistoryConfirmationPresented = false
+    @ViewState private var availableSSHProfiles: [String] = []
+    @ViewState private var selectedSSHProfiles: Set<String> = []
 
     var body: some View {
         Form {
+            Picker("Service", selection: $provider) {
+                ForEach(UsageProvider.allCases) { provider in
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+            .help("Choose which subscription's limits to track. Each service keeps its own history.")
+
             Toggle("Launch at login", isOn: Binding(
                 get: { launchAtLogin },
                 set: updateLaunchAtLogin
@@ -2164,38 +2202,42 @@ struct SettingsView: View {
                 Toggle("Show green target label on hover", isOn: $showsTargetHoverLabel)
                     .help("Show the target percentage at the cursor when the usage and target lines differ by more than 10 percentage points")
 
-                Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
+                if monitor.provider == .codex {
+                    Toggle("Hide 5.3-Spark limit", isOn: $hideCodex53Spark)
+                }
             }
 
-            Section("Remote Codex sessions") {
-                Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
-                    .onChange(of: remoteSessionsEnabled) { _, enabled in
-                        monitor.updateRemoteSessionsEnabled(enabled)
-                    }
-
-                Text("Uses SSH hosts from ~/.ssh/config and adds their Codex session activity to runtime and weekly pace estimates.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if remoteSessionsEnabled {
-                    if availableSSHProfiles.isEmpty {
-                        Text("No named SSH hosts were found.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(availableSSHProfiles, id: \.self) { profile in
-                            Toggle(profile, isOn: Binding(
-                                get: { selectedSSHProfiles.contains(profile) },
-                                set: { selectProfile(profile, enabled: $0) }
-                            ))
+            if monitor.provider.supportsRemoteSessions {
+                Section("Remote Codex sessions") {
+                    Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
+                        .onChange(of: remoteSessionsEnabled) { _, enabled in
+                            monitor.updateRemoteSessionsEnabled(enabled)
                         }
-                    }
 
-                    Button("Reload SSH Profiles", action: loadSSHProfiles)
+                    Text("Uses SSH hosts from ~/.ssh/config and adds their Codex session activity to runtime and weekly pace estimates.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                    if let remoteError = monitor.remoteActivityErrorMessage {
-                        Label(remoteError, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if remoteSessionsEnabled {
+                        if availableSSHProfiles.isEmpty {
+                            Text("No named SSH hosts were found.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(availableSSHProfiles, id: \.self) { profile in
+                                Toggle(profile, isOn: Binding(
+                                    get: { selectedSSHProfiles.contains(profile) },
+                                    set: { selectProfile(profile, enabled: $0) }
+                                ))
+                            }
+                        }
+
+                        Button("Reload SSH Profiles", action: loadSSHProfiles)
+
+                        if let remoteError = monitor.remoteActivityErrorMessage {
+                            Label(remoteError, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }

@@ -26,7 +26,10 @@ final class UsageMonitor: ObservableObject {
 
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var forecast: Forecast?
+    /// Samples for the window shown as the main limit.
     @Published private(set) var samples: [UsageSample] = []
+    @Published private(set) var selectedLimitWindow = UsageLimitWindow.current
+    @Published private(set) var availableLimitWindows: [UsageLimitWindow] = []
     @Published private(set) var weeklyPaceHours: Double?
     @Published private(set) var dailyRuntimeHours: Double?
     @Published private(set) var historicalDailyRuntimeHours: Double?
@@ -41,12 +44,13 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
 
-    private static let stateKey = "usageState"
     private static let historyInstallationIDKey = "historyInstallationID"
-    private static let historySyncBookmarkKey = "historySyncBookmark"
+    let provider: UsageProvider
+    private let stateKey: String
+    private let historySyncBookmarkKey: String
     private let history: UsageHistory
     private let weeklyHistory: UsageHistory
-    private let client = CodexClient()
+    private let client: any UsageClient
     private let logger = Logger(
         subsystem: "com.github.thrr87.CodexLimits",
         category: "UsageMonitor"
@@ -55,10 +59,14 @@ final class UsageMonitor: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var refreshTimerCancellable: AnyCancellable?
     private var started = false
+    private var isShutDown = false
     private var historyPrepared = false
     private var historyUsesFiles = false
     private var configuredSyncDirectory: URL?
     private var historyConnectionActive = false
+    /// The service's snapshot before `selectedLimitWindow` is applied.
+    private var fetchedSnapshot: UsageSnapshot?
+    private var fiveHourSamples: [UsageSample] = []
     private var weeklySamples: [UsageSample] = []
     private var lastHistoryExchangeAt: Date?
     private var lastScheduledActivityWindows: [String: UsageWindow]?
@@ -74,12 +82,19 @@ final class UsageMonitor: ObservableObject {
     )?
     private static let maintenanceInterval: TimeInterval = 10 * 60
 
-    init() {
+    init(provider: UsageProvider = .current) {
+        self.provider = provider
+        stateKey = provider.storageKey("usageState")
+        historySyncBookmarkKey = provider.storageKey("historySyncBookmark")
+        client = switch provider {
+        case .codex: CodexClient()
+        case .claude: ClaudeClient()
+        }
         let defaults = UserDefaults.standard
-        if let data = defaults.data(forKey: Self.stateKey),
+        if let data = defaults.data(forKey: stateKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
-            snapshot = state.snapshot
-            samples = state.samples
+            fetchedSnapshot = state.snapshot
+            fiveHourSamples = state.samples.filter(UsageLimitWindow.isFiveHourSample)
             previousStatus = state.previousStatus
         }
 
@@ -92,13 +107,14 @@ final class UsageMonitor: ObservableObject {
             defaults.set(installationID, forKey: Self.historyInstallationIDKey)
         }
         history = UsageHistory(
-            localDirectory: Self.historyDirectory(),
+            localDirectory: Self.historyDirectory(for: provider),
             installationID: installationID
         )
         weeklyHistory = UsageHistory(
-            localDirectory: Self.weeklyHistoryDirectory(),
+            localDirectory: Self.weeklyHistoryDirectory(for: provider),
             installationID: installationID
         )
+        applyLimitWindowSelection()
         recalculate()
 
         Task { [weak self] in
@@ -137,6 +153,7 @@ final class UsageMonitor: ObservableObject {
         started = true
 
         await prepareHistory()
+        guard !isShutDown else { return }
 
         scheduleRefreshTimer()
 
@@ -148,6 +165,29 @@ final class UsageMonitor: ObservableObject {
             .store(in: &cancellables)
 
         await refresh()
+    }
+
+    func selectLimitWindow(_ window: UsageLimitWindow) {
+        guard window != selectedLimitWindow else { return }
+        UserDefaults.standard.set(window.rawValue, forKey: UsageLimitWindow.preferenceKey)
+        selectedLimitWindow = window
+        // Pace status hysteresis belongs to the previously shown window.
+        previousStatus = nil
+        applyLimitWindowSelection()
+        recalculate()
+        persist()
+    }
+
+    private func applyLimitWindowSelection() {
+        snapshot = fetchedSnapshot.map(selectedLimitWindow.applied(to:))
+        availableLimitWindows = fetchedSnapshot.map(UsageLimitWindow.available(in:)) ?? []
+        selectDisplayedSamples()
+    }
+
+    private func selectDisplayedSamples() {
+        samples = snapshot?.mainLimit.window.durationMinutes == UsageLimitWindow.weekly.durationMinutes
+            ? weeklySamples
+            : fiveHourSamples
     }
 
     func updateRefreshInterval(seconds: Int) {
@@ -235,13 +275,13 @@ final class UsageMonitor: ObservableObject {
     }
 
     func refresh() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, !isShutDown else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
         await prepareHistory()
         if !historyUsesFiles {
-            let historyState = await history.load(legacySamples: samples)
+            let historyState = await history.load(legacySamples: fiveHourSamples)
             apply(historyState)
             historyUsesFiles = historyState.errorMessage == nil
         }
@@ -260,41 +300,54 @@ final class UsageMonitor: ObservableObject {
         do {
             let newSnapshot = try await fetchTask.value
             usageReadFailed = false
-            let window = newSnapshot.mainLimit.window
+            if let fiveHourWindow = UsageLimitWindow.fiveHour.reading(in: newSnapshot)?.window {
+                let recordedState = await history.record(UsageSample(
+                    observedAt: newSnapshot.fetchedAt,
+                    remainingPercent: fiveHourWindow.remainingPercent,
+                    resetsAt: fiveHourWindow.resetsAt
+                ))
+                apply(recordedState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
+                if recordedState.errorMessage == nil {
+                    syncErrorMessage = exchangeErrorMessage
+                }
+            }
+            await recordWeeklySample(from: newSnapshot)
+
+            let displayedSnapshot = selectedLimitWindow.applied(to: newSnapshot)
+            let window = displayedSnapshot.mainLimit.window
             let sample = UsageSample(
                 observedAt: newSnapshot.fetchedAt,
                 remainingPercent: window.remainingPercent,
                 resetsAt: window.resetsAt
             )
-            let recordedState = await history.record(sample)
-            apply(recordedState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
-            if recordedState.errorMessage == nil {
-                syncErrorMessage = exchangeErrorMessage
-            }
-            await recordWeeklySample(from: newSnapshot)
-            guard samples.contains(sample)
-                    || samples.last?.remainingPercent == sample.remainingPercent else {
+            let displayedSamples = window.durationMinutes == UsageLimitWindow.weekly.durationMinutes
+                ? weeklySamples
+                : fiveHourSamples
+            guard displayedSamples.contains(sample)
+                    || displayedSamples.last?.remainingPercent == sample.remainingPercent else {
                 logger.info(
                     "Recorded pending remaining percentage increase to \(window.remainingPercent, privacy: .public); reset timestamp \(window.resetsAt.timeIntervalSince1970, privacy: .public)"
                 )
                 errorMessage = nil
                 return
             }
-            snapshot = newSnapshot
+            fetchedSnapshot = newSnapshot
+            applyLimitWindowSelection()
             errorMessage = nil
             recalculate()
             persist()
-            scheduleActivityAnalysisIfNeeded(for: newSnapshot)
-        } catch let error as CodexClientError {
-            errorMessage = error.localizedDescription
+            scheduleActivityAnalysisIfNeeded(for: displayedSnapshot)
+        } catch let error as LocalizedError where error.errorDescription != nil {
+            errorMessage = error.errorDescription
             usageReadFailed = true
         } catch {
-            errorMessage = "Couldn’t read Codex usage. Try refreshing again."
+            errorMessage = "Couldn’t read \(provider.displayName) usage. Try refreshing again."
             usageReadFailed = true
         }
     }
 
     func shutdown() {
+        isShutDown = true
         refreshTimerCancellable?.cancel()
         activityAnalysisTask?.cancel()
         remoteActivityRetryTask?.cancel()
@@ -357,7 +410,7 @@ final class UsageMonitor: ObservableObject {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            UserDefaults.standard.set(bookmark, forKey: Self.historySyncBookmarkKey)
+            UserDefaults.standard.set(bookmark, forKey: historySyncBookmarkKey)
             configuredSyncDirectory = directory
             syncFolderName = directory.lastPathComponent
         } catch {
@@ -370,7 +423,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     func stopHistorySync() async {
-        UserDefaults.standard.removeObject(forKey: Self.historySyncBookmarkKey)
+        UserDefaults.standard.removeObject(forKey: historySyncBookmarkKey)
         configuredSyncDirectory = nil
         historyConnectionActive = false
         apply(await history.disconnect())
@@ -380,6 +433,7 @@ final class UsageMonitor: ObservableObject {
         apply(await history.reset())
         _ = await weeklyHistory.reset()
         weeklySamples = []
+        selectDisplayedSamples()
         weeklyPaceHours = nil
         weeklyPacePoints = []
         lastScheduledActivityWindows = nil
@@ -408,12 +462,12 @@ final class UsageMonitor: ObservableObject {
 
     private func persist() {
         let state = StoredState(
-            snapshot: snapshot,
-            samples: historyUsesFiles ? [] : samples,
+            snapshot: fetchedSnapshot,
+            samples: historyUsesFiles ? [] : fiveHourSamples,
             previousStatus: previousStatus
         )
         if let data = try? JSONEncoder().encode(state) {
-            UserDefaults.standard.set(data, forKey: Self.stateKey)
+            UserDefaults.standard.set(data, forKey: stateKey)
         }
     }
 
@@ -421,17 +475,18 @@ final class UsageMonitor: ObservableObject {
         guard !historyPrepared else { return }
         historyPrepared = true
 
-        let state = await history.load(legacySamples: samples)
+        let state = await history.load(legacySamples: fiveHourSamples)
         apply(state)
         weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
-            from: await weeklyHistory.load(legacySamples: samples).samples
+            from: await weeklyHistory.load().samples
         )
+        selectDisplayedSamples()
         historyUsesFiles = state.errorMessage == nil
         if historyUsesFiles {
             persist()
         }
 
-        guard let bookmark = UserDefaults.standard.data(forKey: Self.historySyncBookmarkKey) else {
+        guard let bookmark = UserDefaults.standard.data(forKey: historySyncBookmarkKey) else {
             return
         }
         let directory: URL
@@ -444,7 +499,7 @@ final class UsageMonitor: ObservableObject {
                 bookmarkDataIsStale: &isStale
             )
         } catch {
-            UserDefaults.standard.removeObject(forKey: Self.historySyncBookmarkKey)
+            UserDefaults.standard.removeObject(forKey: historySyncBookmarkKey)
             syncErrorMessage = "Couldn’t reopen the history folder. Choose it again."
             return
         }
@@ -460,7 +515,7 @@ final class UsageMonitor: ObservableObject {
                     includingResourceValuesForKeys: nil,
                     relativeTo: nil
                 )
-                UserDefaults.standard.set(refreshed, forKey: Self.historySyncBookmarkKey)
+                UserDefaults.standard.set(refreshed, forKey: historySyncBookmarkKey)
             } catch {
                 syncErrorMessage = "Couldn’t update the saved history folder."
             }
@@ -480,29 +535,32 @@ final class UsageMonitor: ObservableObject {
         _ state: UsageHistory.State,
         configuredFolderName: String? = nil
     ) {
-        samples = UsageReadingValidation.removingImplausibleIncreases(from: state.samples)
+        fiveHourSamples = UsageReadingValidation.removingImplausibleIncreases(
+            from: state.samples.filter(UsageLimitWindow.isFiveHourSample)
+        )
+        selectDisplayedSamples()
         syncFolderName = state.folderName ?? configuredFolderName
         syncErrorMessage = state.errorMessage
     }
 
-    private static func historyDirectory() -> URL {
+    private static func historyDirectory(for provider: UsageProvider) -> URL {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         return base
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
-            .appendingPathComponent("History", isDirectory: true)
+            .appendingPathComponent(provider.storageKey("History"), isDirectory: true)
     }
 
-    private static func weeklyHistoryDirectory() -> URL {
+    private static func weeklyHistoryDirectory(for provider: UsageProvider) -> URL {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         return base
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
-            .appendingPathComponent("WeeklyHistory", isDirectory: true)
+            .appendingPathComponent(provider.storageKey("WeeklyHistory"), isDirectory: true)
     }
 
     private func recordWeeklySample(from snapshot: UsageSnapshot) async {
@@ -515,13 +573,14 @@ final class UsageMonitor: ObservableObject {
 
         if weeklySamples.isEmpty {
             weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
-                from: await weeklyHistory.load(legacySamples: samples + [sample]).samples
+                from: await weeklyHistory.load(legacySamples: [sample]).samples
             )
         } else {
             weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
                 from: await weeklyHistory.record(sample).samples
             )
         }
+        selectDisplayedSamples()
     }
 
     private func updateWeeklyPace(from snapshot: UsageSnapshot) async throws {
@@ -672,10 +731,18 @@ final class UsageMonitor: ObservableObject {
     private func loadActivityIntervals(since: Date, now: Date) async throws -> [ActivityInterval] {
         let defaults = UserDefaults.standard
         let includesSubagents = defaults.bool(forKey: Self.includeSubagentRuntimeKey)
-        let local = try await CodexActivityReader.loadIntervals(
-            since: since, now: now, includesSubagents: includesSubagents
-        )
-        guard defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
+        let local = switch provider {
+        case .codex:
+            try await CodexActivityReader.loadIntervals(
+                since: since, now: now, includesSubagents: includesSubagents
+            )
+        case .claude:
+            try await ClaudeActivityReader.loadIntervals(
+                since: since, now: now, includesSubagents: includesSubagents
+            )
+        }
+        guard provider.supportsRemoteSessions,
+              defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
             remoteActivityErrorMessage = nil
             return local
         }
@@ -727,7 +794,8 @@ final class UsageMonitor: ObservableObject {
             }
             guard let self, !Task.isCancelled else { return }
             self.remoteActivityRetryTask = nil
-            guard UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
+            guard self.provider.supportsRemoteSessions,
+                  UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
                   !self.remoteSSHProfiles.isEmpty,
                   let snapshot = self.snapshot else { return }
 
@@ -797,7 +865,9 @@ final class UsageMonitor: ObservableObject {
 
     private static func weeklyWindow(in snapshot: UsageSnapshot) -> UsageWindow? {
         ([snapshot.mainLimit] + snapshot.otherLimits)
-            .first { $0.limitId == "codex" && $0.window.durationMinutes == 10_080 }?
+            .first {
+                $0.limitId == snapshot.mainLimit.limitId && $0.window.durationMinutes == 10_080
+            }?
             .window
     }
 }

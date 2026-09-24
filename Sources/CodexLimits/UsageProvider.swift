@@ -23,8 +23,6 @@ enum UsageProvider: String, CaseIterable, Identifiable, Sendable {
     /// Limit ID of the provider's main usage limit in `UsageSnapshot`.
     var mainLimitID: String { rawValue }
 
-    var supportsRemoteSessions: Bool { self == .codex }
-
     /// Codex keeps the original, unsuffixed storage so existing history survives.
     func storageKey(_ base: String) -> String {
         self == .codex ? base : "\(base)-\(rawValue)"
@@ -35,6 +33,10 @@ enum UsageProvider: String, CaseIterable, Identifiable, Sendable {
 protocol UsageClient: AnyObject {
     func fetch() async throws -> UsageSnapshot
     func shutdown()
+    /// When set, the service asked to be polled again at this time instead of on the regular interval.
+    var retryAt: Date? { get }
 }
 
-extension CodexClient: UsageClient {}
+extension CodexClient: UsageClient {
+    var retryAt: Date? { nil }
+}

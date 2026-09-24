@@ -82,7 +82,8 @@ final class ClaudeClient: UsageClient {
     nonisolated private static let keychainService = "Claude Code-credentials"
     /// The usage endpoint is rate limited, so poll it at most once a minute.
     private static let minimumFetchInterval: TimeInterval = 60
-    private static let defaultRateLimitBackoff: TimeInterval = 5 * 60
+    /// Delays after consecutive rate limits; the last one repeats until a request succeeds.
+    nonisolated static let rateLimitBackoffSchedule: [TimeInterval] = [10, 60, 3 * 60, 5 * 60]
 
     private let session: URLSession
     private let now: () -> Date
@@ -90,6 +91,9 @@ final class ClaudeClient: UsageClient {
     private var lastSnapshot: UsageSnapshot?
     private var lastRequestAt: Date?
     private var backoffUntil: Date?
+    private var consecutiveRateLimits = 0
+
+    var retryAt: Date? { backoffUntil }
 
     init(session: URLSession? = nil, now: @escaping () -> Date = { Date() }) {
         if let session {
@@ -109,7 +113,7 @@ final class ClaudeClient: UsageClient {
             guard let lastSnapshot else { throw ClaudeClientError.rateLimited }
             return lastSnapshot.refetched(at: currentDate)
         }
-        if let lastSnapshot, let lastRequestAt,
+        if consecutiveRateLimits == 0, let lastSnapshot, let lastRequestAt,
            currentDate.timeIntervalSince(lastRequestAt) < Self.minimumFetchInterval {
             return lastSnapshot.refetched(at: currentDate)
         }
@@ -145,6 +149,7 @@ final class ClaudeClient: UsageClient {
             switch status {
             case 200:
                 backoffUntil = nil
+                consecutiveRateLimits = 0
                 let snapshot = try Self.decode(
                     data,
                     planType: credentials.planType,
@@ -160,13 +165,18 @@ final class ClaudeClient: UsageClient {
                 )
                 throw ClaudeClientError.authenticationFailed
             case 429:
-                let retryAfter = (response as? HTTPURLResponse)?
+                let serverRetryAfter = (response as? HTTPURLResponse)?
                     .value(forHTTPHeaderField: "Retry-After")
-                    .flatMap(TimeInterval.init) ?? Self.defaultRateLimitBackoff
-                backoffUntil = currentDate.addingTimeInterval(max(retryAfter, Self.minimumFetchInterval))
+                    .flatMap(TimeInterval.init) ?? 0
+                let delay = Self.rateLimitBackoff(
+                    afterConsecutiveRateLimits: consecutiveRateLimits,
+                    serverRetryAfter: serverRetryAfter
+                )
+                consecutiveRateLimits += 1
+                backoffUntil = currentDate.addingTimeInterval(delay)
                 CodexDiagnostics.record(
                     "Claude usage request was rate limited",
-                    details: "Retry after: \(Int(retryAfter)) seconds"
+                    details: "Server retry after: \(Int(serverRetryAfter)) seconds; retrying in \(Int(delay)) seconds"
                 )
                 guard let lastSnapshot else { throw ClaudeClientError.rateLimited }
                 return lastSnapshot.refetched(at: currentDate)
@@ -185,6 +195,15 @@ final class ClaudeClient: UsageClient {
 
     func shutdown() {
         session.invalidateAndCancel()
+    }
+
+    /// Steps through the backoff schedule, unless the server asks for a longer wait.
+    nonisolated static func rateLimitBackoff(
+        afterConsecutiveRateLimits count: Int,
+        serverRetryAfter: TimeInterval
+    ) -> TimeInterval {
+        let scheduled = rateLimitBackoffSchedule[min(max(count, 0), rateLimitBackoffSchedule.count - 1)]
+        return max(scheduled, serverRetryAfter.isFinite ? serverRetryAfter : 0)
     }
 
     private func currentCredentials(forceReload: Bool) async throws -> ClaudeCredentials {
@@ -343,19 +362,5 @@ final class ClaudeClient: UsageClient {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: text)
-    }
-}
-
-private extension UsageSnapshot {
-    func refetched(at date: Date) -> UsageSnapshot {
-        UsageSnapshot(
-            mainLimit: mainLimit,
-            otherLimits: otherLimits,
-            tokenHistory: tokenHistory,
-            emergencyResetCount: emergencyResetCount,
-            nextEmergencyResetExpiration: nextEmergencyResetExpiration,
-            fetchedAt: date,
-            planType: planType
-        )
     }
 }

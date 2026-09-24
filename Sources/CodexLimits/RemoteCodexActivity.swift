@@ -141,6 +141,7 @@ enum RemoteCodexActivityReader {
     }
 
     static func loadIntervals(
+        provider: UsageProvider = .codex,
         profiles: [String],
         since: Date,
         now: Date,
@@ -153,6 +154,7 @@ enum RemoteCodexActivityReader {
                         return ProfileResult(
                             profile: profile,
                             intervals: try await loadIntervals(
+                                provider: provider,
                                 profile: profile,
                                 since: since,
                                 now: now,
@@ -183,6 +185,7 @@ enum RemoteCodexActivityReader {
     }
 
     private static func loadIntervals(
+        provider: UsageProvider,
         profile: String,
         since: Date,
         now: Date,
@@ -205,6 +208,7 @@ enum RemoteCodexActivityReader {
             defer { try? FileManager.default.removeItem(at: workDirectory) }
 
             return try loadRemoteIntervals(
+                provider: provider,
                 profile: profile,
                 since: since,
                 now: now,
@@ -215,13 +219,14 @@ enum RemoteCodexActivityReader {
     }
 
     private static func loadRemoteIntervals(
+        provider: UsageProvider,
         profile: String,
         since: Date,
         now: Date,
         includesSubagents: Bool,
         in workDirectory: URL
     ) throws -> [ActivityInterval] {
-        guard let scriptURL = remoteActivityScriptURL() else {
+        guard let scriptURL = remoteActivityScriptURL(for: provider) else {
             throw NSError(
                 domain: "CodexLimits.RemoteActivity",
                 code: 3,
@@ -336,18 +341,19 @@ enum RemoteCodexActivityReader {
         }
     }
 
-    private static func remoteActivityScriptURL() -> URL? {
-        if let bundled = Bundle.main.url(
-            forResource: "remote-activity",
-            withExtension: "py"
-        ) {
+    private static func remoteActivityScriptURL(for provider: UsageProvider) -> URL? {
+        let name = switch provider {
+        case .codex: "remote-activity"
+        case .claude: "remote-claude-activity"
+        }
+        if let bundled = Bundle.main.url(forResource: name, withExtension: "py") {
             return bundled
         }
         let sourceTree = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("Resources/remote-activity.py")
+            .appendingPathComponent("Resources/\(name).py")
         return FileManager.default.fileExists(atPath: sourceTree.path) ? sourceTree : nil
     }
 }

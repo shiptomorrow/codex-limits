@@ -240,7 +240,7 @@ struct MenuContentView: View {
                                 .lineLimit(1)
                             Spacer(minLength: 0)
                             if let usageRemaining = estimatedUsageRemainingText(
-                                window: snapshot.mainLimit.window
+                                window: weeklyWindow(in: snapshot)
                             ) {
                                 HStack(spacing: 1.5) {
                                     Text("~")
@@ -258,7 +258,7 @@ struct MenuContentView: View {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             Spacer(minLength: 0)
-                            Text(paceText(window: snapshot.mainLimit.window, now: context.date))
+                            Text(paceText(window: weeklyWindow(in: snapshot), now: context.date))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.75)
                         }
@@ -400,8 +400,9 @@ struct MenuContentView: View {
         return oneDecimal(hoursPerDay)
     }
 
-    private func estimatedUsageRemainingText(window: UsageWindow) -> String? {
-        guard let hours = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
+    private func estimatedUsageRemainingText(window: UsageWindow?) -> String? {
+        guard let window,
+              let hours = DailyRuntimeCalculator.estimatedUsageHoursRemaining(
             weeklyPaceHours: monitor.weeklyPaceHours,
             remainingPercent: window.remainingPercent
         ) else {
@@ -510,8 +511,10 @@ struct MenuContentView: View {
             + Text(" your limit.").foregroundColor(.secondary)
     }
 
-    private func paceText(window: UsageWindow, now: Date) -> String {
-        guard let recommendedHoursPerDay = DailyRuntimeCalculator.suggestedDailyUsageHours(
+    /// Hours per day are budgeted from the weekly allowance, whichever limit is shown.
+    private func paceText(window: UsageWindow?, now: Date) -> String {
+        guard let window,
+              let recommendedHoursPerDay = DailyRuntimeCalculator.suggestedDailyUsageHours(
             weeklyPaceHours: monitor.weeklyPaceHours,
             remainingPercent: window.remainingPercent,
             safetyBuffer: safetyBuffer,
@@ -2207,37 +2210,35 @@ struct SettingsView: View {
                 }
             }
 
-            if monitor.provider.supportsRemoteSessions {
-                Section("Remote Codex sessions") {
-                    Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
-                        .onChange(of: remoteSessionsEnabled) { _, enabled in
-                            monitor.updateRemoteSessionsEnabled(enabled)
+            Section("Remote \(monitor.provider.displayName) sessions") {
+                Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
+                    .onChange(of: remoteSessionsEnabled) { _, enabled in
+                        monitor.updateRemoteSessionsEnabled(enabled)
+                    }
+
+                Text("Uses SSH hosts from ~/.ssh/config and adds their \(monitor.provider.displayName) session activity to runtime and weekly pace estimates.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if remoteSessionsEnabled {
+                    if availableSSHProfiles.isEmpty {
+                        Text("No named SSH hosts were found.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(availableSSHProfiles, id: \.self) { profile in
+                            Toggle(profile, isOn: Binding(
+                                get: { selectedSSHProfiles.contains(profile) },
+                                set: { selectProfile(profile, enabled: $0) }
+                            ))
                         }
+                    }
 
-                    Text("Uses SSH hosts from ~/.ssh/config and adds their Codex session activity to runtime and weekly pace estimates.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Button("Reload SSH Profiles", action: loadSSHProfiles)
 
-                    if remoteSessionsEnabled {
-                        if availableSSHProfiles.isEmpty {
-                            Text("No named SSH hosts were found.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(availableSSHProfiles, id: \.self) { profile in
-                                Toggle(profile, isOn: Binding(
-                                    get: { selectedSSHProfiles.contains(profile) },
-                                    set: { selectProfile(profile, enabled: $0) }
-                                ))
-                            }
-                        }
-
-                        Button("Reload SSH Profiles", action: loadSSHProfiles)
-
-                        if let remoteError = monitor.remoteActivityErrorMessage {
-                            Label(remoteError, systemImage: "exclamationmark.triangle")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    if let remoteError = monitor.remoteActivityErrorMessage {
+                        Label(remoteError, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }

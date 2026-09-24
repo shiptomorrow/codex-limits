@@ -24,7 +24,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Can optionally replicate usage history through a private folder selected by the user.
 - Checks current usage every 15 seconds by default, configurable from one second to one hour.
 - Refreshes session-derived pace estimates when a reported usage percentage or window changes.
-- Can include Codex sessions from selected hosts in the user's `~/.ssh/config` in runtime and weekly pace calculations.
+- Can include Codex or Claude Code sessions from selected hosts in the user's `~/.ssh/config` in runtime and weekly pace calculations.
 - Exchanges shared history at most once every ten minutes.
 - Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.
 
@@ -37,7 +37,7 @@ Codex Limits is local-first:
 - It does not copy or store Codex credentials.
 - It starts the user-managed Codex CLI and reads usage through its local app-server interface.
 - For the weekly-hours estimate, it reads only task timestamps, task boundaries, and token-count metadata from local Codex session files. It does not use prompt or response text.
-- If remote sessions are enabled, it connects with the system `ssh` command in batch mode. A Python helper maintains an incremental timing cache under `~/.codex/codex-limits` on each selected host and returns only calculated activity intervals. Raw session files never leave the host.
+- If remote sessions are enabled, it connects with the system `ssh` command in batch mode. A Python helper maintains an incremental timing cache on each selected host, under `~/.codex/codex-limits` for Codex or `~/.claude/codex-limits` for Claude, and returns only calculated activity intervals. Raw session files never leave the host.
 - It keeps a local incremental cache of that timing metadata and session file sizes so unchanged JSONL content does not need to be parsed again.
 - It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
 - Weekly-limit samples used by the activity estimate remain local and are not copied to a sync folder.

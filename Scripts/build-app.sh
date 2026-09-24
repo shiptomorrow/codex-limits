@@ -15,6 +15,7 @@ cp .build/release/CodexLimits "$app_dir/Contents/MacOS/CodexLimits"
 cp Resources/Info.plist "$app_dir/Contents/Info.plist"
 cp Resources/AppIcon.icns "$app_dir/Contents/Resources/AppIcon.icns"
 cp Resources/remote-activity.py "$app_dir/Contents/Resources/remote-activity.py"
+cp Resources/remote-claude-activity.py "$app_dir/Contents/Resources/remote-claude-activity.py"
 codesign --force --sign - "$app_dir"
 
 print -r -- "$app_dir"

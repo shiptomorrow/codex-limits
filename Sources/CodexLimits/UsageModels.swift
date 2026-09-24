@@ -370,6 +370,21 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+extension UsageSnapshot {
+    /// The same reading, stamped as observed at `date`.
+    func refetched(at date: Date) -> UsageSnapshot {
+        UsageSnapshot(
+            mainLimit: mainLimit,
+            otherLimits: otherLimits,
+            tokenHistory: tokenHistory,
+            emergencyResetCount: emergencyResetCount,
+            nextEmergencyResetExpiration: nextEmergencyResetExpiration,
+            fetchedAt: date,
+            planType: planType
+        )
+    }
+}
+
 enum PaceStatus: String, Codable, Equatable, Sendable {
     case slowDown
     case onTrack

@@ -73,6 +73,7 @@ final class UsageMonitor: ObservableObject {
     private var pendingActivitySnapshot: UsageSnapshot?
     private var activityAnalysisTask: Task<Void, Never>?
     private var remoteActivityRetryTask: Task<Void, Never>?
+    private var rateLimitRetryTask: Task<Void, Never>?
     private var cachedRemoteActivity: (
         profiles: [String],
         includesSubagents: Bool,
@@ -154,6 +155,14 @@ final class UsageMonitor: ObservableObject {
 
         await prepareHistory()
         guard !isShutDown else { return }
+
+        // Pace only needs the weekly window, so start from the saved reading
+        // rather than waiting for a fetch that may be rate limited.
+        if let saved = snapshot,
+           let weeklyWindow = Self.weeklyWindow(in: saved),
+           weeklyWindow.resetsAt > Date() {
+            scheduleActivityAnalysisIfNeeded(for: saved.refetched(at: Date()))
+        }
 
         scheduleRefreshTimer()
 
@@ -287,6 +296,7 @@ final class UsageMonitor: ObservableObject {
         }
 
         let fetchTask = Task { try await client.fetch() }
+        defer { scheduleRateLimitRetry() }
         var exchangeErrorMessage = syncErrorMessage
         if maintenanceIsDue(since: lastHistoryExchangeAt, now: Date()) {
             let historyState = await exchangeHistory()
@@ -349,6 +359,7 @@ final class UsageMonitor: ObservableObject {
     func shutdown() {
         isShutDown = true
         refreshTimerCancellable?.cancel()
+        rateLimitRetryTask?.cancel()
         activityAnalysisTask?.cancel()
         remoteActivityRetryTask?.cancel()
         client.shutdown()
@@ -362,6 +373,25 @@ final class UsageMonitor: ObservableObject {
         lastScheduledActivityWindows = nil
         guard let snapshot else { return }
         scheduleActivityAnalysisIfNeeded(for: snapshot)
+    }
+
+    /// Retries at the client's backoff time, which can be sooner than the refresh interval.
+    private func scheduleRateLimitRetry() {
+        rateLimitRetryTask?.cancel()
+        rateLimitRetryTask = nil
+        guard !isShutDown, let retryAt = client.retryAt else { return }
+        let delay = retryAt.timeIntervalSinceNow
+        guard delay > 0 else { return }
+        rateLimitRetryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.rateLimitRetryTask = nil
+            await self.refresh()
+        }
     }
 
     private func scheduleRefreshTimer() {
@@ -446,6 +476,8 @@ final class UsageMonitor: ObservableObject {
         guard let snapshot else { return }
         let storedBuffer = UserDefaults.standard.object(forKey: Self.safetyBufferKey) as? Double
         let buffer = safetyBuffer ?? storedBuffer ?? 3
+        // Runtime rates are percentages of the weekly allowance, so they don't apply to the 5-hour window.
+        let isWeekly = snapshot.mainLimit.window.durationMinutes == UsageLimitWindow.weekly.durationMinutes
         let result = ForecastEngine.evaluate(
             window: snapshot.mainLimit.window,
             samples: samples,
@@ -453,8 +485,8 @@ final class UsageMonitor: ObservableObject {
             safetyBuffer: buffer,
             now: snapshot.fetchedAt,
             previousStatus: previousStatus,
-            runtimePercentPerDay: runtimePercentPerDay,
-            historicalRuntimePercentPerDay: historicalRuntimePercentPerDay
+            runtimePercentPerDay: isWeekly ? runtimePercentPerDay : nil,
+            historicalRuntimePercentPerDay: isWeekly ? historicalRuntimePercentPerDay : nil
         )
         forecast = result
         previousStatus = result.status
@@ -741,8 +773,7 @@ final class UsageMonitor: ObservableObject {
                 since: since, now: now, includesSubagents: includesSubagents
             )
         }
-        guard provider.supportsRemoteSessions,
-              defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
+        guard defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
             remoteActivityErrorMessage = nil
             return local
         }
@@ -762,6 +793,7 @@ final class UsageMonitor: ObservableObject {
             remote = cachedRemoteActivity.result
         } else {
             remote = await RemoteCodexActivityReader.loadIntervals(
+                provider: provider,
                 profiles: profiles,
                 since: since,
                 now: now,
@@ -794,8 +826,7 @@ final class UsageMonitor: ObservableObject {
             }
             guard let self, !Task.isCancelled else { return }
             self.remoteActivityRetryTask = nil
-            guard self.provider.supportsRemoteSessions,
-                  UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
+            guard UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
                   !self.remoteSSHProfiles.isEmpty,
                   let snapshot = self.snapshot else { return }
 

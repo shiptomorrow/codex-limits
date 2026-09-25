@@ -191,127 +191,29 @@ enum RemoteCodexActivityReader {
         now: Date,
         includesSubagents: Bool = false
     ) async throws -> [ActivityInterval] {
-        guard SystemSSHProfiles.isConcreteAlias(profile) else {
-            throw NSError(
-                domain: "CodexLimits.RemoteActivity",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid SSH profile name"]
-            )
-        }
-        return try await Task.detached(priority: .utility) {
-            let workDirectory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("CodexLimitsRemote-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(
-                at: workDirectory,
-                withIntermediateDirectories: true
-            )
-            defer { try? FileManager.default.removeItem(at: workDirectory) }
-
-            return try loadRemoteIntervals(
-                provider: provider,
-                profile: profile,
-                since: since,
-                now: now,
-                includesSubagents: includesSubagents,
-                in: workDirectory
-            )
-        }.value
-    }
-
-    private static func loadRemoteIntervals(
-        provider: UsageProvider,
-        profile: String,
-        since: Date,
-        now: Date,
-        includesSubagents: Bool,
-        in workDirectory: URL
-    ) throws -> [ActivityInterval] {
-        guard let scriptURL = remoteActivityScriptURL(for: provider) else {
+        guard let scriptURL = RemoteSSHCommand.scriptURL(
+            named: provider == .codex ? "remote-activity" : "remote-claude-activity"
+        ) else {
             throw NSError(
                 domain: "CodexLimits.RemoteActivity",
                 code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "Remote activity helper is missing"]
             )
         }
-        let outputURL = workDirectory.appendingPathComponent("intervals.json")
-        let errorURL = workDirectory.appendingPathComponent("ssh-error.log")
-        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-        _ = FileManager.default.createFile(atPath: errorURL.path, contents: nil)
-
-        let scriptInput = try FileHandle(forReadingFrom: scriptURL)
-        let output = try FileHandle(forWritingTo: outputURL)
-        let sshError = try FileHandle(forWritingTo: errorURL)
-        defer {
-            try? scriptInput.close()
-            try? output.close()
-            try? sshError.close()
-        }
-
-        let ssh = Process()
-        ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        ssh.arguments = [
-            "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=\(RemoteSSHPolicy.connectTimeoutSeconds)",
-            "-o", "ConnectionAttempts=1",
-            profile,
-            "python3 - \(since.timeIntervalSince1970) \(now.timeIntervalSince1970) \(includesSubagents ? 1 : 0)"
-        ]
-        ssh.standardInput = scriptInput
-        ssh.standardOutput = output
-        ssh.standardError = sshError
+        let output = try await RemoteSSHCommand.run(
+            profile: profile,
+            script: scriptURL,
+            arguments: [
+                String(since.timeIntervalSince1970),
+                String(now.timeIntervalSince1970),
+                includesSubagents ? "1" : "0"
+            ],
+            timeout: RemoteSSHPolicy.operationTimeout,
+            purpose: "activity"
+        )
 
         do {
-            try ssh.run()
-        } catch {
-            if ssh.isRunning { ssh.terminate() }
-            CodexDiagnostics.record(
-                "Remote SSH launch failed for profile \(profile)",
-                details: error.localizedDescription
-            )
-            throw error
-        }
-
-        let sshDeadline = Date().addingTimeInterval(RemoteSSHPolicy.operationTimeout)
-        while ssh.isRunning, Date() < sshDeadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if ssh.isRunning {
-            ssh.terminate()
-            let error = NSError(
-                domain: "CodexLimits.RemoteActivity",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "SSH session timed out"]
-            )
-            CodexDiagnostics.record(
-                "Remote SSH timed out for profile \(profile)",
-                details: "The remote activity request exceeded \(Int(RemoteSSHPolicy.operationTimeout)) seconds."
-            )
-            throw error
-        }
-        ssh.waitUntilExit()
-        try? output.close()
-        try? sshError.close()
-
-        if ssh.terminationStatus != 0 {
-            let detail = ((try? String(contentsOf: errorURL, encoding: .utf8)) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            CodexDiagnostics.record(
-                "Remote SSH failed for profile \(profile) with exit code \(ssh.terminationStatus)",
-                details: detail.isEmpty ? "SSH produced no error output." : detail
-            )
-            throw NSError(
-                domain: "CodexLimits.RemoteActivity",
-                code: Int(ssh.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: detail.isEmpty ? "SSH connection failed" : detail]
-            )
-        }
-
-        do {
-            let payload = try JSONDecoder().decode(
-                IntervalPayload.self,
-                from: Data(contentsOf: outputURL)
-            )
+            let payload = try JSONDecoder().decode(IntervalPayload.self, from: output)
             guard payload.version == 1 else {
                 throw NSError(
                     domain: "CodexLimits.RemoteActivity",
@@ -328,10 +230,9 @@ enum RemoteCodexActivityReader {
                 )
             }
         } catch {
-            let response = ((try? String(contentsOf: outputURL, encoding: .utf8)) ?? "")
             CodexDiagnostics.record(
                 "Remote activity response could not be decoded for profile \(profile)",
-                details: "\(error.localizedDescription)\n\(response)"
+                details: "\(error.localizedDescription)\n\(String(decoding: output, as: UTF8.self))"
             )
             throw NSError(
                 domain: "CodexLimits.RemoteActivity",
@@ -340,12 +241,146 @@ enum RemoteCodexActivityReader {
             )
         }
     }
+}
 
-    private static func remoteActivityScriptURL(for provider: UsageProvider) -> URL? {
-        let name = switch provider {
-        case .codex: "remote-activity"
-        case .claude: "remote-claude-activity"
+/// Runs a bundled Python helper on an SSH host and returns its standard output.
+enum RemoteSSHCommand {
+    /// Pipes `script` into `python3 -` with `arguments`, which must not need shell quoting.
+    static func run(
+        profile: String,
+        script: URL,
+        arguments: [String],
+        timeout: TimeInterval,
+        purpose: String
+    ) async throws -> Data {
+        try await run(
+            profile: profile,
+            input: script,
+            remoteCommand: (["python3", "-"] + arguments).joined(separator: " "),
+            timeout: timeout,
+            purpose: purpose
+        )
+    }
+
+    /// Runs `remoteCommand` in the host's shell with `input` as standard input.
+    static func run(
+        profile: String,
+        input: URL,
+        remoteCommand: String,
+        timeout: TimeInterval,
+        purpose: String
+    ) async throws -> Data {
+        guard SystemSSHProfiles.isConcreteAlias(profile) else {
+            throw NSError(
+                domain: "CodexLimits.RemoteSSH",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid SSH profile name"]
+            )
         }
+        return try await Task.detached(priority: .utility) {
+            let workDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("CodexLimitsRemote-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: workDirectory,
+                withIntermediateDirectories: true
+            )
+            defer { try? FileManager.default.removeItem(at: workDirectory) }
+
+            return try runSynchronously(
+                profile: profile,
+                input: input,
+                remoteCommand: remoteCommand,
+                timeout: timeout,
+                purpose: purpose,
+                in: workDirectory
+            )
+        }.value
+    }
+
+    private static func runSynchronously(
+        profile: String,
+        input inputURL: URL,
+        remoteCommand: String,
+        timeout: TimeInterval,
+        purpose: String,
+        in workDirectory: URL
+    ) throws -> Data {
+        let outputURL = workDirectory.appendingPathComponent("output.json")
+        let errorURL = workDirectory.appendingPathComponent("ssh-error.log")
+        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        _ = FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+
+        let scriptInput = try FileHandle(forReadingFrom: inputURL)
+        let output = try FileHandle(forWritingTo: outputURL)
+        let sshError = try FileHandle(forWritingTo: errorURL)
+        defer {
+            try? scriptInput.close()
+            try? output.close()
+            try? sshError.close()
+        }
+
+        let ssh = Process()
+        ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        ssh.arguments = [
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=\(RemoteSSHPolicy.connectTimeoutSeconds)",
+            "-o", "ConnectionAttempts=1",
+            profile,
+            remoteCommand
+        ]
+        ssh.standardInput = scriptInput
+        ssh.standardOutput = output
+        ssh.standardError = sshError
+
+        do {
+            try ssh.run()
+        } catch {
+            if ssh.isRunning { ssh.terminate() }
+            CodexDiagnostics.record(
+                "Remote SSH launch failed for profile \(profile)",
+                details: error.localizedDescription
+            )
+            throw error
+        }
+
+        let sshDeadline = Date().addingTimeInterval(timeout)
+        while ssh.isRunning, Date() < sshDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if ssh.isRunning {
+            ssh.terminate()
+            CodexDiagnostics.record(
+                "Remote SSH timed out for profile \(profile)",
+                details: "The remote \(purpose) request exceeded \(Int(timeout)) seconds."
+            )
+            throw NSError(
+                domain: "CodexLimits.RemoteSSH",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "SSH session timed out"]
+            )
+        }
+        ssh.waitUntilExit()
+        try? output.close()
+        try? sshError.close()
+
+        if ssh.terminationStatus != 0 {
+            let detail = ((try? String(contentsOf: errorURL, encoding: .utf8)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            CodexDiagnostics.record(
+                "Remote SSH failed for profile \(profile) with exit code \(ssh.terminationStatus)",
+                details: detail.isEmpty ? "SSH produced no error output." : detail
+            )
+            throw NSError(
+                domain: "CodexLimits.RemoteSSH",
+                code: Int(ssh.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: detail.isEmpty ? "SSH connection failed" : detail]
+            )
+        }
+        return try Data(contentsOf: outputURL)
+    }
+
+    static func scriptURL(named name: String) -> URL? {
         if let bundled = Bundle.main.url(forResource: name, withExtension: "py") {
             return bundled
         }

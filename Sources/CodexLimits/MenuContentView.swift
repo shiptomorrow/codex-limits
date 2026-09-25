@@ -2123,6 +2123,7 @@ struct SettingsView: View {
     @ViewState private var isResetHistoryConfirmationPresented = false
     @ViewState private var availableSSHProfiles: [String] = []
     @ViewState private var selectedSSHProfiles: Set<String> = []
+    @ViewState private var selectedUsageLogProfiles: Set<String> = []
 
     var body: some View {
         Form {
@@ -2284,6 +2285,40 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Log \(monitor.provider.displayName) usage on servers") {
+                Text("Each selected host checks \(monitor.provider.displayName) usage \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: monitor.provider))) with cron, so history continues while this Mac is off. While this Mac is reading usage itself, hosts check only \(ServerUsageLog.describe(ServerUsageLog.macLoggingCheckInterval)). This Mac imports the readings when it’s back. Hosts must be signed in to the same \(monitor.provider.displayName) account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if availableSSHProfiles.isEmpty {
+                    Text("No named SSH hosts were found.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(availableSSHProfiles, id: \.self) { profile in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Toggle(profile, isOn: Binding(
+                                get: { selectedUsageLogProfiles.contains(profile) },
+                                set: { selectUsageLogProfile(profile, enabled: $0) }
+                            ))
+                            if let status = monitor.serverUsageLogStatuses[profile] {
+                                Label(
+                                    status.text,
+                                    systemImage: status.isError ? "exclamationmark.triangle" : "checkmark.circle"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+
+                Button("Import Server Usage Now") {
+                    Task { await monitor.importServerUsageLogs() }
+                }
+                .disabled(selectedUsageLogProfiles.isEmpty)
+            }
+
             Section("History sync") {
                 Text("Keep usage history in a folder available on your other Macs.")
                     .foregroundStyle(.secondary)
@@ -2383,9 +2418,21 @@ struct SettingsView: View {
 
     private func loadSSHProfiles() {
         selectedSSHProfiles = Set(monitor.remoteSSHProfiles)
+        selectedUsageLogProfiles = Set(monitor.serverUsageLogSSHProfiles)
         availableSSHProfiles = Array(
-            Set(SystemSSHProfiles.load()).union(selectedSSHProfiles)
+            Set(SystemSSHProfiles.load())
+                .union(selectedSSHProfiles)
+                .union(selectedUsageLogProfiles)
         ).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private func selectUsageLogProfile(_ profile: String, enabled: Bool) {
+        if enabled {
+            selectedUsageLogProfiles.insert(profile)
+        } else {
+            selectedUsageLogProfiles.remove(profile)
+        }
+        Task { await monitor.setServerUsageLogging(enabled, on: profile) }
     }
 
     private func selectProfile(_ profile: String, enabled: Bool) {

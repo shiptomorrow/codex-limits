@@ -109,6 +109,19 @@ actor UsageHistory {
         return state()
     }
 
+    /// Adds samples recorded elsewhere, such as a server's usage log, under their own writer.
+    func importSamples(_ samples: [UsageSample], writer: String) -> State {
+        guard writer != installationID else { return state() }
+        do {
+            try prepareRoot(localDirectory, createIfMissing: true, coordinated: false)
+            try add(samples, to: localDirectory, installationID: writer, coordinated: false)
+            _ = try compactHistory(of: writer, in: localDirectory, coordinated: false)
+        } catch {
+            errorMessage = "Usage history couldn’t be saved."
+        }
+        return state()
+    }
+
     func connect(to directory: URL) -> State {
         do {
             try prepareRoot(directory, createIfMissing: false, coordinated: true)
@@ -288,8 +301,12 @@ actor UsageHistory {
     }
 
     private func compactOwnHistory(in root: URL, coordinated: Bool) throws -> Bool {
+        try compactHistory(of: installationID, in: root, coordinated: coordinated)
+    }
+
+    private func compactHistory(of writerID: String, in root: URL, coordinated: Bool) throws -> Bool {
         let writer = installationsDirectory(in: root)
-            .appendingPathComponent(installationID, isDirectory: true)
+            .appendingPathComponent(writerID, isDirectory: true)
         guard FileManager.default.fileExists(atPath: writer.path) else { return false }
         let files = try jsonFiles(in: writer)
         var readableFiles: [(url: URL, samples: [UsageSample])] = []

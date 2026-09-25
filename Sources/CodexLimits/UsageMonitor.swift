@@ -23,6 +23,9 @@ final class UsageMonitor: ObservableObject {
     static let showPreviousWeeklyWindowKey = "showPreviousWeeklyWindow"
     static let remoteSessionsEnabledKey = "remoteSessionsEnabled"
     static let remoteSSHProfilesKey = "remoteSSHProfiles"
+    static let serverUsageLogSSHProfilesKey = "serverUsageLogSSHProfiles"
+    private static let serverUsageLogCursorsKey = "serverUsageLogCursors"
+    private static let serverUsageLogScriptHashesKey = "serverUsageLogScriptHashes"
 
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var forecast: Forecast?
@@ -46,6 +49,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var usageReadFailed = false
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
+    @Published private(set) var serverUsageLogStatuses: [String: ServerUsageLogStatus] = [:]
 
     private static let historyInstallationIDKey = "historyInstallationID"
     let provider: UsageProvider
@@ -61,6 +65,10 @@ final class UsageMonitor: ObservableObject {
     private var previousStatus: PaceStatus?
     private var cancellables: Set<AnyCancellable> = []
     private var refreshTimerCancellable: AnyCancellable?
+    private var refreshInterval = TimeInterval(UsageRefreshSchedule.defaultSeconds)
+    /// Last successful read or rate-limited attempt. Servers checking the same account cause
+    /// rate limits here, so those still count as this Mac reading usage.
+    private var lastUsageReadAt: Date?
     private var started = false
     private var isShutDown = false
     private var historyPrepared = false
@@ -77,6 +85,8 @@ final class UsageMonitor: ObservableObject {
     private var activityAnalysisTask: Task<Void, Never>?
     private var remoteActivityRetryTask: Task<Void, Never>?
     private var rateLimitRetryTask: Task<Void, Never>?
+    private var serverUsageLogTimerCancellable: AnyCancellable?
+    private var isImportingServerUsageLogs = false
     private var cachedRemoteActivity: (
         profiles: [String],
         includesSubagents: Bool,
@@ -168,15 +178,28 @@ final class UsageMonitor: ObservableObject {
         }
 
         scheduleRefreshTimer()
+        serverUsageLogTimerCancellable = Timer.publish(
+            every: ServerUsageLog.importInterval,
+            on: .main,
+            in: .common
+        )
+        .autoconnect()
+        .sink { [weak self] _ in
+            Task { @MainActor in await self?.importServerUsageLogs() }
+        }
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
-                Task { @MainActor in await self?.refresh() }
+                Task { @MainActor in
+                    await self?.refresh()
+                    await self?.importServerUsageLogs()
+                }
             }
             .store(in: &cancellables)
 
         await refresh()
+        await importServerUsageLogs()
     }
 
     func selectLimitWindow(_ window: UsageLimitWindow) {
@@ -291,6 +314,162 @@ final class UsageMonitor: ObservableObject {
         remoteActivitySettingsChanged()
     }
 
+    var serverUsageLogSSHProfiles: [String] {
+        UserDefaults.standard.stringArray(
+            forKey: provider.storageKey(Self.serverUsageLogSSHProfilesKey)
+        ) ?? []
+    }
+
+    /// Installs or removes the usage logger on `profile`, which keeps recording while this Mac is off.
+    func setServerUsageLogging(_ enabled: Bool, on profile: String) async {
+        var profiles = Set(serverUsageLogSSHProfiles)
+        if enabled {
+            profiles.insert(profile)
+        } else {
+            profiles.remove(profile)
+        }
+        UserDefaults.standard.set(
+            profiles.sorted(),
+            forKey: provider.storageKey(Self.serverUsageLogSSHProfilesKey)
+        )
+        setServerUsageLogScriptHash(nil, for: profile)
+
+        if enabled {
+            serverUsageLogStatuses[profile] = ServerUsageLogStatus(text: "Setting up logger…", isError: false)
+            await importServerUsageLog(from: profile)
+        } else {
+            serverUsageLogStatuses[profile] = ServerUsageLogStatus(text: "Removing logger…", isError: false)
+            do {
+                try await ServerUsageLog.uninstall(profile: profile, provider: provider)
+                // The toggle may have been turned back on while the logger was being removed.
+                if !serverUsageLogSSHProfiles.contains(profile) {
+                    serverUsageLogStatuses[profile] = nil
+                }
+            } catch {
+                serverUsageLogStatuses[profile] = ServerUsageLogStatus(
+                    text: "Couldn’t remove the logger: \(Self.message(for: error))",
+                    isError: true
+                )
+            }
+        }
+    }
+
+    /// Pulls usage the enabled servers logged since the last import into history.
+    func importServerUsageLogs() async {
+        guard !isImportingServerUsageLogs, !isShutDown else { return }
+        isImportingServerUsageLogs = true
+        defer { isImportingServerUsageLogs = false }
+        await prepareHistory()
+        for profile in serverUsageLogSSHProfiles {
+            await importServerUsageLog(from: profile)
+        }
+    }
+
+    /// Servers check less often while this Mac reads usage at least as often as they would.
+    private var macLoggingUntil: Date? {
+        let now = Date()
+        guard refreshInterval <= ServerUsageLog.checkInterval(for: provider),
+              let lastUsageReadAt,
+              now.timeIntervalSince(lastUsageReadAt) < ServerUsageLog.macReadFreshness else { return nil }
+        return now.addingTimeInterval(ServerUsageLog.macLoggingLease)
+    }
+
+    private func importServerUsageLog(from profile: String) async {
+        guard !isShutDown else { return }
+        do {
+            let currentScript = ServerUsageLog.scriptHash
+            var installed: ServerUsageLogExport?
+            if currentScript == nil || serverUsageLogScriptHash(for: profile) != currentScript {
+                installed = try await ServerUsageLog.install(profile: profile, provider: provider)
+                setServerUsageLogScriptHash(currentScript, for: profile)
+            }
+            var export = try await ServerUsageLog.export(
+                profile: profile,
+                provider: provider,
+                since: serverUsageLogCursor(for: profile),
+                macLoggingUntil: macLoggingUntil
+            )
+            if !export.installed, installed == nil {
+                // The cron entry was removed on the host; schedule it again.
+                _ = try await ServerUsageLog.install(profile: profile, provider: provider)
+                setServerUsageLogScriptHash(currentScript, for: profile)
+                export = try await ServerUsageLog.export(
+                    profile: profile,
+                    provider: provider,
+                    since: serverUsageLogCursor(for: profile),
+                    macLoggingUntil: macLoggingUntil
+                )
+            }
+            guard serverUsageLogSSHProfiles.contains(profile) else { return }
+            await importServerSamples(export, from: profile)
+            serverUsageLogStatuses[profile] = ServerUsageLogStatus(export: export, provider: provider, now: Date())
+        } catch {
+            guard serverUsageLogSSHProfiles.contains(profile) else { return }
+            serverUsageLogStatuses[profile] = ServerUsageLogStatus(
+                text: "Couldn’t reach the logger: \(Self.message(for: error))",
+                isError: true
+            )
+        }
+    }
+
+    private func importServerSamples(_ export: ServerUsageLogExport, from profile: String) async {
+        let writer = ServerUsageLog.historyWriter(for: profile)
+        if !export.fiveHourSamples.isEmpty {
+            let state = await history.importSamples(export.fiveHourSamples, writer: writer)
+            apply(state, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
+        }
+        if !export.weeklySamples.isEmpty {
+            weeklySamples = UsageReadingValidation.removingImplausibleIncreases(
+                from: await weeklyHistory.importSamples(export.weeklySamples, writer: writer).samples
+            )
+            selectDisplayedSamples()
+        }
+        if let newest = export.newestEntryTime {
+            setServerUsageLogCursor(newest, for: profile)
+        }
+        guard !export.fiveHourSamples.isEmpty || !export.weeklySamples.isEmpty else { return }
+        logger.info(
+            "Imported \(export.fiveHourSamples.count + export.weeklySamples.count, privacy: .public) server usage samples from \(profile, privacy: .public)"
+        )
+        recalculate()
+        persist()
+        lastScheduledActivityWindows = nil
+        if let snapshot {
+            scheduleActivityAnalysisIfNeeded(for: snapshot)
+        }
+    }
+
+    private func serverUsageLogCursor(for profile: String) -> TimeInterval {
+        let cursors = UserDefaults.standard.dictionary(
+            forKey: provider.storageKey(Self.serverUsageLogCursorsKey)
+        )
+        return (cursors?[profile] as? Double) ?? 0
+    }
+
+    private func setServerUsageLogCursor(_ time: TimeInterval, for profile: String) {
+        let key = provider.storageKey(Self.serverUsageLogCursorsKey)
+        var cursors = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        cursors[profile] = max(time, serverUsageLogCursor(for: profile))
+        UserDefaults.standard.set(cursors, forKey: key)
+    }
+
+    private func serverUsageLogScriptHash(for profile: String) -> String? {
+        UserDefaults.standard.dictionary(
+            forKey: provider.storageKey(Self.serverUsageLogScriptHashesKey)
+        )?[profile] as? String
+    }
+
+    private func setServerUsageLogScriptHash(_ hash: String?, for profile: String) {
+        let key = provider.storageKey(Self.serverUsageLogScriptHashesKey)
+        var hashes = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        hashes[profile] = hash
+        UserDefaults.standard.set(hashes, forKey: key)
+    }
+
+    private static func message(for error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
     func refresh() async {
         guard !isRefreshing, !isShutDown else { return }
         isRefreshing = true
@@ -318,6 +497,7 @@ final class UsageMonitor: ObservableObject {
         do {
             let newSnapshot = try await fetchTask.value
             usageReadFailed = false
+            lastUsageReadAt = Date()
             if let fiveHourWindow = UsageLimitWindow.fiveHour.reading(in: newSnapshot)?.window {
                 let recordedState = await history.record(UsageSample(
                     observedAt: newSnapshot.fetchedAt,
@@ -356,6 +536,9 @@ final class UsageMonitor: ObservableObject {
             persist()
             scheduleActivityAnalysisIfNeeded(for: displayedSnapshot)
         } catch let error as LocalizedError where error.errorDescription != nil {
+            if error as? ClaudeClientError == .rateLimited {
+                lastUsageReadAt = Date()
+            }
             errorMessage = error.errorDescription
             usageReadFailed = true
         } catch {
@@ -367,6 +550,7 @@ final class UsageMonitor: ObservableObject {
     func shutdown() {
         isShutDown = true
         refreshTimerCancellable?.cancel()
+        serverUsageLogTimerCancellable?.cancel()
         rateLimitRetryTask?.cancel()
         activityAnalysisTask?.cancel()
         remoteActivityRetryTask?.cancel()
@@ -419,6 +603,7 @@ final class UsageMonitor: ObservableObject {
         } else {
             seconds = UsageRefreshSchedule.defaultSeconds
         }
+        refreshInterval = TimeInterval(seconds)
         refreshTimerCancellable = Timer.publish(
             every: TimeInterval(seconds),
             on: .main,
@@ -908,6 +1093,54 @@ final class UsageMonitor: ObservableObject {
                 $0.limitId == snapshot.mainLimit.limitId && $0.window.durationMinutes == 10_080
             }?
             .window
+    }
+}
+
+struct ServerUsageLogStatus: Equatable {
+    let text: String
+    let isError: Bool
+
+    init(text: String, isError: Bool) {
+        self.text = text
+        self.isError = isError
+    }
+
+    init(export: ServerUsageLogExport, provider: UsageProvider, now: Date) {
+        let time = { (date: Date) in
+            Calendar.current.isDate(date, inSameDayAs: now)
+                ? date.formatted(date: .omitted, time: .shortened)
+                : date.formatted(date: .abbreviated, time: .shortened)
+        }
+        var parts: [String]
+        var isError = false
+        if let lastError = export.lastError, let lastRunAt = export.lastRunAt {
+            parts = ["Logger error at \(time(lastRunAt)): \(lastError)"]
+            isError = true
+        } else if let lastRunAt = export.lastRunAt {
+            let macIsLogging = export.macLoggingUntil.map { $0 > now } ?? false
+            let staleInterval = macIsLogging
+                ? ServerUsageLog.macLoggingCheckInterval + ServerUsageLog.staleRunInterval
+                : ServerUsageLog.staleRunInterval
+            if now.timeIntervalSince(lastRunAt) > staleInterval {
+                parts = ["Logger hasn’t run since \(time(lastRunAt))"]
+                isError = true
+            } else if macIsLogging {
+                parts = [
+                    "Checking \(ServerUsageLog.describe(ServerUsageLog.macLoggingCheckInterval)) while this Mac reads usage · last check \(time(lastRunAt))"
+                ]
+            } else {
+                parts = [
+                    "Logging \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: provider))) · last check \(time(lastRunAt))"
+                ]
+            }
+        } else {
+            parts = ["Logger hasn’t run yet"]
+        }
+        if export.otherAccountEntryCount > 0 {
+            parts.append("Skipped readings from a different account than this Mac.")
+            isError = true
+        }
+        self.init(text: parts.joined(separator: ". "), isError: isError)
     }
 }
 

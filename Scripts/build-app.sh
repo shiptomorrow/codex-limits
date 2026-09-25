@@ -16,6 +16,7 @@ cp Resources/Info.plist "$app_dir/Contents/Info.plist"
 cp Resources/AppIcon.icns "$app_dir/Contents/Resources/AppIcon.icns"
 cp Resources/remote-activity.py "$app_dir/Contents/Resources/remote-activity.py"
 cp Resources/remote-claude-activity.py "$app_dir/Contents/Resources/remote-claude-activity.py"
+cp Resources/remote-usage.py "$app_dir/Contents/Resources/remote-usage.py"
 codesign --force --sign - "$app_dir"
 
 print -r -- "$app_dir"

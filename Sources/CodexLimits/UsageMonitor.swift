@@ -29,7 +29,10 @@ final class UsageMonitor: ObservableObject {
     /// Samples for the window shown as the main limit.
     @Published private(set) var samples: [UsageSample] = []
     @Published private(set) var selectedLimitWindow = UsageLimitWindow.current
+    /// Windows the service currently reports data for.
     @Published private(set) var availableLimitWindows: [UsageLimitWindow] = []
+    /// The window actually shown, which falls back from the selection when it has no data.
+    @Published private(set) var displayedLimitWindow: UsageLimitWindow?
     @Published private(set) var weeklyPaceHours: Double?
     @Published private(set) var dailyRuntimeHours: Double?
     @Published private(set) var historicalDailyRuntimeHours: Double?
@@ -190,6 +193,11 @@ final class UsageMonitor: ObservableObject {
     private func applyLimitWindowSelection() {
         snapshot = fetchedSnapshot.map(selectedLimitWindow.applied(to:))
         availableLimitWindows = fetchedSnapshot.map(UsageLimitWindow.available(in:)) ?? []
+        displayedLimitWindow = snapshot.flatMap { snapshot in
+            UsageLimitWindow.allCases.first {
+                $0.durationMinutes == snapshot.mainLimit.window.durationMinutes
+            }
+        }
         selectDisplayedSamples()
     }
 

@@ -117,23 +117,18 @@ struct MenuContentView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                if monitor.availableLimitWindows.count > 1 {
+                if !monitor.availableLimitWindows.isEmpty {
                     HStack {
                         Spacer()
-                        Picker("Limit", selection: Binding(
-                            get: { monitor.selectedLimitWindow },
-                            set: { window in
-                                usageWindowOffset = 0
-                                monitor.selectLimitWindow(window)
-                            }
-                        )) {
-                            ForEach(monitor.availableLimitWindows) { window in
-                                Text(window.label).tag(window)
-                            }
+                        // Both windows stay listed; one without data is greyed out
+                        // and the shown limit falls back to the other.
+                        LimitWindowSegmentedControl(
+                            selection: monitor.displayedLimitWindow,
+                            enabledWindows: Set(monitor.availableLimitWindows)
+                        ) { window in
+                            usageWindowOffset = 0
+                            monitor.selectLimitWindow(window)
                         }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .controlSize(.small)
                         .fixedSize()
                         .help("Choose which usage limit to show")
                         .accessibilityLabel("Usage limit")
@@ -587,6 +582,52 @@ struct MenuContentView: View {
 private enum ChartMode {
     case usage
     case weeklyPace
+}
+
+/// A native segmented control, since SwiftUI's segmented picker can't disable single segments.
+private struct LimitWindowSegmentedControl: NSViewRepresentable {
+    var selection: UsageLimitWindow?
+    var enabledWindows: Set<UsageLimitWindow>
+    var onSelect: (UsageLimitWindow) -> Void
+
+    private let windows = UsageLimitWindow.allCases
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(
+            labels: windows.map(\.label),
+            trackingMode: .selectOne,
+            target: context.coordinator,
+            action: #selector(Coordinator.selectionChanged(_:))
+        )
+        control.controlSize = .small
+        control.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        for (index, window) in windows.enumerated() {
+            control.setEnabled(enabledWindows.contains(window), forSegment: index)
+        }
+        control.selectedSegment = selection.flatMap(windows.firstIndex(of:)) ?? -1
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    final class Coordinator: NSObject {
+        var parent: LimitWindowSegmentedControl
+
+        init(parent: LimitWindowSegmentedControl) {
+            self.parent = parent
+        }
+
+        @objc func selectionChanged(_ control: NSSegmentedControl) {
+            guard parent.windows.indices.contains(control.selectedSegment) else { return }
+            parent.onSelect(parent.windows[control.selectedSegment])
+        }
+    }
 }
 
 private struct WeeklyPaceChart: View {

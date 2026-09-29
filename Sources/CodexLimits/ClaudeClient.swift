@@ -41,6 +41,10 @@ struct ClaudeCredentials: Equatable, Sendable {
     let subscriptionType: String?
     let rateLimitTier: String?
 
+    func isExpired(at date: Date) -> Bool {
+        expiresAt.map { $0 <= date } ?? false
+    }
+
     var planType: String? {
         let tier = rateLimitTier?.lowercased() ?? ""
         switch subscriptionType?.lowercased() {
@@ -75,7 +79,8 @@ struct ClaudeCredentials: Equatable, Sendable {
 
 /// Reads Claude subscription limits with the OAuth token Claude Code stores.
 /// The token is never refreshed here: refresh tokens rotate, and refreshing
-/// outside Claude Code would sign Claude Code out.
+/// outside Claude Code would sign Claude Code out. An expired token is renewed
+/// by sending Claude Code a one-word prompt instead, like the server logger does.
 @MainActor
 final class ClaudeClient: UsageClient {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
@@ -88,6 +93,9 @@ final class ClaudeClient: UsageClient {
     /// Delays after consecutive rate limits; the last one repeats until a request succeeds.
     /// Retrying sooner than a minute almost always hits the limit again.
     nonisolated static let rateLimitBackoffSchedule: [TimeInterval] = [60, 3 * 60, 5 * 60]
+    /// Mirrors `CLAUDE_LOGIN_RETRY_INTERVAL` in the server logger.
+    private static let loginRenewalRetryInterval: TimeInterval = 15 * 60
+    nonisolated private static let loginRenewalTimeout: TimeInterval = 60
 
     private let session: URLSession
     private let now: () -> Date
@@ -96,6 +104,7 @@ final class ClaudeClient: UsageClient {
     private var lastRequestAt: Date?
     private var backoffUntil: Date?
     private var consecutiveRateLimits = 0
+    private var lastLoginRenewalAt: Date?
 
     var retryAt: Date? { backoffUntil }
 
@@ -123,11 +132,18 @@ final class ClaudeClient: UsageClient {
         }
 
         for attempt in 0...1 {
-            let credentials = try await currentCredentials(forceReload: attempt > 0)
-            if let expiresAt = credentials.expiresAt, expiresAt <= currentDate {
+            var credentials = try await currentCredentials(forceReload: attempt > 0)
+            if credentials.isExpired(at: currentDate) {
                 // Claude Code may have renewed the token since it was cached.
                 if attempt == 0 { continue }
-                throw ClaudeClientError.authenticationFailed
+                // Claude Code only renews its sign-in while it runs, so it lapses after a few idle hours.
+                guard await renewLogin(at: currentDate) else {
+                    throw ClaudeClientError.authenticationFailed
+                }
+                credentials = try await currentCredentials(forceReload: true)
+                if credentials.isExpired(at: currentDate) {
+                    throw ClaudeClientError.authenticationFailed
+                }
             }
 
             var request = URLRequest(url: Self.usageURL)
@@ -208,6 +224,68 @@ final class ClaudeClient: UsageClient {
     ) -> TimeInterval {
         let scheduled = rateLimitBackoffSchedule[min(max(count, 0), rateLimitBackoffSchedule.count - 1)]
         return max(scheduled, serverRetryAfter.isFinite ? serverRetryAfter : 0)
+    }
+
+    private func renewLogin(at date: Date) async -> Bool {
+        if let lastLoginRenewalAt,
+           date.timeIntervalSince(lastLoginRenewalAt) < Self.loginRenewalRetryInterval {
+            return false
+        }
+        lastLoginRenewalAt = date
+        let renewed = await Task.detached(priority: .utility) { Self.pingClaudeCode() }.value
+        CodexDiagnostics.record(
+            renewed ? "Renewed Claude Code sign-in with a ping" : "Couldn’t renew Claude Code sign-in with a ping"
+        )
+        return renewed
+    }
+
+    /// Sends a one-word prompt on the cheapest model, with no tools, settings, MCP servers or saved session.
+    nonisolated private static func pingClaudeCode() -> Bool {
+        guard let executable = claudeExecutable() else { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [
+            "-p", "ping", "--model", "haiku", "--effort", "low", "--tools", "",
+            "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config"
+        ]
+        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = [
+            executable.deletingLastPathComponent().path,
+            environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        ].joined(separator: ":")
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        if finished.wait(timeout: .now() + loginRenewalTimeout) == .timedOut {
+            process.terminate()
+            return false
+        }
+        return process.terminationStatus == 0
+    }
+
+    /// Apps launched from Finder don't get the login PATH, so check where Claude Code installs itself.
+    nonisolated private static func claudeExecutable() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/.local/bin/claude",
+            "\(home)/.claude/local/claude",
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "\(home)/.npm-global/bin/claude",
+            "\(home)/.bun/bin/claude"
+        ]
+        return candidates
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+            .map { URL(fileURLWithPath: $0) }
     }
 
     private func currentCredentials(forceReload: Bool) async throws -> ClaudeCredentials {

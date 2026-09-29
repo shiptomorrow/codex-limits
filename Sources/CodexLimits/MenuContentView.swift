@@ -2163,6 +2163,11 @@ struct SettingsView: View {
                 } onDecrement: {
                     setRefreshInterval(previousRefreshInterval)
                 }
+                if TimeInterval(refreshIntervalSeconds) < monitor.minimumRefreshInterval {
+                    Text("\(monitor.provider.displayName) usage is checked at most \(ServerUsageLog.describe(monitor.minimumRefreshInterval)) to stay under its rate limit.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Stepper(value: $safetyBuffer, in: 1 ... 10, step: 1) {
                     Text("Suggested pace buffer: \(Int(safetyBuffer))%")
@@ -2286,7 +2291,7 @@ struct SettingsView: View {
             }
 
             Section("Log \(monitor.provider.displayName) usage on servers") {
-                Text("Each selected host checks \(monitor.provider.displayName) usage \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: monitor.provider))) with cron, so history continues while this Mac is off. While this Mac is reading usage itself, hosts check only \(ServerUsageLog.describe(ServerUsageLog.macLoggingCheckInterval)). This Mac imports the readings when it’s back. Hosts must be signed in to the same \(monitor.provider.displayName) account.")
+                Text("Each selected host checks \(monitor.provider.displayName) usage \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: monitor.provider))) with cron, so history continues while this Mac is off. While this Mac is reading usage itself, it pings hosts before each check and they pause, so they don’t share its rate limit. This Mac imports the readings when it’s back. Hosts must be signed in to the same \(monitor.provider.displayName) account.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 

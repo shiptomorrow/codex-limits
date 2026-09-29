@@ -80,10 +80,14 @@ struct ClaudeCredentials: Equatable, Sendable {
 final class ClaudeClient: UsageClient {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     nonisolated private static let keychainService = "Claude Code-credentials"
-    /// The usage endpoint is rate limited, so poll it at most once a minute.
-    private static let minimumFetchInterval: TimeInterval = 60
+    /// The usage endpoint allows about one request a minute per account, shared with
+    /// servers and other apps, so poll it at most every 90 seconds.
+    nonisolated static let minimumFetchInterval: TimeInterval = 90
+    /// Timers can fire slightly early; without slack an early tick would skip a whole interval.
+    private static let fetchIntervalSlack: TimeInterval = 5
     /// Delays after consecutive rate limits; the last one repeats until a request succeeds.
-    nonisolated static let rateLimitBackoffSchedule: [TimeInterval] = [10, 60, 3 * 60, 5 * 60]
+    /// Retrying sooner than a minute almost always hits the limit again.
+    nonisolated static let rateLimitBackoffSchedule: [TimeInterval] = [60, 3 * 60, 5 * 60]
 
     private let session: URLSession
     private let now: () -> Date
@@ -114,7 +118,7 @@ final class ClaudeClient: UsageClient {
             return lastSnapshot.refetched(at: currentDate)
         }
         if consecutiveRateLimits == 0, let lastSnapshot, let lastRequestAt,
-           currentDate.timeIntervalSince(lastRequestAt) < Self.minimumFetchInterval {
+           currentDate.timeIntervalSince(lastRequestAt) < Self.minimumFetchInterval - Self.fetchIntervalSlack {
             return lastSnapshot.refetched(at: currentDate)
         }
 

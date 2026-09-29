@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 
@@ -76,7 +77,7 @@ class RemoteUsageTests(unittest.TestCase):
         self.assertEqual([entry["t"] for entry in usage.export("codex", self.home, 100)["entries"]], [220])
 
     def test_records_missing_cli_as_logger_error(self):
-        with patch.object(usage, "codex_search_path", return_value=str(self.home)):
+        with patch.object(usage, "cli_search_path", return_value=str(self.home)):
             state = usage.log_usage("codex", self.home, now=100)
 
         self.assertEqual(state["lastError"], "cliNotFound")
@@ -93,33 +94,86 @@ class RemoteUsageTests(unittest.TestCase):
             usage.log_usage("claude", self.home, now=105)
 
         self.assertEqual(first["lastError"], "rateLimited")
-        self.assertEqual(first["backoffUntil"], 110)
+        self.assertEqual(first["backoffUntil"], 160)
         self.assertEqual(urlopen.call_count, 1)
 
-    def test_checks_less_often_while_mac_is_logging(self):
+    def test_pauses_while_mac_pings(self):
         self.install_fake_codex()
         usage.log_usage("codex", self.home, now=100)
-        exported = usage.export("codex", self.home, 0, mac_logging_until=2000)
-        self.assertEqual(exported["macLoggingUntil"], 2000)
+        self.assertEqual(usage.ping("codex", self.home, 120, now=150), {"macLoggingUntil": 270})
+        self.assertEqual(usage.export("codex", self.home, 0)["macLoggingUntil"], 270)
 
         os.environ["FAKE_USED"] = "13"
-        skipped = usage.log_usage("codex", self.home, now=160)
+        skipped = usage.log_usage("codex", self.home, now=260)
         self.assertEqual(skipped["lastRunAt"], 100)
-        checked = usage.log_usage("codex", self.home, now=100 + usage.MAC_LOGGING_CHECK_INTERVAL - 5)
-        self.assertEqual(checked["lastRunAt"], 100 + usage.MAC_LOGGING_CHECK_INTERVAL - 5)
+        resumed = usage.log_usage("codex", self.home, now=280)
+        self.assertEqual(resumed["lastRunAt"], 280)
+        self.assertEqual(len(usage.export("codex", self.home, 0)["entries"]), 2)
 
-        usage.export("codex", self.home, 0, mac_logging_until=0)
-        os.environ["FAKE_USED"] = "14"
-        resumed = usage.log_usage("codex", self.home, now=800)
-        self.assertEqual(resumed["lastRunAt"], 800)
-        self.assertEqual(len(usage.export("codex", self.home, 0)["entries"]), 3)
+    def test_ping_lease_is_capped(self):
+        until = usage.ping("claude", self.home, 86400, now=100)["macLoggingUntil"]
+        self.assertEqual(until, 100 + usage.MAXIMUM_MAC_LEASE)
+
+    def test_claude_checks_every_ninety_seconds(self):
+        self.write_claude_credentials()
+        body = json.dumps({"five_hour": {"utilization": 1, "resets_at": "2026-09-25T20:30:00Z"}}).encode()
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = body
+        with patch.object(usage.urllib.request, "urlopen", return_value=response) as urlopen:
+            # Cron ticks every 30 seconds.
+            runs = [usage.log_usage("claude", self.home, now=t)["lastRunAt"] for t in range(0, 210, 30)]
+
+        self.assertEqual(runs, [0, 0, 0, 90, 90, 90, 180])
+        self.assertEqual(urlopen.call_count, 3)
+
+    def write_claude_credentials(self, expires_at=None):
+        oauth = {"accessToken": "token"}
+        if expires_at is not None:
+            oauth["expiresAt"] = expires_at
+        (self.home / ".claude").mkdir(exist_ok=True)
+        (self.home / ".claude/.credentials.json").write_text(json.dumps({"claudeAiOauth": oauth}))
+
+    def test_claude_renews_expired_login_through_claude_code(self):
+        self.write_claude_credentials(expires_at=1000)
+        renewed = lambda home, config: self.write_claude_credentials(expires_at=4102444800000) or True
+        with patch.object(usage, "renew_claude_login", side_effect=renewed) as renew, \
+                patch.object(usage.urllib.request, "urlopen", side_effect=usage.urllib.error.URLError("offline")) as urlopen:
+            state = usage.log_usage("claude", self.home, now=100)
+
+        renew.assert_called_once()
+        urlopen.assert_called_once()
+        self.assertEqual(state["lastError"], "connectionFailed")
+
+    def test_claude_retries_failed_login_renewal_sparingly(self):
+        self.write_claude_credentials(expires_at=1000)
+        with patch.object(usage, "renew_claude_login", return_value=False) as renew, \
+                patch.object(usage.urllib.request, "urlopen") as urlopen:
+            first = usage.log_usage("claude", self.home, now=100)
+            usage.log_usage("claude", self.home, now=200)
+            usage.log_usage("claude", self.home, now=100 + usage.CLAUDE_LOGIN_RETRY_INTERVAL)
+
+        self.assertEqual(first["lastError"], "authenticationFailed")
+        self.assertEqual(renew.call_count, 2)
+        urlopen.assert_not_called()
+
+    def test_renewal_pings_cheapest_model_without_tools(self):
+        executable = self.home / "claude"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o700)
+        (self.home / "data").mkdir()
+        with patch.object(usage.subprocess, "run", return_value=unittest.mock.Mock(returncode=0)) as run:
+            self.assertTrue(usage.renew_claude_login(self.home, {"claude": str(executable), "path": "/usr/bin"}))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], [str(executable), "-p", "ping"])
+        for flag, value in (("--model", "haiku"), ("--effort", "low"), ("--tools", "")):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertIn("--no-session-persistence", command)
 
     def test_claude_does_not_send_expired_token(self):
-        (self.home / ".claude").mkdir()
-        (self.home / ".claude/.credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "token", "expiresAt": 1000}
-        }))
-        with patch.object(usage.urllib.request, "urlopen") as urlopen:
+        self.write_claude_credentials(expires_at=1000)
+        with patch.object(usage, "renew_claude_login", return_value=True), \
+                patch.object(usage.urllib.request, "urlopen") as urlopen:
             state = usage.log_usage("claude", self.home, now=100)
 
         self.assertEqual(state["lastError"], "authenticationFailed")
@@ -142,7 +196,7 @@ class RemoteUsageTests(unittest.TestCase):
         with patch.object(usage, "cron_lines", return_value=crontab), \
                 patch.object(usage, "write_cron_lines", side_effect=written.append), \
                 patch.object(usage, "log_usage", return_value={"lastRunAt": 1}), \
-                patch.object(usage, "codex_search_path", return_value="/usr/bin"):
+                patch.object(usage, "cli_search_path", return_value="/usr/bin"):
             result = usage.install("codex", self.home, "1.0")
 
         self.assertTrue(result["installed"])
@@ -152,14 +206,18 @@ class RemoteUsageTests(unittest.TestCase):
         self.assertIn(" log codex >/dev/null 2>&1 ", written[0][1])
         self.assertTrue(written[0][1].endswith(f"{usage.CRON_MARKER}codex"))
 
-    def test_install_schedules_claude_every_two_minutes(self):
+    def test_install_schedules_claude_every_thirty_seconds(self):
         written = []
         with patch.object(usage, "cron_lines", return_value=[]), \
                 patch.object(usage, "write_cron_lines", side_effect=written.append), \
-                patch.object(usage, "log_usage", return_value={"lastRunAt": 1}):
+                patch.object(usage, "log_usage", return_value={"lastRunAt": 1}), \
+                patch.object(usage, "cli_search_path", return_value="/usr/bin"):
             usage.install("claude", self.home, "1.0")
 
-        self.assertTrue(written[0][0].startswith("*/2 * * * * "))
+        self.assertEqual(len(written[0]), 2)
+        self.assertTrue(written[0][0].startswith("* * * * * /"))
+        self.assertTrue(written[0][1].startswith("* * * * * sleep 30; "))
+        self.assertTrue(all(line.endswith(f"{usage.CRON_MARKER}claude") for line in written[0]))
 
     def test_uninstall_keeps_other_entries(self):
         crontab = [f"* * * * * a {usage.CRON_MARKER}claude", f"* * * * * b {usage.CRON_MARKER}codex"]

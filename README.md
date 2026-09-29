@@ -25,7 +25,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Checks current usage every 15 seconds by default, configurable from one second to one hour.
 - Refreshes session-derived pace estimates when a reported usage percentage or window changes.
 - Can include Codex or Claude Code sessions from selected hosts in the user's `~/.ssh/config` in runtime and weekly pace calculations.
-- Can log usage on selected SSH hosts with cron (Codex every minute, Claude every 2 minutes because its usage endpoint is rate limited, and only every 10 minutes while the Mac is reading usage itself), so history continues while the Mac is off, and imports those readings at launch, on wake, and every ten minutes.
+- Can log usage on selected SSH hosts with cron (Codex every minute, Claude every 90 seconds because its usage endpoint is rate limited, and paused while the Mac is reading usage itself), so history continues while the Mac is off, and imports those readings at launch, on wake, and every ten minutes.
 - Exchanges shared history at most once every ten minutes.
 - Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.
 
@@ -47,7 +47,7 @@ Codex Limits is local-first:
 - Synced history is readable JSON and contains observation times, remaining percentages, and reset times. Choose a private folder that is not shared with other people.
 - It has no telemetry, analytics, notifications, or direct network client.
 - The Codex CLI may contact the Codex service as part of its normal operation.
-- If server usage logging is enabled for a host, the app copies a Python logger to `~/.codex-limits` on that host and adds one tagged line to the user's crontab. Every minute for Codex, or every 2 minutes for Claude, the logger reads usage (every 10 minutes while each import tells the host the Mac is reading usage itself; that lease lasts 15 minutes) the same way the app does locally: through `codex app-server`, or with the host's own Claude Code sign-in against the Claude usage endpoint, without ever refreshing the token. It stores only window percentages, reset times, and a hashed account ID, and the Mac skips entries from a different account. Turning the host off removes the crontab line; the log stays on the host.
+- If server usage logging is enabled for a host, the app copies a Python logger to `~/.codex-limits` on that host and adds tagged lines to the user's crontab. Every minute for Codex, or every 90 seconds for Claude, the logger reads usage the same way the app does locally: through `codex app-server`, or with the host's own Claude Code sign-in against the Claude usage endpoint. Before each of its own checks the Mac pings the host over SSH, which pauses the host's checks for 2 minutes, so the host resumes soon after the Mac stops. The logger never refreshes the Claude token itself; when it has expired, it sends Claude Code a one-word prompt on the cheapest model with no tools, and Claude Code renews its own sign-in. It stores only window percentages, reset times, and a hashed account ID, and the Mac skips entries from a different account. Turning the host off removes the crontab line; the log stays on the host.
 - Remote session access uses the user's existing OpenSSH configuration and credentials. Hosts must already connect without an interactive password or key passphrase prompt.
 
 Do not attach raw CLI output or screenshots containing account usage to public issues.

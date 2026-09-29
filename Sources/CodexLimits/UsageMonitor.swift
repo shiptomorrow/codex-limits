@@ -69,6 +69,8 @@ final class UsageMonitor: ObservableObject {
     /// Last successful read or rate-limited attempt. Servers checking the same account cause
     /// rate limits here, so those still count as this Mac reading usage.
     private var lastUsageReadAt: Date?
+    private var usageReadAttempted = false
+    private var lastServerPingAt: [String: Date] = [:]
     private var started = false
     private var isShutDown = false
     private var historyPrepared = false
@@ -365,13 +367,32 @@ final class UsageMonitor: ObservableObject {
         }
     }
 
-    /// Servers check less often while this Mac reads usage at least as often as they would.
-    private var macLoggingUntil: Date? {
+    /// Claude's usage endpoint rate limits faster polling, whatever the chosen refresh interval.
+    var minimumRefreshInterval: TimeInterval {
+        provider == .claude ? ClaudeClient.minimumFetchInterval : 0
+    }
+
+    /// Pauses the servers' checks so they don't share this Mac's rate limit. The read doesn't wait
+    /// for the pings: each lease outlasts the ping interval, so it's still active from the last check.
+    /// Once this Mac stops reading usage, or its reads keep failing, the leases lapse and servers resume.
+    private func pingServerUsageLogs() {
         let now = Date()
-        guard refreshInterval <= ServerUsageLog.checkInterval(for: provider),
-              let lastUsageReadAt,
-              now.timeIntervalSince(lastUsageReadAt) < ServerUsageLog.macReadFreshness else { return nil }
-        return now.addingTimeInterval(ServerUsageLog.macLoggingLease)
+        let isReadingUsage = !usageReadAttempted
+            || lastUsageReadAt.map { now.timeIntervalSince($0) < ServerUsageLog.macReadFreshness } == true
+        guard isReadingUsage else { return }
+        for profile in serverUsageLogSSHProfiles {
+            if let lastPing = lastServerPingAt[profile],
+               now.timeIntervalSince(lastPing) < ServerUsageLog.macPingInterval { continue }
+            lastServerPingAt[profile] = now
+            let provider = provider
+            Task { [weak self] in
+                do {
+                    try await ServerUsageLog.ping(profile: profile, provider: provider)
+                } catch {
+                    self?.lastServerPingAt[profile] = nil
+                }
+            }
+        }
     }
 
     private func importServerUsageLog(from profile: String) async {
@@ -386,8 +407,7 @@ final class UsageMonitor: ObservableObject {
             var export = try await ServerUsageLog.export(
                 profile: profile,
                 provider: provider,
-                since: serverUsageLogCursor(for: profile),
-                macLoggingUntil: macLoggingUntil
+                since: serverUsageLogCursor(for: profile)
             )
             if !export.installed, installed == nil {
                 // The cron entry was removed on the host; schedule it again.
@@ -396,8 +416,7 @@ final class UsageMonitor: ObservableObject {
                 export = try await ServerUsageLog.export(
                     profile: profile,
                     provider: provider,
-                    since: serverUsageLogCursor(for: profile),
-                    macLoggingUntil: macLoggingUntil
+                    since: serverUsageLogCursor(for: profile)
                 )
             }
             guard serverUsageLogSSHProfiles.contains(profile) else { return }
@@ -482,8 +501,12 @@ final class UsageMonitor: ObservableObject {
             historyUsesFiles = historyState.errorMessage == nil
         }
 
+        pingServerUsageLogs()
         let fetchTask = Task { try await client.fetch() }
-        defer { scheduleRateLimitRetry() }
+        defer {
+            usageReadAttempted = true
+            scheduleRateLimitRetry()
+        }
         var exchangeErrorMessage = syncErrorMessage
         if maintenanceIsDue(since: lastHistoryExchangeAt, now: Date()) {
             let historyState = await exchangeHistory()
@@ -603,9 +626,9 @@ final class UsageMonitor: ObservableObject {
         } else {
             seconds = UsageRefreshSchedule.defaultSeconds
         }
-        refreshInterval = TimeInterval(seconds)
+        refreshInterval = max(TimeInterval(seconds), minimumRefreshInterval)
         refreshTimerCancellable = Timer.publish(
-            every: TimeInterval(seconds),
+            every: refreshInterval,
             on: .main,
             in: .common
         )
@@ -1118,16 +1141,11 @@ struct ServerUsageLogStatus: Equatable {
             isError = true
         } else if let lastRunAt = export.lastRunAt {
             let macIsLogging = export.macLoggingUntil.map { $0 > now } ?? false
-            let staleInterval = macIsLogging
-                ? ServerUsageLog.macLoggingCheckInterval + ServerUsageLog.staleRunInterval
-                : ServerUsageLog.staleRunInterval
-            if now.timeIntervalSince(lastRunAt) > staleInterval {
+            if macIsLogging {
+                parts = ["Paused while this Mac reads usage · last check \(time(lastRunAt))"]
+            } else if now.timeIntervalSince(lastRunAt) > ServerUsageLog.staleRunInterval {
                 parts = ["Logger hasn’t run since \(time(lastRunAt))"]
                 isError = true
-            } else if macIsLogging {
-                parts = [
-                    "Checking \(ServerUsageLog.describe(ServerUsageLog.macLoggingCheckInterval)) while this Mac reads usage · last check \(time(lastRunAt))"
-                ]
             } else {
                 parts = [
                     "Logging \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: provider))) · last check \(time(lastRunAt))"

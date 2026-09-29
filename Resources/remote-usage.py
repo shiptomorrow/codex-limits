@@ -19,7 +19,7 @@ import urllib.request
 
 # Logs subscription usage on a server so history continues while the Mac is off.
 # Cron runs `log` on a schedule; the Mac later pulls new entries with `export`.
-# While the Mac reads usage itself, each export renews a lease that slows the server's checks.
+# While the Mac reads usage itself, it pings before each of its checks, which pauses the server's checks for a while.
 # Credentials never leave the host: entries hold only usage windows and a hashed account ID.
 RESPONSE_VERSION = 1
 REQUEST_TIMEOUT = 30
@@ -28,12 +28,20 @@ MAXIMUM_LOG_SIZE = 4_000_000
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 # Mirrors ClaudeClient.rateLimitBackoffSchedule.
-CLAUDE_BACKOFF_SCHEDULE = [10, 60, 3 * 60, 5 * 60]
+CLAUDE_BACKOFF_SCHEDULE = [60, 3 * 60, 5 * 60]
 CRON_MARKER = "# codex-limits-usage-"
-# The Claude usage endpoint rate limits one request a minute about every other time.
-CRON_SCHEDULES = {"codex": "* * * * *", "claude": "*/2 * * * *"}
-# Mirrors ServerUsageLog.macLoggingCheckInterval.
-MAC_LOGGING_CHECK_INTERVAL = 10 * 60
+# Cron fires at most once a minute, so Claude gets a second entry offset by 30 seconds
+# and `CHECK_INTERVALS` picks every third tick.
+CRON_OFFSETS = {"codex": [0], "claude": [0, 30]}
+# The Claude usage endpoint allows about one request a minute per account. Mirrors ServerUsageLog.checkInterval.
+CHECK_INTERVALS = {"codex": 0, "claude": 90}
+# Cron start times drift by a few seconds, so allow slack to keep the checks on schedule.
+CHECK_SLACK = 10
+# Caps the pause a single ping can request, so a stale ping can't stop logging for long.
+MAXIMUM_MAC_LEASE = 10 * 60
+# Claude Code renews an expired login when it runs; retry a failed renewal only this often.
+CLAUDE_LOGIN_RETRY_INTERVAL = 15 * 60
+CLAUDE_PING_TIMEOUT = 60
 
 
 class UsageError(Exception):
@@ -102,8 +110,8 @@ def login_shell_path():
     return lines[-1] if lines else ""
 
 
-def codex_search_path(home):
-    """SSH and cron sessions often lack the login PATH that finds codex and node."""
+def cli_search_path(home, name):
+    """SSH and cron sessions often lack the login PATH that finds the CLI and node."""
     extra = [
         str(home / ".local/bin"),
         str(home / ".npm-global/bin"),
@@ -114,7 +122,7 @@ def codex_search_path(home):
     ]
     extra += sorted(glob.glob(str(home / ".nvm/versions/node/*/bin")), reverse=True)
     parts = [os.environ.get("PATH", "")]
-    if shutil.which("codex") is None:
+    if shutil.which(name) is None:
         parts.insert(0, login_shell_path())
     return os.pathsep.join(part for part in parts + extra if part)
 
@@ -204,7 +212,7 @@ def read_codex(home, config):
     tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
     account = account_hash("codex", tokens.get("account_id"))
 
-    search_path = config.get("path") or codex_search_path(home)
+    search_path = config.get("path") or cli_search_path(home, "codex")
     executable = config.get("codex")
     if not executable or not os.access(executable, os.X_OK):
         executable = shutil.which("codex", path=search_path)
@@ -305,7 +313,44 @@ def claude_windows(body):
     return windows
 
 
-def read_claude(home, config):
+def claude_token_expired(oauth):
+    expires_at = oauth.get("expiresAt")
+    return isinstance(expires_at, (int, float)) and expires_at / 1000 <= time.time()
+
+
+def renew_claude_login(home, config):
+    """Sends Claude Code a one-word prompt on the cheapest model; Claude Code renews an expired login before it replies.
+
+    The token is never refreshed here directly: refresh tokens rotate, and refreshing
+    outside Claude Code would sign Claude Code out on this host.
+    """
+    search_path = config.get("path") or cli_search_path(home, "claude")
+    executable = config.get("claude")
+    if not executable or not os.access(executable, os.X_OK):
+        executable = shutil.which("claude", path=search_path)
+    if executable is None:
+        return False
+    # No tools, settings, MCP servers or saved session, so the ping stays cheap and out of activity tracking.
+    command = [
+        executable, "-p", "ping", "--model", "haiku", "--effort", "low", "--tools", "",
+        "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=data_directory(home),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=dict(os.environ, PATH=search_path),
+            timeout=CLAUDE_PING_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def read_claude(home, config, state, now):
     claude_config = read_json(claude_config_path(home)) or {}
     oauth_account = claude_config.get("oauthAccount")
     oauth_account = oauth_account if isinstance(oauth_account, dict) else {}
@@ -314,11 +359,18 @@ def read_claude(home, config):
     oauth = claude_credentials(home)
     if oauth is None:
         raise UsageError("credentialsNotFound")
-    # The token is never refreshed here: refresh tokens rotate, and refreshing
-    # outside Claude Code would sign Claude Code out on this host.
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and expires_at / 1000 <= time.time():
-        raise UsageError("authenticationFailed")
+    if claude_token_expired(oauth):
+        # Claude Code only renews its login while it runs, so an idle host's token lapses after a few hours.
+        attempted_at = state.get("loginRenewalAttemptAt")
+        if attempted_at is not None and now - attempted_at < CLAUDE_LOGIN_RETRY_INTERVAL:
+            raise UsageError("authenticationFailed")
+        state["loginRenewalAttemptAt"] = now
+        renew_claude_login(home, config)
+        oauth = claude_credentials(home)
+        if oauth is None:
+            raise UsageError("credentialsNotFound")
+        if claude_token_expired(oauth):
+            raise UsageError("authenticationFailed")
 
     request = urllib.request.Request(CLAUDE_USAGE_URL, headers={
         "Authorization": f"Bearer {oauth['accessToken']}",
@@ -351,11 +403,11 @@ def read_claude(home, config):
     return account, claude_windows(parsed)
 
 
-def read_usage(provider, home, config):
+def read_usage(provider, home, config, state, now):
     if provider == "codex":
         return read_codex(home, config)
     if provider == "claude":
-        return read_claude(home, config)
+        return read_claude(home, config, state, now)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -411,14 +463,16 @@ def log_usage(provider, home, now=None):
         state = read_json(files["state"]) or {}
         if now < state.get("backoffUntil", 0):
             return state
+        last_run_at = state.get("lastRunAt")
+        if last_run_at is not None and now - last_run_at < CHECK_INTERVALS[provider] - CHECK_SLACK:
+            return state
         mac = read_json(files["mac"]) or {}
-        # Cron start times drift by a few seconds, so allow slack to keep the checks on schedule.
-        if now < mac.get("loggingUntil", 0) and now - state.get("lastRunAt", 0) < MAC_LOGGING_CHECK_INTERVAL - 30:
+        if now < mac.get("loggingUntil", 0):
             return state
 
         config = read_json(files["config"]) or {}
         try:
-            account, windows = read_usage(provider, home, config)
+            account, windows = read_usage(provider, home, config, state, now)
         except UsageError as error:
             code = error.code
             if code.startswith("rateLimited:"):
@@ -477,16 +531,19 @@ def install(provider, home, app_version):
     files = paths(home, provider)
     files["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
     script = pathlib.Path(__file__).resolve()
-    config = {"appVersion": app_version}
-    if provider == "codex":
-        search_path = codex_search_path(home)
-        config["path"] = search_path
-        config["codex"] = shutil.which("codex", path=search_path)
+    search_path = cli_search_path(home, provider)
+    config = {
+        "appVersion": app_version,
+        "path": search_path,
+        provider: shutil.which(provider, path=search_path),
+    }
     write_json(files["config"], config)
 
     command = " ".join(shlex.quote(part) for part in (sys.executable, str(script), "log", provider))
     lines = [line for line in cron_lines() if not line.endswith(CRON_MARKER + provider)]
-    lines.append(f"{CRON_SCHEDULES[provider]} {command} >/dev/null 2>&1 {CRON_MARKER}{provider}")
+    for offset in CRON_OFFSETS[provider]:
+        delay = f"sleep {offset}; " if offset else ""
+        lines.append(f"* * * * * {delay}{command} >/dev/null 2>&1 {CRON_MARKER}{provider}")
     write_cron_lines(lines)
     state = log_usage(provider, home)
     return {"installed": True, "state": state}
@@ -500,12 +557,19 @@ def uninstall(provider):
     return {"installed": False}
 
 
-def export(provider, home, since, mac_logging_until=None):
-    """Returns entries newer than `since` and records how long the Mac expects to keep reading usage."""
+def ping(provider, home, lease, now=None):
+    """Pauses the server's checks for `lease` seconds while the Mac reads usage itself."""
     files = paths(home, provider)
-    if mac_logging_until is not None:
-        files["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
-        write_json(files["mac"], {"loggingUntil": mac_logging_until})
+    files["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    now = time.time() if now is None else now
+    until = now + min(max(lease, 0), MAXIMUM_MAC_LEASE)
+    write_json(files["mac"], {"loggingUntil": until})
+    return {"macLoggingUntil": until}
+
+
+def export(provider, home, since):
+    """Returns entries newer than `since`."""
+    files = paths(home, provider)
     mac = read_json(files["mac"]) or {}
     return {
         "installed": is_installed(provider),
@@ -526,11 +590,9 @@ def main():
         elif command == "uninstall":
             result = uninstall(provider)
         elif command == "export":
-            result = export(
-                provider, home,
-                float(sys.argv[3]) if len(sys.argv) > 3 else 0,
-                float(sys.argv[4]) if len(sys.argv) > 4 else None,
-            )
+            result = export(provider, home, float(sys.argv[3]) if len(sys.argv) > 3 else 0)
+        elif command == "ping":
+            result = ping(provider, home, float(sys.argv[3]))
         elif command == "log":
             log_usage(provider, home)
             return

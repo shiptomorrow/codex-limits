@@ -3,11 +3,11 @@ import XCTest
 
 final class ClaudeRateLimitBackoffTests: XCTestCase {
     func testBackoffStepsUpThenRepeatsFiveMinutes() {
-        let delays = (0 ..< 6).map {
+        let delays = (0 ..< 5).map {
             ClaudeClient.rateLimitBackoff(afterConsecutiveRateLimits: $0, serverRetryAfter: 0)
         }
 
-        XCTAssertEqual(delays, [10, 60, 180, 300, 300, 300])
+        XCTAssertEqual(delays, [60, 180, 300, 300, 300])
     }
 
     func testLongerServerRetryAfterWins() {
@@ -16,7 +16,7 @@ final class ClaudeRateLimitBackoffTests: XCTestCase {
             120
         )
         XCTAssertEqual(
-            ClaudeClient.rateLimitBackoff(afterConsecutiveRateLimits: 3, serverRetryAfter: 120),
+            ClaudeClient.rateLimitBackoff(afterConsecutiveRateLimits: 2, serverRetryAfter: 120),
             300
         )
     }

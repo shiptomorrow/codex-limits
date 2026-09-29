@@ -66,31 +66,33 @@ struct ServerUsageLogExport: Equatable, Sendable {
     /// Timestamp of the newest entry, used as the cursor for the next import.
     let newestEntryTime: TimeInterval?
     let otherAccountEntryCount: Int
-    /// While this is in the future, the logger only checks every `macLoggingCheckInterval`.
+    /// While this is in the future, the logger skips its checks because this Mac pinged it.
     let macLoggingUntil: Date?
 }
 
 /// Installs and reads the cron-driven usage logger in `Resources/remote-usage.py`.
 enum ServerUsageLog {
     static let importInterval: TimeInterval = 10 * 60
-    /// Cron runs the logger every one or two minutes and Claude backoff usually skips at most five minutes,
+    /// Cron runs the logger every minute or 90 seconds and Claude backoff usually skips at most five minutes,
     /// so an older run means the logger stopped.
     static let staleRunInterval: TimeInterval = 10 * 60
-    /// Mirrors `MAC_LOGGING_CHECK_INTERVAL`: how often servers check while this Mac reads usage itself.
-    static let macLoggingCheckInterval: TimeInterval = 10 * 60
-    /// Outlasts one import interval, so the lease lapses soon after this Mac sleeps or quits.
-    static let macLoggingLease: TimeInterval = 15 * 60
-    /// This Mac counts as reading usage only if its last successful read is this recent.
+    /// Each ping pauses a server's checks this long, so they resume soon after this Mac stops checking.
+    static let macPingLease: TimeInterval = 2 * 60
+    /// Leaves room for a ping to arrive late before its lease lapses.
+    static let macPingInterval: TimeInterval = 60
+    /// This Mac pings only if its last read, successful or rate limited, is this recent.
     static let macReadFreshness: TimeInterval = 5 * 60
+    private static let pingTimeout: TimeInterval = 20
 
-    /// Mirrors `CRON_SCHEDULES` in the logger.
+    /// Mirrors `CHECK_INTERVALS` in the logger.
     nonisolated static func checkInterval(for provider: UsageProvider) -> TimeInterval {
-        provider == .claude ? 2 * 60 : 60
+        provider == .claude ? ClaudeClient.minimumFetchInterval : 60
     }
 
     nonisolated static func describe(_ interval: TimeInterval) -> String {
-        let minutes = Int(interval / 60)
-        return minutes == 1 ? "every minute" : "every \(minutes) minutes"
+        let seconds = Int(interval)
+        if seconds % 60 != 0 { return "every \(seconds) seconds" }
+        return seconds == 60 ? "every minute" : "every \(seconds / 60) minutes"
     }
     private static let operationTimeout: TimeInterval = 90
     private static let scriptName = "remote-usage"
@@ -146,23 +148,29 @@ enum ServerUsageLog {
         _ = try decodeExport(output, provider: provider, localAccount: nil)
     }
 
-    /// Also passes `macLoggingUntil`, or 0 when this Mac isn't reading usage, so the logger can slow down.
+    /// Pauses the host's checks for `macPingLease` because this Mac is about to read usage itself.
+    static func ping(profile: String, provider: UsageProvider) async throws {
+        guard let scriptURL else { throw ServerUsageLogError.helperMissing }
+        let output = try await RemoteSSHCommand.run(
+            profile: profile,
+            script: scriptURL,
+            arguments: ["ping", provider.rawValue, String(Int(macPingLease))],
+            timeout: pingTimeout,
+            purpose: "usage logger ping"
+        )
+        _ = try decodeExport(output, provider: provider, localAccount: nil)
+    }
+
     static func export(
         profile: String,
         provider: UsageProvider,
-        since: TimeInterval,
-        macLoggingUntil: Date?
+        since: TimeInterval
     ) async throws -> ServerUsageLogExport {
         guard let scriptURL else { throw ServerUsageLogError.helperMissing }
         let output = try await RemoteSSHCommand.run(
             profile: profile,
             script: scriptURL,
-            arguments: [
-                "export",
-                provider.rawValue,
-                String(since),
-                String(macLoggingUntil?.timeIntervalSince1970 ?? 0)
-            ],
+            arguments: ["export", provider.rawValue, String(since)],
             timeout: operationTimeout,
             purpose: "usage log export"
         )

@@ -121,7 +121,23 @@ final class ClaudeClient: UsageClient {
     }
 
     func fetch() async throws -> UsageSnapshot {
+        let local = await localCaches()
+        let snapshot = try await fetchUsage(cached: local.usage)
+        guard let resets = local.resets else { return snapshot }
+        return snapshot.withResets(count: resets.resetsLeft, nextExpiration: resets.nextExpiration)
+    }
+
+    private func fetchUsage(cached: (fetchedAt: Date, snapshot: UsageSnapshot)?) async throws -> UsageSnapshot {
         let currentDate = now()
+        if let cached,
+           currentDate.timeIntervalSince(cached.fetchedAt) < Self.minimumFetchInterval,
+           lastRequestAt.map({ cached.fetchedAt > $0 }) ?? true {
+            // Claude Code's request counts toward the same per-account limit,
+            // so the next request of our own waits a full interval after it.
+            lastRequestAt = cached.fetchedAt
+            lastSnapshot = cached.snapshot
+            return cached.snapshot.refetched(at: currentDate)
+        }
         if let backoffUntil, currentDate < backoffUntil {
             guard let lastSnapshot else { throw ClaudeClientError.rateLimited }
             return lastSnapshot.refetched(at: currentDate)
@@ -288,6 +304,46 @@ final class ClaudeClient: UsageClient {
             .map { URL(fileURLWithPath: $0) }
     }
 
+    /// Claude Code keeps its latest usage response in `~/.claude.json`; reusing a recent
+    /// one saves a request against the usage endpoint's shared rate limit. Limit resets
+    /// come from the Claude desktop app's cache, keyed by the organization named there.
+    private func localCaches() async -> (
+        usage: (fetchedAt: Date, snapshot: UsageSnapshot)?,
+        resets: ClaudeResetGrants?
+    ) {
+        let planType = (try? await currentCredentials(forceReload: false))?.planType
+        let currentDate = now()
+        return await Task.detached(priority: .utility) {
+            let file = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude.json")
+            guard let data = try? Data(contentsOf: file) else { return (nil, nil) }
+            let organization = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                .flatMap { $0["oauthAccount"] as? [String: Any] }?["organizationUuid"] as? String
+            return (
+                Self.cachedUsage(fromClaudeCodeConfig: data, planType: planType),
+                organization.flatMap { ClaudeResetCache.read(organizationUUID: $0, now: currentDate) }
+            )
+        }.value
+    }
+
+    nonisolated static func cachedUsage(
+        fromClaudeCodeConfig data: Data,
+        planType: String?
+    ) -> (fetchedAt: Date, snapshot: UsageSnapshot)? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cache = object["cachedUsageUtilization"] as? [String: Any],
+              let fetchedAtMs = (cache["fetchedAtMs"] as? NSNumber)?.doubleValue,
+              let usage = cache["utilization"] as? [String: Any] else { return nil }
+        // A cache left over from another signed-in account must not be shown as this one.
+        let account = (object["oauthAccount"] as? [String: Any])?["accountUuid"] as? String
+        guard let account, cache["accountUuid"] as? String == account else { return nil }
+        let fetchedAt = Date(timeIntervalSince1970: fetchedAtMs / 1_000)
+        guard let snapshot = try? decode(usage, planType: planType, fetchedAt: fetchedAt) else {
+            return nil
+        }
+        return (fetchedAt, snapshot)
+    }
+
     private func currentCredentials(forceReload: Bool) async throws -> ClaudeCredentials {
         if !forceReload, let credentials {
             return credentials
@@ -343,7 +399,14 @@ final class ClaudeClient: UsageClient {
             )
             throw ClaudeClientError.invalidResponse
         }
+        return try decode(object, planType: planType, fetchedAt: fetchedAt)
+    }
 
+    nonisolated private static func decode(
+        _ object: [String: Any],
+        planType: String?,
+        fetchedAt: Date
+    ) throws -> UsageSnapshot {
         let mainWindows = [
             window(object["five_hour"], durationMinutes: 300),
             window(object["seven_day"], durationMinutes: 10_080)

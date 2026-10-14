@@ -383,6 +383,18 @@ extension UsageSnapshot {
             planType: planType
         )
     }
+
+    func withResets(count: Int, nextExpiration: Date?) -> UsageSnapshot {
+        UsageSnapshot(
+            mainLimit: mainLimit,
+            otherLimits: otherLimits,
+            tokenHistory: tokenHistory,
+            emergencyResetCount: count,
+            nextEmergencyResetExpiration: nextExpiration,
+            fetchedAt: fetchedAt,
+            planType: planType
+        )
+    }
 }
 
 enum PaceStatus: String, Codable, Equatable, Sendable {

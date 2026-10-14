@@ -107,33 +107,35 @@ struct MenuContentView: View {
                 .accessibilityLabel(monitor.isAnalyzingActivity ? "Recalculating pace" : "Refresh usage")
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(statusTitle(forecast.status))
-                    .font(.headline)
-                    .foregroundStyle(statusColor(forecast.status))
-                statusMessage(snapshot: snapshot, forecast: forecast)
-                    .fixedSize(horizontal: false, vertical: true)
-                projectedUsageText
+            HStack(alignment: .bottom, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(statusTitle(forecast.status))
+                        .font(.headline)
+                        .foregroundStyle(statusColor(forecast.status))
+                    statusMessage(snapshot: snapshot, forecast: forecast)
+                        .fixedSize(horizontal: false, vertical: true)
+                    projectedUsageText
+                }
+                Spacer(minLength: 0)
+                if !monitor.availableLimitWindows.isEmpty {
+                    // Both windows stay listed; one without data is greyed out
+                    // and the shown limit falls back to the other.
+                    LimitWindowSegmentedControl(
+                        selection: monitor.displayedLimitWindow,
+                        enabledWindows: Set(monitor.availableLimitWindows)
+                    ) { window in
+                        usageWindowOffset = 0
+                        monitor.selectLimitWindow(window)
+                    }
+                    .fixedSize()
+                    // Hang into the stack spacing so the chart controls below stay close.
+                    .padding(.bottom, -6)
+                    .help("Choose which usage limit to show")
+                    .accessibilityLabel("Usage limit")
+                }
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                if !monitor.availableLimitWindows.isEmpty {
-                    HStack {
-                        Spacer()
-                        // Both windows stay listed; one without data is greyed out
-                        // and the shown limit falls back to the other.
-                        LimitWindowSegmentedControl(
-                            selection: monitor.displayedLimitWindow,
-                            enabledWindows: Set(monitor.availableLimitWindows)
-                        ) { window in
-                            usageWindowOffset = 0
-                            monitor.selectLimitWindow(window)
-                        }
-                        .fixedSize()
-                        .help("Choose which usage limit to show")
-                        .accessibilityLabel("Usage limit")
-                    }
-                }
                 HStack {
                     Spacer()
                     if chartMode == .usage {

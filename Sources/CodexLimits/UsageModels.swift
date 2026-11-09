@@ -347,7 +347,9 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
     let fetchedAt: Date
     let planType: String?
 
-    var subscriptionName: String? {
+    var subscriptionName: String? { Self.subscriptionName(forPlanType: planType) }
+
+    static func subscriptionName(forPlanType planType: String?) -> String? {
         switch planType {
         case "free": "Codex Free"
         case "go": "Codex Go"

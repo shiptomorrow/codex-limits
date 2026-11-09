@@ -19,6 +19,7 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Projects the current pace and compares it with recent historical usage.
 - Optionally includes subagent runtime in local and remote pace estimates, off by default. Each subagent adds its runtime, including time spent running alongside its parent.
 - Starts in the menu bar without opening Settings.
+- Switches between Claude Code accounts from the popover. Any `~/.claude*` folder signed in with `CLAUDE_CONFIG_DIR` is listed by its plan, such as Claude Max 20×. Each account keeps its own history and stays loaded in the background without checking usage, so switching is instant and doesn't spend the usage endpoint's rate limit. Remote sessions and server logging apply only to the default `~/.claude` account.
 - Estimates how many active Codex hours a full weekly allowance supports at the recent pace.
 - Keeps up to 90 days of usage changes in versioned daily JSON files, writing only when the fetched percentage changes.
 - Can optionally replicate usage history through a private folder selected by the user.

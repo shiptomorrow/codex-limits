@@ -20,10 +20,8 @@ enum UsageAccountIdentity {
             let tokens = jsonObject(at: root.appendingPathComponent("auth.json"))?["tokens"]
             accountID = (tokens as? [String: Any])?["account_id"] as? String
         case .claude:
-            let config = environment["CLAUDE_CONFIG_DIR"]
-                .map { expandedURL($0).appendingPathComponent(".claude.json") }
-                ?? home.appendingPathComponent(".claude.json")
-            let account = jsonObject(at: config)?["oauthAccount"]
+            // Servers only log the default account.
+            let account = jsonObject(at: ClaudeAccount.default.configFile)?["oauthAccount"]
             accountID = (account as? [String: Any])?["accountUuid"] as? String
         }
         guard let accountID, !accountID.isEmpty else { return nil }

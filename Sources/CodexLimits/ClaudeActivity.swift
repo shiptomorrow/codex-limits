@@ -2,24 +2,20 @@ import Foundation
 
 enum ClaudeActivityReader {
     static func loadIntervals(
-        since: Date, now: Date, includesSubagents: Bool = false
+        account: ClaudeAccount = .default, since: Date, now: Date, includesSubagents: Bool = false
     ) async throws -> [ActivityInterval] {
-        let environmentRoot = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
-            .map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath, isDirectory: true) }
-        let claudeRoot = environmentRoot ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude", isDirectory: true)
         let cache = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first?
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
             .appendingPathComponent("ActivityCache", isDirectory: true)
-            .appendingPathComponent("claude-events-v1.json")
+            .appendingPathComponent("\(account.storageKey("claude-events-v1")).json")
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limits-claude-events-v1.json")
         return try await loadIntervals(
             since: since,
             now: now,
-            projectsRoot: claudeRoot.appendingPathComponent("projects", isDirectory: true),
+            projectsRoot: account.projectsDirectory,
             cacheURL: cache,
             includesSubagents: includesSubagents
         )

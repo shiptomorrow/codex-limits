@@ -19,18 +19,36 @@ struct MenuContentView: View {
     @Environment(\.openSettings) private var openSettings
     @ViewState private var chartMode: ChartMode = .usage
     @ViewState private var usageWindowOffset = 0
+    @ObservedObject private var claudeAccounts = ClaudeAccountStore.shared
 
     var body: some View {
-        Group {
-            if let snapshot = monitor.snapshot, let forecast = monitor.forecast {
-                dashboard(snapshot: snapshot, forecast: forecast)
-            } else {
-                emptyState
+        VStack(alignment: .leading, spacing: 14) {
+            // Outside the dashboard so an account that can't be read can still be switched away from.
+            if monitor.provider == .claude, claudeAccounts.options.count > 1 {
+                ClaudeAccountSegmentedControl(
+                    selection: monitor.claudeAccount,
+                    options: claudeAccounts.options
+                )
+                .accessibilityLabel("Claude account")
+            }
+            Group {
+                if let snapshot = monitor.snapshot, let forecast = monitor.forecast {
+                    dashboard(snapshot: snapshot, forecast: forecast)
+                } else {
+                    emptyState
+                }
             }
         }
         .frame(width: 420)
         .padding(16)
-        .task { await monitor.refresh() }
+        // The app delegate swaps the monitor in place when switching, so the popover keeps its layout.
+        .task(id: ObjectIdentifier(monitor)) {
+            usageWindowOffset = 0
+            if monitor.provider == .claude {
+                await claudeAccounts.reload()
+            }
+            await monitor.refresh()
+        }
         .environment(\.locale, Locale(identifier: "en_US"))
     }
 
@@ -1477,6 +1495,41 @@ private struct BurnDownChart: View {
     let safetyBuffer: Double
     let showsUsedPercentage: Bool
     let activity: [ActivityInterval]
+    /// Computed once per chart: every computed property below and the chart reuse it.
+    private var observedSegments: [BurnSegment] = []
+
+    init(
+        window: UsageWindow,
+        samples: [UsageSample],
+        tokenHistory: [TokenDay],
+        fetchedAt: Date,
+        forecast: Forecast?,
+        safetyBuffer: Double,
+        showsUsedPercentage: Bool,
+        activity: [ActivityInterval]
+    ) {
+        self.window = window
+        self.samples = samples
+        self.tokenHistory = tokenHistory
+        self.fetchedAt = fetchedAt
+        self.forecast = forecast
+        self.safetyBuffer = safetyBuffer
+        self.showsUsedPercentage = showsUsedPercentage
+        self.activity = activity
+        let index = BurnActivityIndex(activity)
+        observedSegments = zip(observed, observed.dropFirst())
+            .flatMap { start, end in Self.splitSegment(from: start, to: end, activity: index) }
+            .enumerated()
+            .map { index, segment in
+                BurnSegment(
+                    id: index,
+                    start: segment.start,
+                    end: segment.end,
+                    lastValueChangeDate: segment.lastValueChangeDate,
+                    isFastMode: segment.isFastMode
+                )
+            }
+    }
 
     private var observed: [BurnPoint] {
         let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
@@ -1522,20 +1575,6 @@ private struct BurnDownChart: View {
             $0.start.remaining != $0.end.remaining
         }
         return latestUsageSegment?.isFastMode == true ? .orange : currentColor
-    }
-
-    private var observedSegments: [BurnSegment] {
-        zip(observed, observed.dropFirst()).flatMap { start, end in
-            splitSegment(from: start, to: end)
-        }.enumerated().map { index, segment in
-            BurnSegment(
-                id: index,
-                start: segment.start,
-                end: segment.end,
-                lastValueChangeDate: segment.lastValueChangeDate,
-                isFastMode: segment.isFastMode
-            )
-        }
     }
 
     private var currentProjection: [BurnPoint] {
@@ -1795,14 +1834,20 @@ private struct BurnDownChart: View {
         }
     }
 
-    private func splitSegment(from start: BurnPoint, to end: BurnPoint) -> [BurnSegment] {
-        let boundaries = Set(activity.flatMap { [$0.start, $0.end] }.filter {
-            $0 > start.date && $0 < end.date
-        }).sorted()
-        let dates = [start.date] + boundaries + [end.date]
-        let usageIntervalContainsFastMode = activity.contains {
-            $0.isFastMode && $0.start < end.date && $0.end > start.date
-        }
+    /// The value holds flat until the last activity boundary before `end`, then drops to it.
+    /// The flat part only splits where fast mode starts or stops, so a long history of
+    /// sessions doesn't become thousands of identical chart segments.
+    private static func splitSegment(
+        from start: BurnPoint,
+        to end: BurnPoint,
+        activity: BurnActivityIndex
+    ) -> [BurnSegment] {
+        let lastBoundary = activity.lastBoundary(after: start.date, before: end.date)
+        let dates = [start.date]
+            + activity.fastModeBoundaries(after: start.date, before: lastBoundary ?? start.date)
+            + (lastBoundary.map { [$0] } ?? [])
+            + [end.date]
+        let usageIntervalContainsFastMode = activity.hasFastMode(from: start.date, to: end.date)
 
         return dates.indices.dropLast().map { index in
             let segmentStart = dates[index]
@@ -1810,9 +1855,7 @@ private struct BurnDownChart: View {
             let midpoint = segmentStart.addingTimeInterval(
                 segmentEnd.timeIntervalSince(segmentStart) / 2
             )
-            let midpointIsFastMode = activity.contains {
-                $0.isFastMode && $0.start <= midpoint && $0.end >= midpoint
-            }
+            let midpointIsFastMode = activity.isFastMode(at: midpoint)
             let isFinalSegment = segmentEnd == end.date
             return BurnSegment(
                 id: index,
@@ -2070,6 +2113,76 @@ private struct BurnPoint: Identifiable {
     var id: Date { date }
 }
 
+/// Activity sorted for binary search, so splitting the usage line doesn't scan every
+/// session for every sample.
+private struct BurnActivityIndex {
+    /// Every interval start and end, sorted.
+    private let boundaries: [Date]
+    /// Fast-mode intervals merged where they touch or overlap, sorted; their ends are sorted too.
+    private let fastModeSpans: [(start: Date, end: Date)]
+
+    init(_ activity: [ActivityInterval]) {
+        boundaries = activity.flatMap { [$0.start, $0.end] }.sorted()
+        var spans: [(start: Date, end: Date)] = []
+        for interval in activity.filter(\.isFastMode).sorted(by: { $0.start < $1.start }) {
+            if let last = spans.last, interval.start <= last.end {
+                spans[spans.count - 1].end = max(last.end, interval.end)
+            } else {
+                spans.append((interval.start, interval.end))
+            }
+        }
+        fastModeSpans = spans
+    }
+
+    /// The latest boundary strictly between the dates.
+    func lastBoundary(after start: Date, before end: Date) -> Date? {
+        let index = Self.partition(boundaries.count) { boundaries[$0] >= end }
+        guard index > 0, boundaries[index - 1] > start else { return nil }
+        return boundaries[index - 1]
+    }
+
+    /// Where fast mode starts or stops strictly between the dates.
+    func fastModeBoundaries(after start: Date, before end: Date) -> [Date] {
+        var result: [Date] = []
+        var index = Self.partition(fastModeSpans.count) { fastModeSpans[$0].end > start }
+        while index < fastModeSpans.count, fastModeSpans[index].start < end {
+            let span = fastModeSpans[index]
+            // An instant of fast mode can't color any of the flat line.
+            if span.end > span.start {
+                result += [span.start, span.end].filter { $0 > start && $0 < end }
+            }
+            index += 1
+        }
+        return result
+    }
+
+    func isFastMode(at date: Date) -> Bool {
+        let index = Self.partition(fastModeSpans.count) { fastModeSpans[$0].start > date }
+        return index > 0 && fastModeSpans[index - 1].end >= date
+    }
+
+    /// Whether any fast-mode interval overlaps the open range between the dates.
+    func hasFastMode(from start: Date, to end: Date) -> Bool {
+        let index = Self.partition(fastModeSpans.count) { fastModeSpans[$0].end > start }
+        return index < fastModeSpans.count && fastModeSpans[index].start < end
+    }
+
+    /// The first index in `0..<count` where `isAfter` holds, given it holds for a suffix.
+    private static func partition(_ count: Int, _ isAfter: (Int) -> Bool) -> Int {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if isAfter(middle) {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        return low
+    }
+}
+
 private struct BurnSegment: Identifiable {
     let id: Int
     let start: BurnPoint
@@ -2126,6 +2239,7 @@ struct SettingsView: View {
     @ViewState private var availableSSHProfiles: [String] = []
     @ViewState private var selectedSSHProfiles: Set<String> = []
     @ViewState private var selectedUsageLogProfiles: Set<String> = []
+    @ObservedObject private var claudeAccounts = ClaudeAccountStore.shared
 
     var body: some View {
         Form {
@@ -2135,6 +2249,11 @@ struct SettingsView: View {
                 }
             }
             .help("Choose which subscription's limits to track. Each service keeps its own history.")
+
+            if monitor.provider == .claude, claudeAccounts.options.count > 1 {
+                ClaudeAccountPicker(selection: monitor.claudeAccount, options: claudeAccounts.options)
+                    .help("Choose which Claude Code sign-in to track. Each account keeps its own history.")
+            }
 
             Toggle("Launch at login", isOn: Binding(
                 get: { launchAtLogin },
@@ -2259,71 +2378,79 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Remote \(monitor.provider.displayName) sessions") {
-                Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
-                    .onChange(of: remoteSessionsEnabled) { _, enabled in
-                        monitor.updateRemoteSessionsEnabled(enabled)
+            if !monitor.usesServers {
+                Section("Servers") {
+                    Text("Remote sessions and server usage logging are only available for the default Claude account (~/.claude).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Section("Remote \(monitor.provider.displayName) sessions") {
+                    Toggle("Include sessions over SSH", isOn: $remoteSessionsEnabled)
+                        .onChange(of: remoteSessionsEnabled) { _, enabled in
+                            monitor.updateRemoteSessionsEnabled(enabled)
+                        }
+
+                    Text("Uses SSH hosts from ~/.ssh/config and adds their \(monitor.provider.displayName) session activity to runtime and weekly pace estimates.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if remoteSessionsEnabled {
+                        if availableSSHProfiles.isEmpty {
+                            Text("No named SSH hosts were found.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(availableSSHProfiles, id: \.self) { profile in
+                                Toggle(profile, isOn: Binding(
+                                    get: { selectedSSHProfiles.contains(profile) },
+                                    set: { selectProfile(profile, enabled: $0) }
+                                ))
+                            }
+                        }
+
+                        Button("Reload SSH Profiles", action: loadSSHProfiles)
+
+                        if let remoteError = monitor.remoteActivityErrorMessage {
+                            Label(remoteError, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                }
 
-                Text("Uses SSH hosts from ~/.ssh/config and adds their \(monitor.provider.displayName) session activity to runtime and weekly pace estimates.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Section("Log \(monitor.provider.displayName) usage on servers") {
+                    Text("Each selected host checks \(monitor.provider.displayName) usage \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: monitor.provider))) with cron, so history continues while this Mac is off. While this Mac is reading usage itself, it pings hosts before each check and they pause, so they don’t share its rate limit. This Mac imports the readings when it’s back. Hosts must be signed in to the same \(monitor.provider.displayName) account.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                if remoteSessionsEnabled {
                     if availableSSHProfiles.isEmpty {
                         Text("No named SSH hosts were found.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(availableSSHProfiles, id: \.self) { profile in
-                            Toggle(profile, isOn: Binding(
-                                get: { selectedSSHProfiles.contains(profile) },
-                                set: { selectProfile(profile, enabled: $0) }
-                            ))
-                        }
-                    }
-
-                    Button("Reload SSH Profiles", action: loadSSHProfiles)
-
-                    if let remoteError = monitor.remoteActivityErrorMessage {
-                        Label(remoteError, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            Section("Log \(monitor.provider.displayName) usage on servers") {
-                Text("Each selected host checks \(monitor.provider.displayName) usage \(ServerUsageLog.describe(ServerUsageLog.checkInterval(for: monitor.provider))) with cron, so history continues while this Mac is off. While this Mac is reading usage itself, it pings hosts before each check and they pause, so they don’t share its rate limit. This Mac imports the readings when it’s back. Hosts must be signed in to the same \(monitor.provider.displayName) account.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if availableSSHProfiles.isEmpty {
-                    Text("No named SSH hosts were found.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(availableSSHProfiles, id: \.self) { profile in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Toggle(profile, isOn: Binding(
-                                get: { selectedUsageLogProfiles.contains(profile) },
-                                set: { selectUsageLogProfile(profile, enabled: $0) }
-                            ))
-                            if let status = monitor.serverUsageLogStatuses[profile] {
-                                Label(
-                                    status.text,
-                                    systemImage: status.isError ? "exclamationmark.triangle" : "checkmark.circle"
-                                )
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Toggle(profile, isOn: Binding(
+                                    get: { selectedUsageLogProfiles.contains(profile) },
+                                    set: { selectUsageLogProfile(profile, enabled: $0) }
+                                ))
+                                if let status = monitor.serverUsageLogStatuses[profile] {
+                                    Label(
+                                        status.text,
+                                        systemImage: status.isError ? "exclamationmark.triangle" : "checkmark.circle"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                         }
                     }
-                }
 
-                Button("Import Server Usage Now") {
-                    Task { await monitor.importServerUsageLogs() }
+                    Button("Import Server Usage Now") {
+                        Task { await monitor.importServerUsageLogs() }
+                    }
+                    .disabled(selectedUsageLogProfiles.isEmpty)
                 }
-                .disabled(selectedUsageLogProfiles.isEmpty)
             }
 
             Section("History sync") {
@@ -2354,6 +2481,10 @@ struct SettingsView: View {
         .padding()
         .frame(width: 400, height: 700)
         .onAppear(perform: loadSSHProfiles)
+        .task(id: monitor.provider) {
+            guard monitor.provider == .claude else { return }
+            await claudeAccounts.reload()
+        }
         .alert(
             "Delete usage history?",
             isPresented: $isResetHistoryConfirmationPresented
@@ -2492,5 +2623,84 @@ enum LoginItem {
         } catch {
             defaults.set(false, forKey: preferenceKey)
         }
+    }
+}
+
+/// Switches between Claude Code sign-ins; the app delegate swaps in a monitor for the chosen one.
+struct ClaudeAccountPicker: View {
+    let selection: ClaudeAccount
+    let options: [ClaudeAccountOption]
+
+    var body: some View {
+        Picker("Account", selection: Binding(
+            get: { selection },
+            set: { ClaudeAccount.select($0) }
+        )) {
+            ForEach(options) { option in
+                Text(option.label)
+                    .help(option.help)
+                    .tag(option.account)
+            }
+        }
+        .help(options.first { $0.account == selection }?.help ?? "")
+        .accessibilityLabel("Claude account")
+    }
+}
+
+/// The popover's account switch. It switches on mouse-down rather than on release.
+private struct ClaudeAccountSegmentedControl: NSViewRepresentable {
+    var selection: ClaudeAccount
+    var options: [ClaudeAccountOption]
+
+    func makeNSView(context: Context) -> PressSegmentedControl {
+        let control = PressSegmentedControl()
+        control.trackingMode = .selectOne
+        control.segmentDistribution = .fillEqually
+        control.target = context.coordinator
+        control.action = #selector(Coordinator.selectionChanged(_:))
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return control
+    }
+
+    func updateNSView(_ control: PressSegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        control.segmentCount = options.count
+        for (index, option) in options.enumerated() {
+            control.setLabel(option.label, forSegment: index)
+            control.setToolTip(option.help, forSegment: index)
+        }
+        control.selectedSegment = options.firstIndex { $0.account == selection } ?? -1
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    final class Coordinator: NSObject {
+        var parent: ClaudeAccountSegmentedControl
+
+        init(parent: ClaudeAccountSegmentedControl) {
+            self.parent = parent
+        }
+
+        @objc func selectionChanged(_ control: NSSegmentedControl) {
+            guard parent.options.indices.contains(control.selectedSegment) else { return }
+            ClaudeAccount.select(parent.options[control.selectedSegment].account)
+        }
+    }
+}
+
+/// Selects the pressed segment immediately instead of tracking the mouse until release.
+/// Segments are equally wide, so the pressed one follows from the click position.
+private final class PressSegmentedControl: NSSegmentedControl {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled, segmentCount > 0, bounds.width > 0 else { return }
+        let x = convert(event.locationInWindow, from: nil).x
+        let index = min(max(Int(x / (bounds.width / CGFloat(segmentCount))), 0), segmentCount - 1)
+        guard index != selectedSegment else { return }
+        selectedSegment = index
+        sendAction(action, to: target)
     }
 }

@@ -53,6 +53,11 @@ final class UsageMonitor: ObservableObject {
 
     private static let historyInstallationIDKey = "historyInstallationID"
     let provider: UsageProvider
+    /// Always the default account for Codex.
+    let claudeAccount: ClaudeAccount
+    /// SSH hosts are signed in to the default account, so server logging and remote
+    /// sessions only apply to it.
+    var usesServers: Bool { claudeAccount.isDefault }
     private let stateKey: String
     private let historySyncBookmarkKey: String
     private let history: UsageHistory
@@ -73,6 +78,8 @@ final class UsageMonitor: ObservableObject {
     private var lastServerPingAt: [String: Date] = [:]
     private var started = false
     private var isShutDown = false
+    /// Set while another account or service is shown; the monitor keeps its readings and pace but stops checking.
+    private var isPaused = false
     private var historyPrepared = false
     private var historyUsesFiles = false
     private var configuredSyncDirectory: URL?
@@ -98,20 +105,23 @@ final class UsageMonitor: ObservableObject {
     )?
     private static let maintenanceInterval: TimeInterval = 10 * 60
 
-    init(provider: UsageProvider = .current) {
+    init(provider: UsageProvider = .current, claudeAccount: ClaudeAccount = .current) {
+        let claudeAccount = provider == .claude ? claudeAccount : .default
         self.provider = provider
-        stateKey = provider.storageKey("usageState")
-        historySyncBookmarkKey = provider.storageKey("historySyncBookmark")
-        client = switch provider {
-        case .codex: CodexClient()
-        case .claude: ClaudeClient()
-        }
+        self.claudeAccount = claudeAccount
+        let storageKey = { claudeAccount.storageKey(provider.storageKey($0)) }
+        stateKey = storageKey("usageState")
+        historySyncBookmarkKey = storageKey("historySyncBookmark")
         let defaults = UserDefaults.standard
         if let data = defaults.data(forKey: stateKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
             fetchedSnapshot = state.snapshot
             fiveHourSamples = state.samples.filter(UsageLimitWindow.isFiveHourSample)
             previousStatus = state.previousStatus
+        }
+        client = switch provider {
+        case .codex: CodexClient()
+        case .claude: ClaudeClient(account: claudeAccount, lastSnapshot: fetchedSnapshot)
         }
 
         let installationID: String
@@ -123,11 +133,11 @@ final class UsageMonitor: ObservableObject {
             defaults.set(installationID, forKey: Self.historyInstallationIDKey)
         }
         history = UsageHistory(
-            localDirectory: Self.historyDirectory(for: provider),
+            localDirectory: Self.historyDirectory(named: storageKey("History")),
             installationID: installationID
         )
         weeklyHistory = UsageHistory(
-            localDirectory: Self.weeklyHistoryDirectory(for: provider),
+            localDirectory: Self.historyDirectory(named: storageKey("WeeklyHistory")),
             installationID: installationID
         )
         applyLimitWindowSelection()
@@ -179,16 +189,7 @@ final class UsageMonitor: ObservableObject {
             scheduleActivityAnalysisIfNeeded(for: saved.refetched(at: Date()))
         }
 
-        scheduleRefreshTimer()
-        serverUsageLogTimerCancellable = Timer.publish(
-            every: ServerUsageLog.importInterval,
-            on: .main,
-            in: .common
-        )
-        .autoconnect()
-        .sink { [weak self] _ in
-            Task { @MainActor in await self?.importServerUsageLogs() }
-        }
+        startTimers()
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
@@ -202,6 +203,46 @@ final class UsageMonitor: ObservableObject {
 
         await refresh()
         await importServerUsageLogs()
+    }
+
+    private func startTimers() {
+        guard !isPaused, !isShutDown else { return }
+        scheduleRefreshTimer()
+        serverUsageLogTimerCancellable = Timer.publish(
+            every: ServerUsageLog.importInterval,
+            on: .main,
+            in: .common
+        )
+        .autoconnect()
+        .sink { [weak self] _ in
+            Task { @MainActor in await self?.importServerUsageLogs() }
+        }
+    }
+
+    /// Stops checking usage while another account or service is shown. A running pace
+    /// calculation finishes, so its result is ready when the monitor is shown again.
+    func pause() {
+        guard !isPaused else { return }
+        isPaused = true
+        refreshTimerCancellable?.cancel()
+        serverUsageLogTimerCancellable?.cancel()
+        rateLimitRetryTask?.cancel()
+        rateLimitRetryTask = nil
+        remoteActivityRetryTask?.cancel()
+        remoteActivityRetryTask = nil
+    }
+
+    /// Picks up where `pause()` left off. Pace is only recalculated if the usage changed meanwhile,
+    /// and the client doesn't send a request before the rate limit allows one.
+    func resume() {
+        guard isPaused, !isShutDown else { return }
+        isPaused = false
+        guard started else { return }
+        startTimers()
+        Task { [weak self] in
+            await self?.refresh()
+            await self?.importServerUsageLogs()
+        }
     }
 
     func selectLimitWindow(_ window: UsageLimitWindow) {
@@ -317,13 +358,15 @@ final class UsageMonitor: ObservableObject {
     }
 
     var serverUsageLogSSHProfiles: [String] {
-        UserDefaults.standard.stringArray(
+        guard usesServers else { return [] }
+        return UserDefaults.standard.stringArray(
             forKey: provider.storageKey(Self.serverUsageLogSSHProfilesKey)
         ) ?? []
     }
 
     /// Installs or removes the usage logger on `profile`, which keeps recording while this Mac is off.
     func setServerUsageLogging(_ enabled: Bool, on profile: String) async {
+        guard usesServers else { return }
         var profiles = Set(serverUsageLogSSHProfiles)
         if enabled {
             profiles.insert(profile)
@@ -358,7 +401,7 @@ final class UsageMonitor: ObservableObject {
 
     /// Pulls usage the enabled servers logged since the last import into history.
     func importServerUsageLogs() async {
-        guard !isImportingServerUsageLogs, !isShutDown else { return }
+        guard !isImportingServerUsageLogs, !isShutDown, !isPaused else { return }
         isImportingServerUsageLogs = true
         defer { isImportingServerUsageLogs = false }
         await prepareHistory()
@@ -490,7 +533,7 @@ final class UsageMonitor: ObservableObject {
     }
 
     func refresh() async {
-        guard !isRefreshing, !isShutDown else { return }
+        guard !isRefreshing, !isShutDown, !isPaused else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
@@ -594,7 +637,7 @@ final class UsageMonitor: ObservableObject {
     private func scheduleRateLimitRetry() {
         rateLimitRetryTask?.cancel()
         rateLimitRetryTask = nil
-        guard !isShutDown, let retryAt = client.retryAt else { return }
+        guard !isShutDown, !isPaused, let retryAt = client.retryAt else { return }
         let delay = retryAt.timeIntervalSinceNow
         guard delay > 0 else { return }
         rateLimitRetryTask = Task { [weak self] in
@@ -791,24 +834,14 @@ final class UsageMonitor: ObservableObject {
         syncErrorMessage = state.errorMessage
     }
 
-    private static func historyDirectory(for provider: UsageProvider) -> URL {
+    private static func historyDirectory(named name: String) -> URL {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         return base
             .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
-            .appendingPathComponent(provider.storageKey("History"), isDirectory: true)
-    }
-
-    private static func weeklyHistoryDirectory(for provider: UsageProvider) -> URL {
-        let base = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.temporaryDirectory
-        return base
-            .appendingPathComponent("com.github.thrr87.CodexLimits", isDirectory: true)
-            .appendingPathComponent(provider.storageKey("WeeklyHistory"), isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
     }
 
     private func recordWeeklySample(from snapshot: UsageSnapshot) async {
@@ -986,10 +1019,10 @@ final class UsageMonitor: ObservableObject {
             )
         case .claude:
             try await ClaudeActivityReader.loadIntervals(
-                since: since, now: now, includesSubagents: includesSubagents
+                account: claudeAccount, since: since, now: now, includesSubagents: includesSubagents
             )
         }
-        guard defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
+        guard usesServers, defaults.bool(forKey: Self.remoteSessionsEnabledKey) else {
             remoteActivityErrorMessage = nil
             return local
         }
@@ -1042,7 +1075,8 @@ final class UsageMonitor: ObservableObject {
             }
             guard let self, !Task.isCancelled else { return }
             self.remoteActivityRetryTask = nil
-            guard UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
+            guard self.usesServers,
+                  UserDefaults.standard.bool(forKey: Self.remoteSessionsEnabledKey),
                   !self.remoteSSHProfiles.isEmpty,
                   let snapshot = self.snapshot else { return }
 

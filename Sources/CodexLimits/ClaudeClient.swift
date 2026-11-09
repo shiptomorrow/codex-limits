@@ -84,7 +84,6 @@ struct ClaudeCredentials: Equatable, Sendable {
 @MainActor
 final class ClaudeClient: UsageClient {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-    nonisolated private static let keychainService = "Claude Code-credentials"
     /// The usage endpoint allows about one request a minute per account, shared with
     /// servers and other apps, so poll it at most every 90 seconds.
     nonisolated static let minimumFetchInterval: TimeInterval = 90
@@ -97,18 +96,35 @@ final class ClaudeClient: UsageClient {
     private static let loginRenewalRetryInterval: TimeInterval = 15 * 60
     nonisolated private static let loginRenewalTimeout: TimeInterval = 60
 
+    private let account: ClaudeAccount
     private let session: URLSession
     private let now: () -> Date
     private var credentials: ClaudeCredentials?
     private var lastSnapshot: UsageSnapshot?
-    private var lastRequestAt: Date?
-    private var backoffUntil: Date?
-    private var consecutiveRateLimits = 0
+    /// Request timing outlives the client, so switching accounts or restarting
+    /// the app doesn't send a request the rate limit would refuse.
+    private var lastRequestAt: Date? { didSet { saveRequestState() } }
+    private var backoffUntil: Date? { didSet { saveRequestState() } }
+    private var consecutiveRateLimits = 0 { didSet { saveRequestState() } }
     private var lastLoginRenewalAt: Date?
 
     var retryAt: Date? { backoffUntil }
 
-    init(session: URLSession? = nil, now: @escaping () -> Date = { Date() }) {
+    /// `lastSnapshot` is the account's saved reading, returned until a new request is allowed.
+    init(
+        account: ClaudeAccount = .default,
+        lastSnapshot: UsageSnapshot? = nil,
+        session: URLSession? = nil,
+        now: @escaping () -> Date = { Date() }
+    ) {
+        self.account = account
+        self.lastSnapshot = lastSnapshot
+        if let data = UserDefaults.standard.data(forKey: account.storageKey(Self.requestStateKey)),
+           let state = try? JSONDecoder().decode(RequestState.self, from: data) {
+            lastRequestAt = state.lastRequestAt
+            backoffUntil = state.backoffUntil
+            consecutiveRateLimits = state.consecutiveRateLimits
+        }
         if let session {
             self.session = session
         } else {
@@ -233,6 +249,25 @@ final class ClaudeClient: UsageClient {
         session.invalidateAndCancel()
     }
 
+    private static let requestStateKey = "claudeRequestState"
+
+    private struct RequestState: Codable {
+        let lastRequestAt: Date?
+        let backoffUntil: Date?
+        let consecutiveRateLimits: Int
+    }
+
+    private func saveRequestState() {
+        let state = RequestState(
+            lastRequestAt: lastRequestAt,
+            backoffUntil: backoffUntil,
+            consecutiveRateLimits: consecutiveRateLimits
+        )
+        if let data = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(data, forKey: account.storageKey(Self.requestStateKey))
+        }
+    }
+
     /// Steps through the backoff schedule, unless the server asks for a longer wait.
     nonisolated static func rateLimitBackoff(
         afterConsecutiveRateLimits count: Int,
@@ -248,7 +283,8 @@ final class ClaudeClient: UsageClient {
             return false
         }
         lastLoginRenewalAt = date
-        let renewed = await Task.detached(priority: .utility) { Self.pingClaudeCode() }.value
+        let account = account
+        let renewed = await Task.detached(priority: .utility) { Self.pingClaudeCode(as: account) }.value
         CodexDiagnostics.record(
             renewed ? "Renewed Claude Code sign-in with a ping" : "Couldn’t renew Claude Code sign-in with a ping"
         )
@@ -256,7 +292,7 @@ final class ClaudeClient: UsageClient {
     }
 
     /// Sends a one-word prompt on the cheapest model, with no tools, settings, MCP servers or saved session.
-    nonisolated private static func pingClaudeCode() -> Bool {
+    nonisolated private static func pingClaudeCode(as account: ClaudeAccount) -> Bool {
         guard let executable = claudeExecutable() else { return false }
         let process = Process()
         process.executableURL = executable
@@ -265,7 +301,7 @@ final class ClaudeClient: UsageClient {
             "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config"
         ]
         process.currentDirectoryURL = FileManager.default.temporaryDirectory
-        var environment = ProcessInfo.processInfo.environment
+        var environment = account.environment(ProcessInfo.processInfo.environment)
         environment["PATH"] = [
             executable.deletingLastPathComponent().path,
             environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -304,7 +340,7 @@ final class ClaudeClient: UsageClient {
             .map { URL(fileURLWithPath: $0) }
     }
 
-    /// Claude Code keeps its latest usage response in `~/.claude.json`; reusing a recent
+    /// Claude Code keeps its latest usage response in the account's `.claude.json`; reusing a recent
     /// one saves a request against the usage endpoint's shared rate limit. Limit resets
     /// come from the Claude desktop app's cache, keyed by the organization named there.
     private func localCaches() async -> (
@@ -313,9 +349,8 @@ final class ClaudeClient: UsageClient {
     ) {
         let planType = (try? await currentCredentials(forceReload: false))?.planType
         let currentDate = now()
+        let file = account.configFile
         return await Task.detached(priority: .utility) {
-            let file = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".claude.json")
             guard let data = try? Data(contentsOf: file) else { return (nil, nil) }
             let organization = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
                 .flatMap { $0["oauthAccount"] as? [String: Any] }?["organizationUuid"] as? String
@@ -348,8 +383,9 @@ final class ClaudeClient: UsageClient {
         if !forceReload, let credentials {
             return credentials
         }
+        let account = account
         guard let loaded = await Task.detached(priority: .utility, operation: {
-            Self.loadCredentials()
+            Self.loadCredentials(of: account)
         }).value else {
             credentials = nil
             throw ClaudeClientError.credentialsNotFound
@@ -358,22 +394,21 @@ final class ClaudeClient: UsageClient {
         return loaded
     }
 
-    nonisolated private static func loadCredentials() -> ClaudeCredentials? {
-        if let data = keychainCredentials(), let credentials = ClaudeCredentials.decode(data) {
+    nonisolated private static func loadCredentials(of account: ClaudeAccount) -> ClaudeCredentials? {
+        if let data = keychainCredentials(service: account.keychainService),
+           let credentials = ClaudeCredentials.decode(data) {
             return credentials
         }
-        let file = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials.json")
-        return (try? Data(contentsOf: file)).flatMap(ClaudeCredentials.decode)
+        return (try? Data(contentsOf: account.credentialsFile)).flatMap(ClaudeCredentials.decode)
     }
 
-    nonisolated private static func keychainCredentials() -> Data? {
+    nonisolated private static func keychainCredentials(service: String) -> Data? {
         // Claude Code writes this item with the security tool, which is therefore
         // trusted to read it back without a keychain prompt.
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", keychainService, "-w"]
+        process.arguments = ["find-generic-password", "-s", service, "-w"]
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         do {

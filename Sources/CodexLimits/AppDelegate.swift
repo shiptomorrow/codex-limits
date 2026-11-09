@@ -5,6 +5,8 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private(set) var monitor = UsageMonitor()
+    /// Every account or service shown so far, kept so switching back doesn't start over.
+    private var monitors: [UsageSourceSelection: UsageMonitor] = [:]
 
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
@@ -45,14 +47,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         self.statusItem = statusItem
         statusIcon = image
+        preloadClaudeAccounts()
         attachMonitor()
 
         providerCancellable = NotificationCenter.default
             .publisher(for: UserDefaults.didChangeNotification)
-            .map { _ in UsageProvider.current }
+            .map { _ in UsageSourceSelection.current }
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] provider in self?.switchProvider(to: provider) }
+            .sink { [weak self] selection in self?.switchSource(to: selection) }
 
         let initialPresentation = StatusItemPresentation.current
         preferencesCancellable = NotificationCenter.default
@@ -67,19 +70,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
     }
 
-    private func switchProvider(to provider: UsageProvider) {
-        guard provider != monitor.provider else { return }
-        monitor.shutdown()
-        monitor = UsageMonitor(provider: provider)
+    private func switchSource(to selection: UsageSourceSelection) {
+        let current = UsageSourceSelection(monitor: monitor)
+        guard selection != current else { return }
+        monitor.pause()
+        monitors[current] = monitor
+        if let existing = monitors.removeValue(forKey: selection) {
+            monitor = existing
+            monitor.resume()
+        } else {
+            monitor = UsageMonitor(provider: selection.provider, claudeAccount: selection.claudeAccount)
+        }
+        preloadClaudeAccounts()
         attachMonitor()
+    }
+
+    /// Loads the other Claude accounts paused, from their saved readings and without
+    /// requests, so the first switch is instant and the menu bar item is sized for them.
+    private func preloadClaudeAccounts() {
+        guard monitor.provider == .claude else { return }
+        for option in ClaudeAccountStore.shared.options where option.account != monitor.claudeAccount {
+            let selection = UsageSourceSelection(provider: .claude, claudeAccount: option.account)
+            guard monitors[selection] == nil else { continue }
+            let preloaded = UsageMonitor(provider: .claude, claudeAccount: option.account)
+            preloaded.pause()
+            monitors[selection] = preloaded
+        }
     }
 
     /// Points the popover, settings window and menu bar item at the current monitor.
     private func attachMonitor() {
-        popover.contentViewController = NSHostingController(rootView: MenuContentView(
+        let content = MenuContentView(
             monitor: monitor,
             openSettingsAction: { [weak self] in self?.showSettings() }
-        ))
+        )
+        // Replacing the root view rather than the controller keeps the open popover in place.
+        if let controller = popover.contentViewController as? NSHostingController<MenuContentView> {
+            controller.rootView = content
+        } else {
+            popover.contentViewController = NSHostingController(rootView: content)
+        }
         (settingsWindow?.contentViewController as? NSHostingController<SettingsView>)?
             .rootView = SettingsView(monitor: monitor)
         settingsWindow?.title = "\(monitor.provider.displayName) Limits Settings"
@@ -105,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         endOpeningPress()
         removeClickAwayMonitor()
         monitor.shutdown()
+        monitors.values.forEach { $0.shutdown() }
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
@@ -191,8 +222,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         presentation: StatusItemPresentation = .current
     ) {
         guard let button = statusItem?.button else { return }
+        // Room for every account's percentage, so switching accounts doesn't
+        // resize the item and slide the open popover sideways.
+        let titleWidth = ([monitor] + Array(monitors.values))
+            .map { StatusItemImage.titleWidth($0.menuBarText) }
+            .max() ?? 0
         button.image = StatusItemImage.make(
             title: monitor.menuBarText,
+            minimumTitleWidth: titleWidth,
             spacing: presentation.spacing,
             icon: presentation.showsIcon ? statusIcon : nil
         )
@@ -297,7 +334,17 @@ private enum StatusItemImage {
         weight: .regular
     )
 
-    static func make(title: String, spacing: CGFloat, icon: NSImage?) -> NSImage {
+    static func titleWidth(_ title: String) -> CGFloat {
+        ceil((title as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    /// The title is left-aligned in `minimumTitleWidth` when it is narrower.
+    static func make(
+        title: String,
+        minimumTitleWidth: CGFloat = 0,
+        spacing: CGFloat,
+        icon: NSImage?
+    ) -> NSImage {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor.black
@@ -305,7 +352,7 @@ private enum StatusItemImage {
         let titleSize = (title as NSString).size(withAttributes: attributes)
         let iconWidth = icon == nil ? 0 : imageSize.width + spacing
         let size = NSSize(
-            width: ceil(iconWidth + titleSize.width),
+            width: ceil(iconWidth + max(titleSize.width, minimumTitleWidth)),
             height: ceil(max(imageSize.height, titleSize.height))
         )
         let result = NSImage(size: size, flipped: false) { _ in
@@ -333,5 +380,28 @@ private enum StatusItemImage {
         result.isTemplate = true
         result.accessibilityDescription = "Usage \(title)"
         return result
+    }
+}
+
+/// The service and, for Claude, the account the menu bar item tracks.
+private struct UsageSourceSelection: Hashable {
+    let provider: UsageProvider
+    let claudeAccount: ClaudeAccount
+
+    @MainActor static var current: UsageSourceSelection {
+        let provider = UsageProvider.current
+        return UsageSourceSelection(
+            provider: provider,
+            claudeAccount: provider == .claude ? .current : .default
+        )
+    }
+
+    @MainActor init(monitor: UsageMonitor) {
+        self.init(provider: monitor.provider, claudeAccount: monitor.claudeAccount)
+    }
+
+    init(provider: UsageProvider, claudeAccount: ClaudeAccount) {
+        self.provider = provider
+        self.claudeAccount = claudeAccount
     }
 }

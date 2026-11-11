@@ -2231,6 +2231,7 @@ struct SettingsView: View {
     @AppStorage(OtherLimitPreferences.hideCodex53SparkKey) private var hideCodex53Spark = true
     @AppStorage(StatusItemPreferences.spacingKey) private var menuBarSpacing = 4.0
     @AppStorage(StatusItemPreferences.showsIconKey) private var showsMenuBarIcon = true
+    @AppStorage(StatusItemPreferences.showsBothClaudeAccountsKey) private var showsBothClaudeAccounts = true
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
     @AppStorage(UsageMonitor.remoteSessionsEnabledKey) private var remoteSessionsEnabled = false
     @AppStorage(UsageProvider.preferenceKey) private var provider = UsageProvider.codex
@@ -2274,6 +2275,10 @@ struct SettingsView: View {
                 Toggle("Show icon", isOn: $showsMenuBarIcon)
                 Toggle("Show used percentage", isOn: $showsUsedPercentage)
                     .help("Show percentage used instead of percentage remaining")
+                if monitor.provider == .claude, claudeAccounts.options.count == 2 {
+                    Toggle("Show both accounts", isOn: $showsBothClaudeAccounts)
+                        .help("Show both Claude accounts’ percentages, left to right as in the popover’s account switch")
+                }
             }
 
             Section("Misc") {

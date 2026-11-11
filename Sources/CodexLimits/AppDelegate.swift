@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var usageErrorCancellable: AnyCancellable?
     private var preferencesCancellable: AnyCancellable?
     private var providerCancellable: AnyCancellable?
+    private var accountsCancellable: AnyCancellable?
+    /// Readings of the other account shown beside the current one in the menu bar.
+    private var companionCancellables: [AnyCancellable] = []
     private var settingsWindow: NSWindow?
     private var globalMouseMonitor: Any?
     private var localReleaseMonitor: Any?
@@ -49,6 +52,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusIcon = image
         preloadClaudeAccounts()
         attachMonitor()
+        updateCompanionMonitors()
+
+        accountsCancellable = ClaudeAccountStore.shared.$options
+            .dropFirst()
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.preloadClaudeAccounts()
+                self?.updateCompanionMonitors()
+            }
 
         providerCancellable = NotificationCenter.default
             .publisher(for: UserDefaults.didChangeNotification)
@@ -66,6 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .dropFirst()
             .receive(on: RunLoop.main)
             .sink { [weak self] presentation in
+                self?.updateCompanionMonitors()
                 self?.updateStatusItem(presentation: presentation)
             }
     }
@@ -73,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func switchSource(to selection: UsageSourceSelection) {
         let current = UsageSourceSelection(monitor: monitor)
         guard selection != current else { return }
-        monitor.pause()
+        // updateCompanionMonitors pauses it unless the menu bar still shows it.
         monitors[current] = monitor
         if let existing = monitors.removeValue(forKey: selection) {
             monitor = existing
@@ -83,6 +97,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         preloadClaudeAccounts()
         attachMonitor()
+        updateCompanionMonitors()
+    }
+
+    /// The two Claude accounts the menu bar shows side by side, ordered like the popover's
+    /// account switch, or nil when it shows only the current account.
+    private var menuBarAccounts: [UsageMonitor]? {
+        guard monitor.provider == .claude, StatusItemPreferences.showsBothClaudeAccounts else { return nil }
+        let options = ClaudeAccountStore.shared.options
+        guard options.count == 2 else { return nil }
+        let shown = options.compactMap { option in
+            option.account == monitor.claudeAccount
+                ? monitor
+                : monitors[UsageSourceSelection(provider: .claude, claudeAccount: option.account)]
+        }
+        return shown.count == 2 ? shown : nil
+    }
+
+    /// Keeps checking the other account while the menu bar shows it, and pauses every other
+    /// monitor that isn't on screen.
+    private func updateCompanionMonitors() {
+        let shown = menuBarAccounts.map { Set($0.map(ObjectIdentifier.init)) } ?? []
+        companionCancellables = []
+        for other in monitors.values {
+            guard shown.contains(ObjectIdentifier(other)) else {
+                other.pause()
+                continue
+            }
+            other.resume()
+            companionCancellables.append(
+                other.$snapshot
+                    .map { _ in () }
+                    .merge(with: other.$usageReadFailed.removeDuplicates().map { _ in () })
+                    .receive(on: RunLoop.main)
+                    .sink { [weak self] in self?.updateStatusItem() }
+            )
+        }
+        updateStatusItem()
     }
 
     /// Loads the other Claude accounts paused, from their saved readings and without
@@ -222,13 +273,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         presentation: StatusItemPresentation = .current
     ) {
         guard let button = statusItem?.button else { return }
-        // Room for every account's percentage, so switching accounts doesn't
-        // resize the item and slide the open popover sideways.
-        let titleWidth = ([monitor] + Array(monitors.values))
-            .map { StatusItemImage.titleWidth($0.menuBarText) }
-            .max() ?? 0
+        let title: String
+        let titleWidth: CGFloat
+        if let accounts = menuBarAccounts {
+            // Both accounts stay in place whichever one is current.
+            title = accounts.map(\.menuBarText).joined(separator: " | ")
+            titleWidth = 0
+        } else {
+            title = monitor.menuBarText
+            // Room for every account's percentage, so switching accounts doesn't
+            // resize the item and slide the open popover sideways.
+            titleWidth = ([monitor] + Array(monitors.values))
+                .map { StatusItemImage.titleWidth($0.menuBarText) }
+                .max() ?? 0
+        }
         button.image = StatusItemImage.make(
-            title: monitor.menuBarText,
+            title: title,
             minimumTitleWidth: titleWidth,
             spacing: presentation.spacing,
             icon: presentation.showsIcon ? statusIcon : nil
@@ -298,6 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 enum StatusItemPreferences {
     static let spacingKey = "menuBarIconTextSpacing"
     static let showsIconKey = "menuBarShowsIcon"
+    static let showsBothClaudeAccountsKey = "menuBarShowsBothClaudeAccounts"
 
     static var spacing: CGFloat {
         let defaults = UserDefaults.standard
@@ -310,18 +371,27 @@ enum StatusItemPreferences {
         guard defaults.object(forKey: showsIconKey) != nil else { return true }
         return defaults.bool(forKey: showsIconKey)
     }
+
+    /// Applies only while exactly two Claude accounts are signed in.
+    static var showsBothClaudeAccounts: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: showsBothClaudeAccountsKey) != nil else { return true }
+        return defaults.bool(forKey: showsBothClaudeAccountsKey)
+    }
 }
 
 private struct StatusItemPresentation: Equatable {
     let spacing: CGFloat
     let showsIcon: Bool
     let showsUsedPercentage: Bool
+    let showsBothClaudeAccounts: Bool
 
     static var current: Self {
         Self(
             spacing: StatusItemPreferences.spacing,
             showsIcon: StatusItemPreferences.showsIcon,
-            showsUsedPercentage: UsagePercentageDisplay.showsUsed
+            showsUsedPercentage: UsagePercentageDisplay.showsUsed,
+            showsBothClaudeAccounts: StatusItemPreferences.showsBothClaudeAccounts
         )
     }
 }
